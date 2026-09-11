@@ -340,6 +340,7 @@ class Policy:
     upgrade_commitment_enabled: bool = True
     base_recovery_enabled: bool = True
     economic_route_commitment_enabled: bool = True
+    day_schedule_enabled: bool = True
     defence_procurement_enabled: bool = False
     defence_gold_limit: int = 200
     joint_lookahead_enabled: bool = False

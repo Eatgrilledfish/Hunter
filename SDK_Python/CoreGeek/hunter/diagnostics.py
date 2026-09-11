@@ -62,6 +62,12 @@ class Diagnostics(logging.Handler):
             record["context_cut"] = True
             if "detail" in record:
                 record["detail"] = self._brief(record["detail"],180)
+        # Preserve exception tails even when multibyte text exceeds the line budget.
+        while isinstance(record.get("result"),str) and len(record['result']) > 40 and len(
+                json.dumps(record,ensure_ascii=False,separators=(",", ":")).encode()) > 1400:
+            value = record['result'];keep = len(value)//3
+            record['result'] = value[:keep]+" … "+value[-keep:]
+            record['context_cut'] = True
         print("HUNTER " + json.dumps(record,ensure_ascii=False,separators=(",", ":")),flush=True)
 
     def _compact_event(self, event, data):

@@ -44,6 +44,7 @@
     "weapon_portfolio_enabled": true,
     "portfolio_saturation_enabled": false,
     "joint_lookahead_enabled": false,
-    "joint_lookahead_seconds": 0.3
+    "joint_lookahead_seconds": 0.3,
+    "day_schedule_enabled": true
   }
 }

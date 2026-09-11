@@ -31,6 +31,8 @@ def prepare_wall_cycle(world, clock, rules, policy=None):
         return
     world.build_interior = blue
     battery.prepare(world, rules, policy)
+    world.timed_economy = bool(policy and policy.day_schedule_enabled and len(world.weapons)==3
+                              and len(battery.missing_walls(world,rules))<=1)
     if rules.wall_count(world) >= 10:
         world.defence_cells = blue
     if (clock.phases == {"day"} and clock.until_night <= 10 and len(world.movers) == 3
@@ -48,6 +50,15 @@ def open_day_gate(world, clock, rules, deadline):
     walls = {u.pos for u in world.ours.values() if u.alive and u.kind == "wall"}
     if not rule or rule.cells != yellow:
         return []
+    # Check each role's permanent topology, not just the presence of a hole.
+    # Temporary role jams are handled by the director's outbound yielding.
+    outside = {p for cell in yellow for p in neighbours(cell)
+               if world.inside(p) and p not in blue and p not in yellow}
+    from copy import copy
+    topology = copy(world)
+    topology.occupied = world.occupied-{u.pos for u in world.movers}
+    trapped = [u for u in world.movers if u.pos in blue and
+               u.pos not in distance_field(topology, outside, u.pos, deadline)]
     if world.firing_ports:
         gates = walls & world.firing_ports
         reason = "clear reserved Gatling firing port; do not rebuild this wall"
@@ -55,15 +66,20 @@ def open_day_gate(world, clock, rules, deadline):
             gates = walls & battery.cells(world,'wall',yellow)
             reason = "open one owned wall for daytime access; stone is not refunded"
     else:
-        if clock.until_night <= 10 or not yellow <= walls:
+        if clock.until_night <= 10 or not trapped:
             return []
-        gates = yellow
+        gates = yellow & walls
         reason = "open one owned wall for daytime access; stone is not refunded"
     options = []
     for actor in world.movers:
-        if actor.kind != "worker" or actor.pos not in blue:
+        if actor.kind != "worker":
             continue
         for gate in sorted(gates):
+            if trapped and not world.firing_ports:
+                opened = copy(topology)
+                opened.occupied = topology.occupied-{gate}
+                if not any(u.pos in distance_field(opened, outside, u.pos, deadline) for u in trapped):
+                    continue
             length, steps = route(world, actor, [gate], deadline)
             if length is not None:
                 options.append((length, actor.id, gate, steps))
@@ -114,6 +130,12 @@ def _construction_jobs(world, rules, portfolio=False, repair_saturation=False, r
     workers = {u.id: u for u in world.movers if u.kind == "worker"}
     available = {name: (rule, {p for p in battery.cells(world,name,rule.cells) if world.inside(p) and p not in world.occupied})
                  for name in sorted(WEAPONS | {"wall"}) if (rule := rules.build_rule(world, name)) is not None}
+    if prefer_closed_ring and world.build_interior and world.battery_plan is None:
+        xs, ys = zip(*world.build_interior)
+        corners = {(x,y) for x in (min(xs),max(xs)) for y in (min(ys),max(ys))}
+        for name in WEAPONS:
+            if name in available:
+                available[name][1].intersection_update(corners)
     result, reserved_cells = {}, set()
     gold, slots = max(0, world.gold-reserve_gold), max(0, rules.weapon_limit-len(world.weapons))
     wall_slots = max(0, rules.wall_limit-rules.wall_count(world))
@@ -178,7 +200,7 @@ def _construction_jobs(world, rules, portfolio=False, repair_saturation=False, r
         target = next(iter(missing))
         free_workers = [u for u in world.movers if u.kind=="worker" and (u.id not in result or result[u.id]["name"]=="wall")]
         if free_workers:
-            owner = min(free_workers,key=lambda u:(not bool(u.inventory["stone"]),distance(u.pos,target),u.id))
+            owner = min(free_workers,key=lambda u:(not bool(u.inventory["stone"]),sum(u.inventory[k]*world.vendor.get(k,0) for k in ("iron","copper")),u.id))
             for i in list(result):
                 if result[i]["name"]=="wall":del result[i]
             result[owner.id] = {"name":"wall", "target":target, "items":Counter(wall_rule.items), "gate":True}
@@ -227,6 +249,8 @@ def ready_construction(world, clock, rules, policy, deadline, *, jobs=None):
     for identity, job in jobs.items():
         actor = world.ours[identity]
         if time.monotonic() >= deadline or actor.backpack is None:
+            continue
+        if job.get("gate") and actor.inventory["stone"] and not world.seal_cells:
             continue
         rule = rules.build_rule(world, job["name"])
         if rule is None:
@@ -321,6 +345,9 @@ def immediate(world, rules, task_actor=None, *, jobs=None, policy=None):
             for mineral in sorted(MINERALS):
                 for pos in sorted(world.zones.get(mineral, ())):
                     if ore_jobs.get(actor.id) == (mineral, pos) and distance(actor.pos, pos) <= 1:
+                        held = sum(max(0,actor.inventory[k]-materials[k]) for k in MINERALS)
+                        if world.build_interior and not getattr(world,'timed_economy',False) and held >= 10 and actor.inventory[mineral] >= materials[mineral]:
+                            continue  # One mine's stock is enough until it can be sold.
                         result.append(Candidate(actor.id, {"action": "collect", "targetPos": [pos_json(pos)]},
                                                 world.vendor.get(mineral, 0)*0.4 + (8 if actor.inventory[mineral] < materials[mineral] else 0),
                                                 "collect current adjacent ore, including verified construction need"))
@@ -438,7 +465,9 @@ def propose(world, clock, rules, policy, deadline, task_actor=None, operator_sta
                 length+sale_actions+home_from_vendor+policy.return_buffer+8 <= clock.until_night))
             if length and sale_fits:
                 carried_value = sum(max(0, actor.inventory[k]-materials[k])*world.vendor.get(k, 0) for k in MINERALS)
-                value = carried_value/(length+1) * (1.2 if ore_count >= policy.sell_batch or bag_full else 0.25)
+                value = carried_value/(length+1) * (1.2 if ore_count >= min(10,policy.sell_batch) or bag_full else 0.25)
+                if ore_count >= min(10,policy.sell_batch) or (home_from_vendor is not None and length+sale_actions+home_from_vendor+policy.return_buffer+12 >= clock.until_night):
+                    value = max(value, 12)  # Realize a depleted mine's load before another detour.
                 result.extend(movement(actor, steps, value, "sell route valued by current prices and carried quantity",
                                         route_goal={"purpose":"sell", "zone":"vendor", "targets":tuple(sorted(world.zones.get("vendor", ())))}))
         if not bag_full and not (ore_count >= policy.sell_batch and world.zones.get("vendor")):
@@ -462,13 +491,24 @@ def propose(world, clock, rules, policy, deadline, task_actor=None, operator_sta
                     needed = actor.inventory[mineral] < materials[mineral]
                     utility = 8/(length+1) if needed else 0
                     if sell_length is not None:
-                        horizon = length + policy.sell_batch + sell_length + 1
                         home = min((defence_field[p] for p in vendor_goals if p in defence_field), default=None)
-                        if not world.build_interior or (home is not None and horizon+home+policy.return_buffer+8 <= clock.until_night):
-                            utility += policy.sell_batch*world.vendor.get(mineral, 0)/horizon
+                        batch = policy.sell_batch
+                        if world.build_interior:
+                            batch = min(batch, clock.until_night-length-sell_length-1-(home or 0)-policy.return_buffer-8)
+                        horizon = length + max(1,batch) + sell_length + 1
+                        if batch > 0 and (not world.build_interior or (home is not None and horizon+home+policy.return_buffer+8 <= clock.until_night)):
+                            utility += batch*world.vendor.get(mineral, 0)/horizon
+                        elif world.build_interior and home is not None and ore_count < 10:
+                            # A nearby bounded stock trip can fit when the vendor
+                            # detour cannot. Keep a verified future cash path and
+                            # tomorrow's sell priority; never assume future prices.
+                            mine_home = min((defence_field[p] for p in ore_stands if p in defence_field),default=None)
+                            stock = min(10-ore_count,clock.until_night-length-(mine_home or 0)-policy.return_buffer-8)
+                            if mine_home is not None and stock > 0:
+                                utility += stock*world.vendor.get(mineral,0)/(length+stock+mine_home+sell_length+home+2)*0.5
                     if length and utility > 0:
                         result.extend(movement(actor, steps, utility, "gather verified building materials" if needed
-                                               else "ore route includes harvest and vendor return",
+                                               else "bounded ore route; cash trip when feasible, otherwise stock for next day",
                                                route_goal={"purpose":"collect", "zone":mineral, "targets":(pos,)}))
         if policy.weapon_portfolio_enabled:
             job = build_jobs.get(actor.id)

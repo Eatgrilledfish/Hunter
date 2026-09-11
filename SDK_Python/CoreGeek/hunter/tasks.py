@@ -11,6 +11,15 @@ from .documents import DocumentLedger
 from .answer_contract import contract as answer_contract, validate as validate_answer
 
 
+def result_excerpt(value, limit=480):
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    # Traceback exception type/message is at the end, not in the Popen frames.
+    marker = " … [middle omitted] … "
+    return text[:limit//3] + marker + text[-(limit-limit//3-len(marker)):]
+
+
 @dataclass
 class LLMBudget:
     day: int | None = None
@@ -781,7 +790,7 @@ class TaskEngine:
                             "op":pending["operation"], "round": world.round,
                             "exit":data.get("tool_exit_code", data.get("exit_code", parsed.get("exit_code"))),
                             "path":pending.get("plan", {}).get("path"), "usable":usable,
-                            "result":str(data.get("data", data.get("text", data.get("error", ""))))[:240]
+                            "result":result_excerpt(data.get("data", data.get("text", data.get("error", ""))))
                                       if pending["operation"] in {"run_tool", "run_python"} else ""})
         if usable and pending.get("plan"):
             if pending["operation"] == "run_tool" and data.get("completeness") == "complete":
@@ -906,7 +915,15 @@ class TaskEngine:
                            for e in task.evidence.values() if e.get("usable")):
                     plan = {"operation": "list_dir", "path": "."}
                 else:
-                    if self.reuse_enabled and (task.workflow_id or not task.executions):
+                    # Read an observed API manual before asking for executable
+                    # API code. This saves a model round and supplies auth/schema.
+                    listed = {entry.get("path") for e in task.evidence.values() if e.get("usable")
+                              for entry in e.get("data",{}).get("entries",[]) if isinstance(entry,dict)}
+                    read = {e.get("data",{}).get("path") for e in task.evidence.values() if e.get("usable")
+                            and e.get("data",{}).get("operation")=="read_slice"}
+                    if "API_DOCS.md" in listed-read:
+                        plan = {"operation":"read_slice", "path":"API_DOCS.md", "limit":8192}
+                    if plan is None and self.reuse_enabled and (task.workflow_id or not task.executions):
                         plan, workflow = self.skills.workflow_next(task)
                     if plan is None and not task.workflow_id:
                         skill = self.skills.match(task) if self.reuse_enabled else None
@@ -969,6 +986,11 @@ class TaskEngine:
                     "Use {operation:run_python,path:discovered or documented working directory,code:Python source,effect:read_only|mutation, "
                     "evidence_refs:[ids of fully read task/API/spec documents]}. "
                     "Use it for documented local API calls, computing statistics, editing task workspace files, and subprocess.run([\"./check\"],...). "
+                    "Before any API request, read its actual API documentation including authentication, pagination and response schema. "
+                    "Encode Chinese query values with urllib.parse.urlencode; never concatenate raw Chinese into a URL. "
+                    "On 401 or any failed page, stop and fix documented authentication; do not compute an answer from empty/partial records. "
+                    "For engineering tasks inspect spec and the checker path/interpreter in the working directory first. "
+                    "Do not repeat a failed subprocess unchanged: use the final exception and stderr to fix cwd, permissions or invocation. "
                     "Basic shell commands may be executed through Python subprocess inside this task sandbox. "
                     "Batch related reads/calculations/checks in one run_python to save rounds. Print necessary documents when more information is needed. "
                     "Read the spec before changing files; restrict all work to the authorized task. "

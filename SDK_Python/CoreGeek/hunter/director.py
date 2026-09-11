@@ -42,6 +42,7 @@ class Directive:
     return_routes: dict = field(default_factory=dict)
     horizon_risk: dict = field(default_factory=dict)
     construction_actions: dict = field(default_factory=dict)
+    day_actions: dict = field(default_factory=dict)
     seal_builds: dict = field(default_factory=dict)
     upgrade_actions: dict = field(default_factory=dict)
     recovery_actions: dict = field(default_factory=dict)
@@ -68,7 +69,7 @@ class Directive:
             return False
         if candidate.actor in self.urgent_upgrades:
             return candidate.command == self.urgent_upgrades[candidate.actor]
-        for commitments in (self.recovery_actions, self.construction_actions, self.upgrade_actions, self.medical_actions):
+        for commitments in (self.recovery_actions, self.construction_actions, self.upgrade_actions, self.medical_actions, self.day_actions):
             if candidate.actor in commitments and not any(candidate is c for c in self.candidates):
                 medical = candidate.command['action'] == 'use' and candidate.command.get('name') in {'Medicine','Bomb','DizzyWeapon'}
                 if not medical and candidate.command not in commitments[candidate.actor]:
@@ -559,6 +560,9 @@ def propose(world, clock, task_actor, task, deadline, policy=None, risk_memory=N
             field = distance_field(relaxed,world.defence_cells,actor.pos,deadline)
             if actor.pos not in field:
                 continue
+            carrying_upgrade = any('UpgradeVoucher' in name and count > 0 for name,count in actor.inventory.items())
+            if clock.until_night > field[actor.pos]+policy.return_buffer+8 and not carrying_upgrade:
+                continue  # An outbound worker has no current right-of-way to return.
             path, cursor = [], actor.pos
             while field[cursor] > 0:
                 cursor = min((p for p in neighbours(cursor) if p in field and field[p]<field[cursor]),key=lambda p:(field[p],p))
@@ -582,6 +586,50 @@ def propose(world, clock, task_actor, task, deadline, policy=None, risk_memory=N
                     yielding[0][blocker.id]["yield_for"] = actor.id
                     for candidate in yielding[1]:candidate.reason="clear teammate's blocked gate return route"
                     result.return_routes.update(yielding[0]);result.candidates.extend(yielding[1])
+    # Daytime outbound traffic needs the same cooperation as night return.
+    # Use a relaxed path only to identify a blocker, then issue a real legal
+    # step off that path. Do not dismantle more walls for a temporary role jam.
+    if world.defence_cells and clock.phases == {"day"} and clock.until_night > 12:
+        from .rules import station_rings
+        blue, yellow = station_rings(world.stations[0].pos)
+        outside = {p for q in yellow for p in neighbours(q)
+                   if world.inside(p) and p not in blue|yellow}
+        relaxed = copy(world)
+        relaxed.occupied = world.occupied-{u.pos for u in world.movers}
+        free_field = distance_field(relaxed,outside,None,deadline)
+        for actor in world.movers:
+            if actor.id == task_actor or actor.pos not in blue or actor.pos not in free_field:
+                continue
+            if actor.pos in distance_field(world,outside,actor.pos,deadline):
+                continue
+            path, cursor = [], actor.pos
+            while free_field[cursor] > 0:
+                cursor = min((p for p in neighbours(cursor) if p in free_field and free_field[p]<free_field[cursor]),
+                             key=lambda p:(free_field[p],p))
+                path.append(cursor)
+            for blocker in world.movers:
+                if blocker.id == task_actor or blocker.pos not in path:
+                    continue
+                if any('UpgradeVoucher' in name and count > 0 for name,count in blocker.inventory.items()):
+                    continue  # A delivery must not be pushed back out of the gate.
+                forward = [p for p in neighbours(blocker.pos) if p not in world.occupied
+                           and p in free_field and free_field[p] < free_field[blocker.pos]]
+                available = forward or [p for p in neighbours(blocker.pos) if world.inside(p)
+                             and p not in world.occupied and p not in path and p != actor.pos]
+                if not available:
+                    continue
+                stand = min(available,key=lambda p:(p not in outside,free_field.get(p,999),p))
+                yielding = return_plan(world,clock,{blocker.id:stand},replace(policy,return_buffer=130),deadline)
+                if yielding is not None:
+                    yielding[0][blocker.id]['yield_for'] = actor.id
+                    result.return_routes.update(yielding[0])
+                    result.candidates = [c for c in result.candidates if c.actor!=blocker.id]
+                    for c in yielding[1]:c.reason='clear teammate outbound path through daytime gate'
+                    result.candidates.extend(yielding[1])
+                    break
+            else:
+                continue
+            break  # One controlled yield, recompute from next observed positions.
     for actor in world.movers:
         actor_task = task if actor.id == task_actor else None
         proposed, observation = lookahead.propose(world, clock, actor, actor_task, risk_memory,

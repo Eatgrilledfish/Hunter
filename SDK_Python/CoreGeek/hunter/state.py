@@ -13,6 +13,7 @@ from .defence import DefenceProcurement
 from .medical import MedicalSupply
 from .recovery import BaseRecovery
 from .economic_routes import EconomicRoutes
+from .day_schedule import DaySchedule
 from .navigation import neighbours
 from .protocol import pos_json
 
@@ -46,6 +47,7 @@ class Session:
 
     recovery: BaseRecovery = field(default_factory=BaseRecovery)
     economic_routes: EconomicRoutes = field(default_factory=EconomicRoutes)
+    day_schedule: DaySchedule = field(default_factory=DaySchedule)
 
     def task_actor(self, world):
         if not world.phase_task:

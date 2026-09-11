@@ -262,6 +262,8 @@ def compile_operation(context, plan, environment, evidence):
     path = plan.get("path", ".")
     if not isinstance(path, str) or len(path) > 1024 or "\x00" in path:
         raise ValueError("invalid path")
+    if posixpath.normpath(path) == posixpath.normpath(root):
+        path = "."
     if path.startswith(root.rstrip("/")+"/"):
         path = path[len(root.rstrip("/"))+1:]
     path = posixpath.normpath(path)

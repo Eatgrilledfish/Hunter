@@ -202,6 +202,12 @@ class Agent:
             for candidate in recovery:
                 guidance.recovery_actions.setdefault(candidate.actor, []).append(candidate.command)
             candidates.extend(recovery)
+            scheduled = draft.day_schedule.candidates(world,clock,self.policy,build_jobs,guidance.operator_stands,
+                upgrade_plans,{task_actor}|set(guidance.recovery_actions)|set(guidance.urgent_upgrades),
+                min(deadline,time.monotonic()+.12))
+            scheduled = [c for c in draft.filter_failures(scheduled,world.round) if guidance.permit(c)]
+            for c in scheduled:guidance.day_actions.setdefault(c.actor,[]).append(c.command)
+            candidates.extend(scheduled)
             ready = economy.ready_construction(world, clock, self.rules, self.policy, min(deadline, time.monotonic()+0.08), jobs=build_jobs)
             if world.seal_cells and len(economy.battery.missing_walls(world,self.rules)) == 1:
                 for c in ready:
@@ -239,7 +245,7 @@ class Agent:
             candidates.extend(guidance.candidates)
             candidates = [c for c in candidates if guidance.permit(c)]
             # Preserve a checked triage incumbent even if later planning runs out.
-            if guidance.candidates or guidance.return_routes or guidance.blocked_moves or guidance.construction_actions or guidance.upgrade_actions or guidance.recovery_actions or guidance.economic_route_actions or guidance.medical_actions or guidance.urgent_upgrades:
+            if guidance.candidates or guidance.return_routes or guidance.blocked_moves or guidance.construction_actions or guidance.upgrade_actions or guidance.recovery_actions or guidance.economic_route_actions or guidance.medical_actions or guidance.day_actions or guidance.urgent_upgrades:
                 incumbent = select(world, clock, self.rules, self.policy,
                                    draft.filter_failures(candidates, world.round), time.monotonic()+0.03,
                                    task_actor=task_actor, task_moves=guidance.task_moves,
@@ -348,6 +354,12 @@ class Agent:
                       "movement_retry_windows": draft.move_retry_windows(world.round),
                       "construction_jobs": build_jobs,
                       "work_status":{u.id:{"ore":[u.inventory[k] for k in ("stone","iron","copper")],
+                          "job":({"name":build_jobs[u.id]["name"],"gate":build_jobs[u.id].get("gate",False)} if u.id in build_jobs else None),
+                          "slack":guidance.return_routes.get(u.id,{}).get("slack_before_buffer"),
+                          "schedule":draft.day_schedule.diagnostic.get(u.id),
+                          "idle":("return_hold" if guidance.return_routes.get(u.id,{}).get("due") else "no_selected_feasible_work")
+                              if u.id not in response['roleCommandMap'] and not any(c.get('controllerId')==u.id for c in response['roleCommandMap'].values()) else None,
+                          "trip":draft.economic_routes.diagnostic.get(u.id,{}).get("goal"),
                           "upgrade":({k:upgrade_plans[u.id][k] for k in ("name","steps","stage")} if u.id in upgrade_plans else None)}
                           for u in world.movers if u.kind=="worker"},
                       "battery_plan": world.battery_plan,

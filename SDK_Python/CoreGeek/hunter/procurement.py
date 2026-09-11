@@ -119,7 +119,7 @@ def propose(world, policy, deadline, task_actor=None, *, plans=None, priority_id
     # deliveries must not release this tier's budget to lower-priority work.
     critical = {i:t for i,t in targets.items() if i in priority_ids and t['name'] in world.shop}
     purchase_rank = min((t['rank'] for t in critical.values()), default=None)
-    restrict_purchases = bool(critical) or world.battery_plan is not None
+    restrict_purchases = bool(critical) or world.battery_plan is not None or bool(world.build_interior and policy.closed_ring_rockets_enabled)
     if restrict_purchases and purchase_rank is None:
         # A missing listing is not permission to spend the leading upgrade fund
         # on cheaper walls. Wait for a current price/listing instead of inventing
@@ -184,7 +184,7 @@ def propose(world, policy, deadline, task_actor=None, *, plans=None, priority_id
     if restrict_purchases:
         targets = {i:t for i,t in targets.items() if purchase_rank is not None and t['rank'] == purchase_rank}
     purchase_reserve = policy.reserve_gold
-    if (world.battery_plan is not None and targets and all(
+    if ((world.battery_plan is not None or world.build_interior and policy.closed_ring_rockets_enabled) and targets and all(
             identity in priority_ids or target['unit'].kind in WEAPONS and target['rank'] <= 1
             for identity,target in targets.items())):
         # The current first-range/emergency/rocket priority IS the defensive
