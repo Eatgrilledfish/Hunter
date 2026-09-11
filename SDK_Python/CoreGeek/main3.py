@@ -1,4 +1,5 @@
 """Competition entry point: POST / and callback(json_data)."""
+import base64
 import argparse
 import logging
 import os
@@ -6,10 +7,12 @@ import os
 from flask import Flask, request, jsonify
 
 if __package__:
+    from .hunter.diagnostics import Diagnostics
     from .hunter.agent import Agent
     from .hunter.protocol import strict_json, empty_response
     from .hunter.rules import Rules, Policy
 else:
+    from hunter.diagnostics import Diagnostics
     from hunter.agent import Agent
     from hunter.protocol import strict_json, empty_response
     from hunter.rules import Rules, Policy
@@ -17,8 +20,15 @@ else:
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024  # Local input budget, not an official limit.
 app.json.ensure_ascii = False
-agent = Agent(rules=Rules.load(os.environ["HUNTER_RULES_PATH"]) if os.environ.get("HUNTER_RULES_PATH") else None,
+diagnostics = Diagnostics()
+logging.getLogger("hunter").addHandler(diagnostics)
+agent = Agent(diagnostics=diagnostics, rules=Rules.load(os.environ["HUNTER_RULES_PATH"]) if os.environ.get("HUNTER_RULES_PATH") else None,
               policy=Policy.load(os.environ["HUNTER_POLICY_PATH"]) if os.environ.get("HUNTER_POLICY_PATH") else None)
+
+try:
+    diagnostics.startup(agent)
+except Exception:
+    logging.getLogger("hunter").exception("startup diagnostic failed")
 
 
 def callback(json_data):
@@ -27,16 +37,20 @@ def callback(json_data):
 
 @app.route("/", methods=["POST"])
 def process_request():
+    body = request.get_data(cache=False)
     try:
-        data = strict_json(request.get_data(cache=False).decode("utf-8"))
+        data = strict_json(body.decode("utf-8"))
     except (ValueError, UnicodeError):
-        logging.getLogger("hunter").warning("malformed input JSON")
+        diagnostics.event("malformed_request", raw_base64=base64.b64encode(body).decode("ascii"),
+                          response=empty_response(), http_status=200)
         return jsonify(empty_response())
     return jsonify(callback(data))
 
 
 @app.errorhandler(413)
 def oversized_request(_error):
+    diagnostics.event("oversized_request", content_length=request.content_length,
+                      response=empty_response(), http_status=413)
     return jsonify(empty_response()), 413
 
 

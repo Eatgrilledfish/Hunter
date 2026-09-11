@@ -1,6 +1,7 @@
 """Cross-turn task, LLM quota, evidence and recipe state machines."""
 from dataclasses import dataclass, field
 import json
+import uuid
 
 from .arbitration import Candidate
 from .protocol import distance, fingerprint, obj, array, integer, strict_json
@@ -462,6 +463,7 @@ def evidence_answer(task, spec):
 
 @dataclass
 class TaskEngine:
+    receipt_namespace: str = field(default_factory=lambda: uuid.uuid4().hex)
     active: TaskInstance | None = None
     accept_pending: dict | None = None
     generation: int = 0
@@ -778,7 +780,8 @@ class TaskEngine:
                     bound = bind_plan(task.text, plan, task.evidence)
                     if fingerprint(bound) in task.uncertain_operations:
                         raise ValueError("operation may already have executed; inspect state first")
-                    response["executeCmd"] = compile_operation(context, bound, task.environment, task.evidence)
+                    environment = {**task.environment, "receipt_namespace": self.receipt_namespace}
+                    response["executeCmd"] = compile_operation(context, bound, environment, task.evidence)
                     task.sandbox_pending = {"round": world.round, "context": context, "operation": plan["operation"],
                                             "plan": plan, "bound_hash": fingerprint(bound),
                                             "skill_id": skill["id"] if skill else None,

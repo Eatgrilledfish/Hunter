@@ -16,7 +16,8 @@ LOG = logging.getLogger("hunter")
 
 
 class Agent:
-    def __init__(self, rules=None, policy=None):
+    def __init__(self, rules=None, policy=None, diagnostics=None):
+        self.diagnostics = diagnostics
         self.rules = rules or Rules.load(Path(__file__).resolve().parents[1] / "config/verified_rules.json")
         self.policy = policy or Policy()
         self.lock = threading.Lock()
@@ -43,7 +44,22 @@ class Agent:
         task_actor = next((u.id for u in world.movers if u.kind == "pioneer" and world.phase_task), None)
         return self._base(world, Clock(world.round, self.rules.round_origin), task_actor).response
 
+    def _diagnostic(self, event, **data):
+        if self.diagnostics is not None:
+            try:
+                if event == "outcome":
+                    self.diagnostics.outcome(data["value"])
+                else:
+                    self.diagnostics.event(event, **data)
+            except Exception:
+                pass
+
     def callback(self, raw):
+        if self.diagnostics is not None:
+            return self.diagnostics.run(raw, self._callback)
+        return self._callback(raw)
+
+    def _callback(self, raw):
         start = time.monotonic()
         acquired = False
         fallback = empty_response()
@@ -52,6 +68,7 @@ class Agent:
             digest = fingerprint(raw)
             acquired = self.lock.acquire(timeout=self.policy.lock_seconds)
             if not acquired:
+                self._diagnostic("outcome", value="lock_timeout")
                 # Never advance an independent session or create channel requests.
                 return self._isolated_response(world)
             key = (world.team_id, world.side)
@@ -59,8 +76,10 @@ class Agent:
             if session is not None:
                 cached = session.cache.get((world.round, digest))
                 if cached is not None:
+                    self._diagnostic("outcome", value="cache_hit")
                     return deepcopy(cached)
                 if key != self.active_key or world.round <= session.last_round:
+                    self._diagnostic("outcome", value="isolated_stale_or_other_session")
                     return self._isolated_response(world)
             else:
                 self.epoch += 1
@@ -248,10 +267,21 @@ class Agent:
                       "empty_map_officially_verified": self.rules.empty_actions_verified}
             try:
                 self.telemetry.append(record)
+                self._diagnostic("decision", **record)
+                if self.diagnostics is not None:
+                    task = draft.tasks.active
+                    self._diagnostic("task_state", active={name: getattr(task, name, None) for name in
+                        ("key", "actor", "phase", "seq", "accept_round", "activation_round", "timeout",
+                         "llm_pending", "sandbox_pending", "command_plan", "answer", "submitted", "events",
+                         "uncertain_operations", "executions", "workflow_id", "workflow_results")} if task else None,
+                        accept_pending=draft.tasks.accept_pending, closed=draft.tasks.closed,
+                        budget=draft.tasks.budget)
+
             except Exception:
                 pass  # Optional observations must not invalidate an already committed response.
             return response
         except Exception:
+            self._diagnostic("outcome", value="fallback")
             LOG.exception("turn failed; returning structurally checked incumbent")
             validate_response(fallback)
             return deepcopy(fallback)

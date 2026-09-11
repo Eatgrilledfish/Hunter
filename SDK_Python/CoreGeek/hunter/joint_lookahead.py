@@ -191,10 +191,12 @@ def advance(world, clock, selected, scenario, depth, suppression=None):
 
 
 def movements(world, task_actor=None, task_cells=()):
-    """All eight first steps; score only a small positioning tie preference.
+    """All eight first steps; credit only progress toward a weapon.
 
     The rollout, not this distance hint, determines final root value. Future
     path segments also remain inside an active task's interaction neighbourhood.
+    A sideways move earns no unconditional reward: if all future outcomes are
+    equal, the intact incumbent must win instead of inducing perpetual motion.
     """
     result = []
     for u in world.movers:
@@ -207,7 +209,7 @@ def movements(world, task_actor=None, task_cells=()):
                 continue
             after = min((max(0, distance(p, w.pos)-1) for w in guns), default=0)
             result.append(Candidate(u.id, {'action': 'move', 'targetPos': [pos_json(p)]},
-                                    .05+2*(before-after), 'joint rollout positioning'))
+                                    2*(before-after), 'joint rollout positioning'))
     return result
 
 

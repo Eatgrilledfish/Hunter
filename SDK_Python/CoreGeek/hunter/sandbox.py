@@ -5,6 +5,7 @@ import shlex
 
 from .protocol import strict_json, integer
 from .dependencies import execution_manifest, input_manifest
+from .receipts import guarded_script
 
 
 def parse_result(text):
@@ -239,7 +240,7 @@ while len(encoded.encode("utf-8")) > 30000 and out.get("text"):
     out["text"] = out["text"][:len(out["text"])//2]
     out.update(status="truncated", completeness="partial", transport_budget_exceeded=True)
     encoded = json.dumps(out, ensure_ascii=False, allow_nan=False)
-print(encoded)
+RESULT = encoded
 '''
 
 
@@ -299,6 +300,17 @@ def compile_operation(context, plan, environment, evidence):
         manifest, import_candidates = execution_manifest(plan, evidence)
         inputs = input_manifest(plan, evidence, manifest)
         payload.update(manifest=manifest, import_candidates=import_candidates, input_manifest=inputs)
-    script = "P = " + repr(payload) + "\n" + OPERATION_SCRIPT
+    if operation == "run_tool":
+        namespace = environment.get("receipt_namespace")
+        if namespace is None:
+            # Direct compiler clients without a TaskEngine retain command-local
+            # identity, but cannot claim isolation between fresh service runs.
+            namespace = "direct-compiler"
+        if not isinstance(namespace, str) or not re.fullmatch(r"[a-zA-Z0-9-]{1,80}", namespace):
+            raise ValueError("invalid receipt namespace")
+        payload["receipt_namespace"] = namespace
+        script = guarded_script(payload, OPERATION_SCRIPT)
+    else:
+        script = "P = " + repr(payload) + "\n" + OPERATION_SCRIPT + "\nprint(RESULT)"
     # The wrapper's own imports must not resolve to task files such as json.py.
     return shlex.quote(python) + " -I -c " + shlex.quote(script)
