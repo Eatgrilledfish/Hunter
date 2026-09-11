@@ -55,7 +55,16 @@ class DaySchedule:
             sale_steps=max(1,kinds)
             vendors=interaction_cells(world,world.zones.get('vendor',()),actor.pos)
             shops=interaction_cells(world,world.zones.get('weaponShop',()),actor.pos)
-            need_shop=any(u.level in (1,2) and 'WeaponUpgradeVoucher'+str(u.level) in world.shop for u in world.weapons)
+            # Reserve the shop detour only against observed gold and currently
+            # carried sellable stock, not hypothetical future mining income.
+            liquidation = world.gold or 0
+            for worker in world.movers:
+                if worker.kind != 'worker':continue
+                held_reserve = jobs.get(worker.id,{}).get('stock_target',0)
+                liquidation += sum(max(0,worker.inventory[k]-(held_reserve if k=='stone' else 0))*world.vendor.get(k,0) for k in MINERALS)
+            prices = [world.shop['WeaponUpgradeVoucher'+str(u.level)] for u in world.weapons
+                      if u.level in (1,2) and 'WeaponUpgradeVoucher'+str(u.level) in world.shop]
+            need_shop=bool(prices and liquidation >= min(prices))
             if need_shop:
                 # Buying and applying one voucher are two separate actions.
                 via_shop=weighted_field(world,{p:home[p]+2 for p in shops if p in home},actor,deadline)
@@ -68,6 +77,8 @@ class DaySchedule:
             slack=left-checkout[actor.pos]-margin
             stage=self.active.get(actor.id,'harvest')
             if stage=='cashout' and not kinds:stage='shop'
+            if stage in ('shop','done') and not upgrades.get(actor.id):
+                stage='harvest'  # No affordable purchase: use remaining feasible mining time.
             personal=upgrades.get(actor.id)
             if personal and personal['stage']=='deliver':stage='home'
             selected=[]
@@ -109,7 +120,7 @@ class DaySchedule:
             self.active[actor.id]=stage
             self.diagnostic[actor.id]={'stage':stage,'checkout_steps':checkout[actor.pos],
                 'margin':margin,'harvest_left':max(0,slack-1),'leave_by':world.round+max(0,slack-1),
-                'shop_reserved':need_shop}
+                'shop_reserved':need_shop,'liquidation':liquidation,'upgrade_price':min(prices) if prices else None}
             result.extend(selected)
         return result
 

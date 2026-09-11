@@ -13,6 +13,7 @@ import traceback
 import uuid
 
 from .protocol import obj, array
+from . import llm_trace
 
 
 class Diagnostics(logging.Handler):
@@ -52,7 +53,7 @@ class Diagnostics(logging.Handler):
         record = dict(schema=2, run=self.run_id[:8], round=getattr(self.local,"round",None), event=event, **data)
         # Valid single-line JSON, never a byte slice of a serialized record.
         # Essential issue details take precedence over optional current context.
-        for optional in ("reasons", "channels", "work", "commands", "units", "task", "defence"):
+        for optional in ("reasons", "channels", "work", "commands", "units", "task", "defence", "docs", "root_entries", "entries"):
             if len(json.dumps(record,ensure_ascii=False,separators=(",", ":")).encode()) <= 1400:
                 break
             record.pop(optional,None)
@@ -82,6 +83,9 @@ class Diagnostics(logging.Handler):
             faults = [e for e in active.get("events",[]) if e.get("kind") in
                       {"quarantined_llm", "invalid_llm", "invalid_command_plan", "missing_llm", "missing_command_effect_unknown"}]
             self.local.task_fault = faults[-1] if faults else None
+            self.local.llm_verdict = next((e for e in reversed(active.get('events',[]))
+                if e.get('round')==getattr(self.local,'round',None) and e.get('kind') in
+                {'llm_consumed','invalid_llm','quarantined_llm','invalid_command_plan'}),{})
             executed = [e for e in active.get("events",[]) if e.get("kind") == "sandbox_result"
                         and e.get("op") in {"run_python", "run_tool"}]
             self.local.task_tool = executed[-1] if executed else None
@@ -112,6 +116,42 @@ class Diagnostics(logging.Handler):
                     count = self.external_counts[event]
                     if count == 1 or count % self.interval == 0:
                         self._write_compact(event,count=count,detail=issue)
+
+    def _llm_turn(self,state,raw,response,task,number):
+        pending=state.get('llm_trace_pending');logged=False
+        counts=state.setdefault('llm_trace_counts',OrderedDict())
+        if pending:
+            reply=raw.get('llmResp')
+            ended=task.get('id')!=pending['task']
+            if reply or ended or number-pending['round']>2:
+                identity=pending['task'];counts.setdefault(identity,0)
+                if counts[identity]<3:
+                    output=llm_trace.received(reply,pending['input'].get('_documents','')) if isinstance(reply,str) and reply else {}
+                    verdict=getattr(self.local,'llm_verdict',{})
+                    record={'task':identity,'rid':pending['input'].get('rid'),'sent_round':pending['round'],
+                            'wait_rounds':number-pending['round'],
+                            'verdict':('task_changed' if ended else verdict.get('kind','received') if reply else 'missing'),
+                            'input':{k:v for k,v in pending['input'].items() if not k.startswith('_') and k!='rid'},
+                            'output':output}
+                    if verdict.get('reason'):record['reason']=str(verdict['reason'])[:100]
+                    # Keep valid one-line JSON and a strict extra-line byte budget.
+                    for group,key in [('input','docs'),('output','imports'),('output','endpoints'),('output','auth'),('output','launch')]:
+                        if len(json.dumps(record,ensure_ascii=False).encode())<=1000:break
+                        record[group].pop(key,None);record['cut']=True
+                    if len(json.dumps(record,ensure_ascii=False).encode())>1100:
+                        record['output']={k:v for k,v in output.items() if k in {'reply_hash','reply_chars','parse','code_hash','intent','op'}}
+                        record['cut']=True
+                    self._write_compact('llm',**record);counts[identity]+=1;logged=True
+                    if output.get('code_hash'):
+                        mappings=state.setdefault('program_rids',{})
+                        mappings[output['code_hash']]=pending['input'].get('rid')
+                        if len(mappings)>16:del mappings[next(iter(mappings))]
+                else:state['stats']['llm_trace_omitted']+=1
+                state['llm_trace_pending']=None
+        if response.get('prompt') and task.get('id'):
+            state['llm_trace_pending']={'task':task['id'],'round':number,'input':llm_trace.sent(response['prompt'])}
+        while len(counts)>32:counts.popitem(last=False)
+        return logged
 
     def _compact_turn(self, raw, response, elapsed):
         raw = obj(raw)
@@ -179,19 +219,24 @@ class Diagnostics(logging.Handler):
                             detail += f" after={actor} ack={feedback.get(actor)} {action}"
                     issues.append(self._brief(detail,320))
             task = getattr(self.local,"task",{})
+            llm_logged = self._llm_turn(state,raw,response,task,number)
             tool = getattr(self.local,"task_tool",None)
             tool_key = (task.get("id"),(tool or {}).get("round"))
             if tool and task.get("id") and tool_key not in state["task_tools"]:
                 if sum(k[0]==task["id"] for k in state["task_tools"]) < 2:
                     self._write_compact("task_exec",task=task["id"],left=task.get("left"),
+                        rid=state.get('program_rids',{}).get(str(tool.get('program') or '')[:12]),
                         op=tool.get("op"),path=self._brief(tool.get("path"),100),status=tool.get("status"),
-                        exit=tool.get("exit"),usable=tool.get("usable"),result=self._brief(tool.get("result",""),480),
+                        exit=tool.get("exit"),usable=tool.get("usable"),answer_usable=tool.get('answer_usable'),
+                        failure=tool.get('failure'),cwd=tool.get('cwd'),entries=(tool.get('entries') or [])[:8],
+                        root_entries=(tool.get('root_entries') or [])[:8],
+                        program=str(tool.get('program') or '')[:12],docs=tool.get('docs'),result=self._brief(tool.get("result",""),480),
                         result_round=tool.get("round"))
                 state["task_tools"].add(tool_key)
                 if len(state["task_tools"]) > 32:state["task_tools"]={tool_key}
             fault = getattr(self.local,"task_fault",None)
             fault_key = (task.get("id"),(fault or {}).get("kind"))
-            if fault and fault_key not in state["task_faults"]:
+            if fault and fault_key not in state["task_faults"] and not (llm_logged and fault.get("round")==number):
                 # One diagnostic per failure kind per task, capped to two per
                 # task. Never let discovery events consume this allowance.
                 if sum(k[0]==task.get("id") for k in state["task_faults"]) < 2:

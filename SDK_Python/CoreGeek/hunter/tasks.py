@@ -11,6 +11,17 @@ from .documents import DocumentLedger
 from .answer_contract import contract as answer_contract, validate as validate_answer
 
 
+def execution_failure(data):
+    """Recognize explicit execution errors; zero records alone are not a failure."""
+    text = data.get('text', '')
+    if not isinstance(text, str):return None
+    if re.search(r'HTTP(?: Error)?\s*401\b|401[: ]+Unauthorized', text, re.I):
+        return 'api_authentication_failed'
+    if 'FileNotFoundError' in text and 'No such file or directory' in text:
+        return 'file_or_interpreter_missing'
+    return None
+
+
 def result_excerpt(value, limit=480):
     text = str(value)
     if len(text) <= limit:
@@ -442,6 +453,8 @@ def evidence_answer(task, spec):
     refs = spec.get("evidence_refs")
     if not isinstance(refs, list) or not refs or any(not isinstance(r, str) or r not in task.evidence or not task.evidence[r].get("usable") for r in refs):
         raise ValueError("missing or unusable answer evidence")
+    if any(task.evidence[r].get('answer_usable') is False for r in refs):
+        raise ValueError("execution reported a failure; cannot answer from its partial/empty output")
     if "compose" in spec:
         if spec["format"] != "json" or not isinstance(spec["compose"], (dict, list)):
             raise ValueError("composition requires a JSON structure")
@@ -784,15 +797,21 @@ class TaskEngine:
                         old["stale_reason"] = "input changed before execution"
             else:
                 self.skills.invalidate_pending(pending)
-        task.evidence[evidence_id] = {"source": "sandbox", "round": world.round, "usable": usable,
+        failure = execution_failure(data) if pending['operation'] in {'run_tool','run_python'} else None
+        task.evidence[evidence_id] = {"answer_usable": usable and not failure, "failure": failure, "source": "sandbox", "round": world.round, "usable": usable,
                                       "nonce": pending["context"]["nonce"], "data": data or parsed}
         task.events.append({"kind": "sandbox_result", "status": data.get("status", parsed["status"]),
                             "op":pending["operation"], "round": world.round,
                             "exit":data.get("tool_exit_code", data.get("exit_code", parsed.get("exit_code"))),
                             "path":pending.get("plan", {}).get("path"), "usable":usable,
+                            "answer_usable":usable and not failure, "failure":failure,
+                            "cwd":data.get('cwd'), "entries":data.get('cwd_entries'), "root_entries":data.get('root_entries'),
+                            "program":data.get('file_sha256'),
+                            "docs":[{'path':e.get('data',{}).get('path'), 'complete':e.get('data',{}).get('completeness')=='complete'}
+                                    for e in task.evidence.values() if e.get('data',{}).get('operation')=='read_slice'][-6:],
                             "result":result_excerpt(data.get("data", data.get("text", data.get("error", ""))))
                                       if pending["operation"] in {"run_tool", "run_python"} else ""})
-        if usable and pending.get("plan"):
+        if usable and not failure and pending.get("plan"):
             if pending["operation"] == "run_tool" and data.get("completeness") == "complete":
                 task.executions.append({"plan": pending["plan"], "evidence": evidence_id,
                                         "file_sha256": data.get("file_sha256"), "manifest": data.get("manifest"), "round": world.round})
@@ -883,7 +902,7 @@ class TaskEngine:
         # official inclusive/exclusive timeout rule.
         stopping = task.timeout is not None and task.accept_round is not None and world.round >= task.accept_round+task.timeout-2
         final_answer_only = stopping and world.round == task.accept_round+task.timeout-2 and any(
-            e.get("usable") and e.get("data", {}).get("operation") in {"run_python", "run_tool"}
+            e.get("usable") and e.get("answer_usable") is not False and e.get("data", {}).get("operation") in {"run_python", "run_tool"}
             and e["data"].get("completeness") == "complete" for e in task.evidence.values())
         if stopping and not final_answer_only:
             return
@@ -985,11 +1004,15 @@ class TaskEngine:
                     "run_python executes your code in the competition sandbox, never in the HTTP callback. "
                     "Use {operation:run_python,path:discovered or documented working directory,code:Python source,effect:read_only|mutation, "
                     "evidence_refs:[ids of fully read task/API/spec documents]}. "
-                    "Use it for documented local API calls, computing statistics, editing task workspace files, and subprocess.run([\"./check\"],...). "
+                    "Use it for documented local API calls, computing statistics, editing task workspace files, and invoking the actual documented checker. "
                     "Before any API request, read its actual API documentation including authentication, pagination and response schema. "
                     "Encode Chinese query values with urllib.parse.urlencode; never concatenate raw Chinese into a URL. "
                     "On 401 or any failed page, stop and fix documented authentication; do not compute an answer from empty/partial records. "
+                    "Never invent a plausible API key. Copy the documented header name, prefix and credential source exactly. "
+                    "If authentication instructions are absent from evidence, read the actual manual; do not retry a guessed key. "
                     "For engineering tasks inspect spec and the checker path/interpreter in the working directory first. "
+                    "There is NO default checker path. A checker may be in the task root, outside the workspace subdirectory. "
+                    "FileNotFoundError on an existing script can mean a missing shebang interpreter or CRLF; inspect before retry. "
                     "Do not repeat a failed subprocess unchanged: use the final exception and stderr to fix cwd, permissions or invocation. "
                     "Basic shell commands may be executed through Python subprocess inside this task sandbox. "
                     "Batch related reads/calculations/checks in one run_python to save rounds. Print necessary documents when more information is needed. "
@@ -1028,11 +1051,23 @@ class TaskEngine:
                            "allowed_intents":["answer"] if final_answer_only else ["execute", "answer", "inspect"],
                            "task_truncated_locally": len(task.text) > 16384,
                            "answer_contract": answer_contract(task),
+                           "task_root":task.environment.get('root'),
+                           "complete_document_refs":{key:e['data'].get('path') for key,e in task.evidence.items()
+                               if e.get('usable') and e.get('data',{}).get('operation')=='read_slice'
+                               and e['data'].get('completeness')=='complete'},
+                           "latest_execution_failure":next(({'kind':e.get('failure'),'cwd':e['data'].get('cwd'),
+                               'entries':e['data'].get('cwd_entries'),'root_entries':e['data'].get('root_entries'),'tail':result_excerpt(e['data'].get('text',''))}
+                               for e in reversed(list(task.evidence.values())) if e.get('failure')),None),
                            "rounds_left": None if task.timeout is None else max(0, task.timeout-(world.round-(task.accept_round or task.activation_round))),
                            "omitted_evidence": len(task.evidence)-len(evidence), "events": [{k:v for k,v in e.items() if k not in {"nonce", "received", "expected", "reply"}} for e in task.events[-8:]],
                            "submitted": [{"hash": s["hash"], "text": s["text"][:2048],
                                           "feedback": s.get("feedback")} for s in task.submitted[-4:]],
                            "recipe_hints": [{"plan": r["plan"], "manifest": r.get("manifest"),
                                              "level": r["validation_level"]} for r in self.skills.records[-4:]]}
+                # Put a concrete current envelope at the very end, where it cannot
+                # be confused with old identities or buried in the long protocol.
+                payload['reply_template'] = {'version':1,'request_id':payload['request_id'],
+                    'intent':'execute','command_plan':{'operation':'read_slice','path':'<actual discovered document>'}}
+                payload['required_response'] = 'ONLY JSON; copy reply_template version/request_id; replace the operation with your actual next step.'
                 response["prompt"] = instructions + json.dumps(payload, ensure_ascii=False)
                 task.llm_pending = {"round": world.round, "context": context}

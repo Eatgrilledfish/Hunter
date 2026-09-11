@@ -165,7 +165,22 @@ runpy.run_path(entry, run_name="__main__")
         argv.extend(P["args"])
         if op == "run_python":
             argv = [P["python"], "-I", "-B", "-c", P["code"]]
-        child = subprocess.Popen(argv, cwd=path if op == "run_python" else root, stdin=subprocess.DEVNULL,
+        execution_cwd = path if op == "run_python" else root
+        out['cwd'] = os.path.relpath(execution_cwd, root)
+        # Bounded names only: no credential contents, judge internals or external reads.
+        out['cwd_entries'] = []
+        with os.scandir(execution_cwd) as listing:
+            for index, entry in enumerate(listing):
+                if index >= 32:break
+                if not entry.name.startswith('.') and not entry.is_symlink():
+                    out['cwd_entries'].append(entry.name[:80]+('/' if entry.is_dir() else ''))
+        out['root_entries'] = []
+        with os.scandir(root) as listing:
+            for index, entry in enumerate(listing):
+                if index >= 32:break
+                if not entry.name.startswith('.') and not entry.is_symlink():
+                    out['root_entries'].append(entry.name[:80]+('/' if entry.is_dir() else ''))
+        child = subprocess.Popen(argv, cwd=execution_cwd, stdin=subprocess.DEVNULL,
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
         out["executed"] = True
         output, status = bytearray(), "ok"
