@@ -18,6 +18,7 @@ class LayoutGuard:
         self.cache, self.before, self.static = {}, None, None
         self.sources = {u.id: u.pos for u in world.movers}
         self.facilities = []
+        self.internal_facilities = []
 
     def components(self, blocked):
         world = self.world
@@ -59,7 +60,9 @@ class LayoutGuard:
                     self.facilities.append(set(neighbours(p)))
         for unit in world.ours.values():
             if unit.alive and unit.kind in WEAPONS | {"station"}:
-                self.facilities.append(set(neighbours(unit.pos)))
+                goals = set(neighbours(unit.pos))
+                self.facilities.append(goals)
+                self.internal_facilities.append(goals)
         self.before = self.components(self.static)
         return self.before is not None
 
@@ -83,6 +86,10 @@ class LayoutGuard:
             self.cache[builds] = allowed, reason
             return allowed, reason
 
+        walls = {u.pos for u in self.world.ours.values() if u.alive and u.kind == "wall"}
+        seal = (bool(self.world.seal_cells) and all(kind == "wall" for _, kind, _ in builds)
+                and added <= self.world.seal_cells and self.world.seal_cells <= walls | added)
+        facilities = self.internal_facilities if seal else self.facilities
         for identity, source in self.sources.items():
             old, new = self.before.get(source), after.get(source)
             if old is None or new is None:
@@ -90,7 +97,7 @@ class LayoutGuard:
             for other in self.sources.values():
                 if self.before.get(other) == old and after.get(other) != new:
                     return finish(False, "build bundle separates previously connected teammates")
-            for goals in self.facilities:
+            for goals in facilities:
                 if any(self.before.get(p) == old for p in goals) and not any(after.get(p) == new for p in goals):
                     return finish(False, "build bundle cuts access to a current facility")
             if any(self.before.get(p) == old for p in neighbours(source)) and not any(after.get(p) == new for p in neighbours(source)):
@@ -99,6 +106,29 @@ class LayoutGuard:
             if kind in WEAPONS:
                 component = after.get(self.sources.get(identity))
                 stands = [p for p in neighbours(point) if p in after and after[p] == component]
+                if self.world.build_interior:
+                    stands = [p for p in stands if p in self.world.build_interior]
                 if len(stands) < 2:
                     return finish(False, "new weapon lacks two connected operator stands")
-        return finish(True, "build bundle preserves current structural access")
+        if self.world.build_interior:
+            guns = [u.pos for u in self.world.weapons] + [p for _,k,p in builds if k in WEAPONS]
+            floor = self.world.build_interior - self.static - added
+            if not floor:
+                return finish(False, "no interior circulation remains")
+            seen = {next(iter(floor))}
+            queue = list(seen)
+            for point in queue:
+                for p in neighbours(point):
+                    if p in floor and p not in seen:
+                        seen.add(p)
+                        queue.append(p)
+            if seen != floor and any(k in WEAPONS for _,k,_ in builds):
+                return finish(False, "completed walls would disconnect interior circulation")
+            states = {0}
+            for p in floor:
+                mask = sum(1 << i for i,g in enumerate(guns) if max(abs(p[0]-g[0]),abs(p[1]-g[1])) <= 1)
+                states |= {state | (1 << i) for state in list(states) for i in range(len(guns))
+                           if mask & (1 << i) and not state & (1 << i)}
+            if not any(s.bit_count() == len(guns) for s in states):
+                return finish(False, "completed walls would leave guns without distinct interior operators")
+        return finish(True, "night seal preserves team and gun access; reopen at dawn" if seal else "build bundle preserves current structural access")

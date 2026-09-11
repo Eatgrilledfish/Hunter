@@ -15,6 +15,54 @@ def movement(actor, steps, value, reason, *, route_goal=None):
             for i, p in enumerate(steps[:4])]
 
 
+def prepare_wall_cycle(world, clock, rules):
+    """Allow a verified ring seal only after every living role is back inside.
+
+    Daytime access is restored by removing one owned wall; no refund assumed.
+    """
+    from .rules import station_rings
+    world.seal_cells = frozenset()
+    rule = rules.build_rule(world, "wall")
+    if not rule or len(world.stations) != 1:
+        return
+    blue, yellow = station_rings(world.stations[0].pos)
+    if rule.cells != yellow or len(yellow) != rules.wall_limit:
+        return
+    world.build_interior = blue
+    if rules.wall_count(world) >= 10:
+        world.defence_cells = blue
+    if (clock.phases == {"day"} and clock.until_night <= 10 and len(world.movers) == 3
+            and all(u.pos in blue for u in world.movers)
+            and not any(u.pos in blue or u.pos in world.stations[0].cells for u in world.robots.values())):
+        world.seal_cells = yellow
+
+
+def open_day_gate(world, clock, rules, deadline):
+    if clock.phases != {"day"} or clock.until_night <= 10 or len(world.stations) != 1:
+        return []
+    from .rules import station_rings
+    blue, yellow = station_rings(world.stations[0].pos)
+    rule = rules.build_rule(world, "wall")
+    walls = {u.pos for u in world.ours.values() if u.alive and u.kind == "wall"}
+    if not rule or rule.cells != yellow or not yellow <= walls:
+        return []
+    options = []
+    for actor in world.movers:
+        if actor.kind != "worker" or actor.pos not in blue:
+            continue
+        for gate in sorted(yellow):
+            length, steps = route(world, actor, [gate], deadline)
+            if length is not None:
+                options.append((length, actor.id, gate, steps))
+    if not options:
+        return []
+    length, identity, gate, steps = min(options)
+    if length == 0:
+        return [Candidate(identity, {"action":"remove", "targetPos":[pos_json(gate)]}, 40,
+                          "open one owned wall for daytime access; stone is not refunded")]
+    return movement(world.ours[identity], steps, 40, "approach daytime gate to reopen access")
+
+
 def construction_cash_reserve(world, policy):
     # Establish all three guns before saving for replenishment. A cash reserve with
     # no current shop/Medicine has no executable use and must not block builds.
@@ -52,8 +100,9 @@ def _construction_jobs(world, rules, portfolio=False, repair_saturation=False, r
     wall_slots = max(0, rules.wall_limit-rules.wall_count(world))
     # Optional walls must not tie up the entire workforce while cash is needed.
     earnable = bool(world.zones.get("vendor")) and any(world.vendor.get(k, 0)>0 and world.zones.get(k) for k in MINERALS)
-    wall_workers = max(0, len(workers)-1) if earnable else len(workers)
-    # Keep one named builder across observations; the other worker earns cash.
+    wall_workers = len(workers) if len(world.weapons) >= rules.weapon_limit else (max(0, len(workers)-1) if earnable else len(workers))
+    team_wall_work = len(world.weapons) >= rules.weapon_limit
+    # Before the battery is complete, keep one builder and one cash worker.
     wall_owner = min(workers, key=lambda i: (not bool(workers[i].inventory["stone"]), i)) if workers else None
     while workers:
         options = []
@@ -61,7 +110,7 @@ def _construction_jobs(world, rules, portfolio=False, repair_saturation=False, r
             if rule.gold > gold or (name in WEAPONS and not slots) or (name == "wall" and (not wall_slots or wall_workers <= 0)):
                 continue
             for identity, actor in workers.items():
-                if name == "wall" and earnable and identity != wall_owner:
+                if name == "wall" and earnable and not team_wall_work and identity != wall_owner:
                     continue
                 targets = cells-reserved_cells
                 if not targets:
@@ -94,11 +143,40 @@ def _construction_jobs(world, rules, portfolio=False, repair_saturation=False, r
         if name in WEAPONS:
             planned.append((name,1,target))
         workers.pop(identity)
+    # Keep a material/staging job for the final gate even while the layout
+    # policy correctly refuses to close it before the pioneer returns.
+    wall_rule = rules.build_rule(world, "wall")
+    missing = (set(wall_rule.cells)-{u.pos for u in world.ours.values() if u.alive and u.kind=="wall"}) if wall_rule else set()
+    if len(missing)==1 and world.build_interior and len(world.weapons)>=rules.weapon_limit:
+        target = next(iter(missing))
+        free_workers = [u for u in world.movers if u.kind=="worker" and (u.id not in result or result[u.id]["name"]=="wall")]
+        if free_workers:
+            owner = min(free_workers,key=lambda u:(not bool(u.inventory["stone"]),distance(u.pos,target),u.id))
+            for i in list(result):
+                if result[i]["name"]=="wall":del result[i]
+            result[owner.id] = {"name":"wall", "target":target, "items":Counter(wall_rule.items), "gate":True}
+    # Reserve all remaining wall stone, divided between the assigned builders.
+    # Allocate carried stock first (inventories cannot be transferred), then
+    # balance outstanding collection rather than repeatedly fetching four stones.
+    builders = sorted(i for i,j in result.items() if j["name"] == "wall")
+    remaining = max(0, rules.wall_limit-rules.wall_count(world))
+    quotas = {}
+    for i in sorted(builders, key=lambda i: (-world.ours[i].inventory["stone"], i)):
+        quotas[i] = min(remaining, world.ours[i].inventory["stone"])
+        remaining -= quotas[i]
+    for _ in range(remaining):
+        if not builders:
+            break
+        i = min(builders, key=lambda i:(quotas[i],i))
+        quotas[i] += 1
+    for i in builders:
+        result[i]["stock_target"] = quotas[i]
     return result
 
 
 def construction_reservations(world, rules, *, jobs=None):
-    return {identity: job["items"] for identity, job in (construction_jobs(world, rules) if jobs is None else jobs).items()}
+    return {identity: Counter({**job["items"], **({"stone":job["stock_target"]} if job["name"]=="wall" and "stock_target" in job else {})})
+            for identity, job in (construction_jobs(world, rules) if jobs is None else jobs).items()}
 
 
 def ready_construction(world, clock, rules, policy, deadline, *, jobs=None):
@@ -109,8 +187,14 @@ def ready_construction(world, clock, rules, policy, deadline, *, jobs=None):
     """
     if not policy.construction_commitment_enabled or clock.phases != {"day"}:
         return []
+    opening = open_day_gate(world, clock, rules, deadline)
+    if opening:
+        return opening
     result = []
-    for identity, job in (construction_jobs(world, rules, policy) if jobs is None else jobs).items():
+    jobs = construction_jobs(world, rules, policy) if jobs is None else jobs
+    ore_jobs = harvest_jobs(world, construction_reservations(world, rules, jobs=jobs))
+    claimed = set()
+    for identity, job in jobs.items():
         actor = world.ours[identity]
         if time.monotonic() >= deadline or actor.backpack is None:
             continue
@@ -119,9 +203,9 @@ def ready_construction(world, clock, rules, policy, deadline, *, jobs=None):
             continue
         if job["name"] == "wall":
             mineral = next((k for k, n in rule.items.items() if actor.inventory[k] < n), None)
-            # Batch a few stones while at the mine, then spend them on the wall.
+            # Fill the personal project quota while at the mine, then build.
             # This is a policy stock target, not a change to the one-stone cost.
-            if mineral is None and actor.inventory["stone"] < min(4, rules.wall_limit-rules.wall_count(world)):
+            if mineral is None and actor.inventory["stone"] < min(job.get("stock_target", 4), max(1, (clock.until_night-policy.return_buffer)//2)):
                 if world.near_zone(actor.pos, "stone"):
                     mineral = "stone"
             if mineral is not None:
@@ -132,9 +216,10 @@ def ready_construction(world, clock, rules, policy, deadline, *, jobs=None):
                     length, steps = route(world, actor, [mine], deadline)
                     back = min((home[p] for p in interaction_cells(world, [mine], actor.pos) if p in home), default=None)
                     if length is not None and back is not None and length+back+5+policy.return_buffer < clock.until_night:
-                        options.append((length+back, mine, length, steps))
+                        options.append((mine in claimed, ore_jobs.get(identity) != (mineral, mine), length+back, mine, length, steps))
                 if options:
-                    _, mine, length, steps = min(options)
+                    _, _, _, mine, length, steps = min(options)
+                    claimed.add(mine)
                     if length == 0:
                         result.append(Candidate(actor.id, {"action":"collect", "targetPos":[pos_json(mine)]}, 18,
                                                 "wall builder: stock stone before returning to build"))

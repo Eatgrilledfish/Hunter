@@ -41,6 +41,7 @@ class Directive:
     return_routes: dict = field(default_factory=dict)
     horizon_risk: dict = field(default_factory=dict)
     construction_actions: dict = field(default_factory=dict)
+    seal_builds: dict = field(default_factory=dict)
     upgrade_actions: dict = field(default_factory=dict)
     recovery_actions: dict = field(default_factory=dict)
     medical_actions: dict = field(default_factory=dict)
@@ -75,7 +76,7 @@ class Directive:
         if not route or not route["due"] or any(candidate is c for c in self.candidates):
             return True
         action = candidate.command["action"]
-        if action == "attack":
+        if action == "attack" or candidate.command == self.seal_builds.get(candidate.actor):
             return True
         if action == "move":
             target = candidate.command["targetPos"][0]
@@ -162,8 +163,10 @@ def fallback_stands(world, *, include_pioneer, task_actor, allow_task_control, h
         else:
             for gun in weapons:
                 reachable = interaction_cells(world, [gun.pos], actor.pos) & distances.keys()
+                if world.defence_cells:
+                    reachable &= world.defence_cells
                 cells.update(sorted(reachable, key=lambda p: (distances[p], p))[:3])
-            if any(distance(actor.pos, gun.pos) <= 1 for gun in weapons):
+            if (not world.defence_cells or actor.pos in world.defence_cells) and any(distance(actor.pos, gun.pos) <= 1 for gun in weapons):
                 cells.add(actor.pos)
         choices.append(sorted(cells) + [None])
     masks = {p: sum(1 << i for i, gun in enumerate(weapons) if distance(p, gun.pos) <= 1)
@@ -221,7 +224,9 @@ def return_plan(world, clock, stands, policy, deadline=float("inf"), *, failed_s
                 steps = sorted(p for p in neighbours(actor.pos) if p in field and field[p] < length)
         if policy.operator_safety_enabled and exposure(world, clock, actor.pos)["upper_per_attack_opportunity"]:
             steps.sort(key=lambda p: (exposure(world, clock, p)["upper_per_attack_opportunity"], p))
-        slack = clock.until_night-length-policy.return_buffer
+        # Near-complete walls require time for gate traffic and sealing after arrival.
+        seal_buffer = 8 if world.defence_cells else 0
+        slack = clock.until_night-length-policy.return_buffer-seal_buffer
         due = clock.phases != {"day"} or slack <= 0
         routes[actor.id] = {"stand": stand, "length": length, "steps": steps,
                            "slack_before_buffer": slack, "due": due}
@@ -274,7 +279,7 @@ def assign_operator_stands(world, clock, deadline, *, include_pioneer=True,
         fields[operator.id] = distances
         cells = (set([operator.pos]) if operator.id in fixed else
                  interaction_cells(world, [w.pos for w in weapons], operator.pos))
-        cells = [p for p in cells if p in distances]
+        cells = [p for p in cells if p in distances and (operator.id in fixed or not world.defence_cells or p in world.defence_cells)]
         for p in cells:
             if p not in features:
                 adjacent = [w for w in weapons if distance(p, w.pos) <= 1]
@@ -498,13 +503,32 @@ def propose(world, clock, task_actor, task, deadline, policy=None, risk_memory=N
         result.operator_plan_status = "optimized"
     result.return_routes = baseline[0]
     result.candidates.extend(baseline[1])
+    # With a wall ring, enter the nearest available interior cell first. Routing
+    # all the way to a gun through a teammate-blocked corridor can oscillate
+    # around the outside and never get the final role through the gate.
+    if world.defence_cells:
+        for actor in world.movers:
+            if actor.id == task_actor or actor.pos in world.defence_cells:
+                continue
+            goals = set(world.defence_cells)-world.occupied
+            field = distance_field(world, [actor.pos], actor.pos, deadline)
+            reachable = goals & field.keys()
+            if not reachable:
+                continue
+            entry = min(reachable, key=lambda p:(field[p],p))
+            inward = return_plan(world, clock, {actor.id:entry}, policy, deadline, failed_steps=failed_steps)
+            if inward is not None:
+                old = baseline[1]
+                result.candidates = [c for c in result.candidates if not (c.actor==actor.id and any(c is b for b in old))]
+                result.return_routes.update(inward[0])
+                result.candidates.extend(inward[1])
     # With fewer guns than roles, an unassigned pioneer still needs a return
     # destination. The base is a landmark, not assumed invulnerability.
     if world.stations and policy.pioneer_defence_enabled:
         for actor in world.movers:
-            if actor.kind != "pioneer" or actor.id == task_actor or actor.id in result.operator_stands:
+            if (actor.kind != "pioneer" and not world.defence_cells) or actor.id == task_actor or actor.id in result.return_routes:
                 continue
-            goals = interaction_cells(world, [p for station in world.stations for p in station.cells], actor.pos)
+            goals = (set(world.defence_cells)-world.occupied if world.defence_cells else interaction_cells(world, [p for station in world.stations for p in station.cells], actor.pos))
             field = distance_field(world, [actor.pos], actor.pos, deadline)
             reachable = goals & field.keys()
             if not reachable:

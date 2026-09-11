@@ -1,5 +1,6 @@
 """Serial, bounded turn transaction with a validated current-state incumbent."""
 from collections import OrderedDict, deque
+from dataclasses import replace
 from copy import deepcopy
 import logging
 from pathlib import Path
@@ -88,6 +89,7 @@ class Agent:
             draft.tasks.reuse_enabled = self.policy.skill_reuse_enabled
             clock = draft.reconcile(world)
             task_actor = draft.task_actor(world)
+            economy.prepare_wall_cycle(world, clock, self.rules)
             build_jobs = economy.construction_jobs(world, self.rules, self.policy)
             immediate = draft.filter_failures(economy.immediate(world, self.rules, task_actor, jobs=build_jobs, policy=self.policy), world.round)
             incumbent = self._base(world, clock, task_actor, immediate)
@@ -97,6 +99,35 @@ class Agent:
             deadline = start + self.policy.planning_seconds
             guidance = director.propose(world, clock, task_actor, draft.tasks.active, min(deadline, time.monotonic()+0.12), self.policy, draft.risk,
                                         failed_steps=draft.failed_move_steps(world) if self.policy.return_detour_enabled else None)
+            # Stage the worker who actually owns the final stone before the
+            # gate closes. A different worker cannot spend that inventory.
+            if clock.phases == {"day"}:
+                from .navigation import distance_field, neighbours
+                for identity, job in build_jobs.items():
+                    actor = world.ours[identity]
+                    if not job.get("gate") or not actor.inventory["stone"]:
+                        continue
+                    entries = set(neighbours(job["target"])) & world.build_interior
+                    goals = entries-(world.occupied-{actor.pos})
+                    if any(u.pos not in world.build_interior for u in world.movers):
+                        # The staging worker must leave an inner landing free
+                        # for the last returning teammate, not plug the gate.
+                        free_entries = entries-(world.occupied-{actor.pos})
+                        if len(free_entries) <= 1:
+                            goals = (world.build_interior-entries)-(world.occupied-{actor.pos})
+                    if not goals and actor.pos in world.build_interior:
+                        goals = {actor.pos}  # Keep staging while a teammate clears the landing.
+                    field = distance_field(world,[actor.pos],actor.pos,min(deadline,time.monotonic()+.02))
+                    reachable = goals & field.keys()
+                    if not reachable:
+                        continue
+                    stand = min(reachable,key=lambda p:(distance(p,job["target"]),field[p],p))
+                    staged = director.return_plan(world,clock,{identity:stand},replace(self.policy,return_buffer=130),min(deadline,time.monotonic()+.02))
+                    if staged is not None:
+                        guidance.return_routes.update(staged[0])
+                        guidance.candidates = [c for c in guidance.candidates if not (c.actor==identity and c.reason.startswith("execute due return"))]
+                        for c in staged[1]:c.reason="stage final stone owner inside gate before sealing"
+                        guidance.candidates.extend(staged[1])
             for actor in world.movers:
                 guidance.blocked_moves.setdefault(actor.id, set()).update(world.navigation_avoided.get(actor.pos, set()))
             # Check the return/triage incumbent before procurement or other
@@ -121,6 +152,12 @@ class Agent:
                 guidance.recovery_actions.setdefault(candidate.actor, []).append(candidate.command)
             candidates.extend(recovery)
             ready = economy.ready_construction(world, clock, self.rules, self.policy, min(deadline, time.monotonic()+0.08), jobs=build_jobs)
+            if world.seal_cells and self.rules.wall_count(world) == self.rules.wall_limit-1:
+                for c in ready:
+                    if c.command.get("action") == "build" and c.command.get("name") == "wall":
+                        guidance.seal_builds[c.actor] = c.command
+                        c.utility = 1000
+                        c.reason = "all roles inside: seal last wall before night"
             ready = [c for c in draft.filter_failures(ready, world.round) if guidance.permit(c)]
             for candidate in ready:
                 guidance.construction_actions.setdefault(candidate.actor, []).append(candidate.command)
@@ -259,6 +296,17 @@ class Agent:
                       "navigation_retry_exclusions": {u.id:sorted(world.navigation_avoided.get(u.pos, set())) for u in world.movers},
                       "movement_retry_windows": draft.move_retry_windows(world.round),
                       "construction_jobs": build_jobs,
+                      "wall_supply": {"need":max(0,self.rules.wall_limit-self.rules.wall_count(world)),
+                          "stone":{u.id:u.inventory["stone"] if u.backpack is not None else None for u in world.movers if u.kind=="worker"},
+                          "quotas":{i:j.get("stock_target") for i,j in build_jobs.items() if j["name"]=="wall"},
+                          "mines":sorted(world.zones.get("stone", ()))[:8],
+                          "gaps":sorted((self.rules.build_rule(world,"wall").cells if self.rules.build_rule(world,"wall") else set())-
+                                        {u.pos for u in world.ours.values() if u.alive and u.kind=="wall"}),
+                          "seal_ready":bool(world.seal_cells)},
+                      "gun_status":[{"id":w.id,"cd":w.cooldown,"range":w.attack_range,
+                          "controllers":[u.id for u in world.movers if distance(w.pos,u.pos)<=1],
+                          "targets":sum(distance(w.pos,r.pos)<=(w.attack_range or 0) for r in world.robots.values()),
+                          "fired":response["roleCommandMap"].get(w.id,{}).get("action")=="attack"} for w in world.weapons],
                       "feedback_counts": dict(draft.feedback_counts),
                       "construction_commitments": sorted(guidance.construction_actions),
                       "upgrade_commitments": sorted(guidance.upgrade_actions),

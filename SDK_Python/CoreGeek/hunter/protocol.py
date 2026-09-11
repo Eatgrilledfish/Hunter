@@ -118,6 +118,9 @@ class World:
     phase_task: str
     warnings: list[str]
     navigation_avoided: dict = field(default_factory=dict)
+    seal_cells: frozenset = field(default_factory=frozenset)
+    defence_cells: frozenset = field(default_factory=frozenset)
+    build_interior: frozenset = field(default_factory=frozenset)
 
     def inside(self, pos):
         return 0 <= pos[0] < self.width and 0 <= pos[1] < self.height
