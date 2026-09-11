@@ -314,3 +314,64 @@ def compile_operation(context, plan, environment, evidence):
         script = "P = " + repr(payload) + "\n" + OPERATION_SCRIPT + "\nprint(RESULT)"
     # The wrapper's own imports must not resolve to task files such as json.py.
     return shlex.quote(python) + " -I -c " + shlex.quote(script)
+
+
+def task_documents(text):
+    """File references are locators, never the task contents themselves."""
+    return sorted(set(re.findall(r"[A-Za-z0-9_][A-Za-z0-9_.-]*\.md(?![A-Za-z0-9_.-])", text)))[:8]
+
+
+LOCATE_SCRIPT = r'''
+import json, os, time
+out = {"version":1, "context":P["context"], "operation":"locate_task"}
+started = time.monotonic()
+matches, errors, visited = [], [], 0
+# The second root is observed in the competition trace, not an assumed cwd.
+roots = [P["cwd"]] if P["cwd"] != "/" else []
+roots.append("/tmp/selfEvolutionTask")
+complete = True
+for root in dict.fromkeys(roots):
+    if not os.path.isdir(root) or os.path.islink(root):
+        continue
+    def onerror(exc):
+        errors.append(str(exc)[:256])
+    for folder, dirs, files in os.walk(root, topdown=True, onerror=onerror, followlinks=False):
+        dirs[:] = sorted(d for d in dirs if not d.startswith(".") and not os.path.islink(os.path.join(folder,d)))
+        if len(os.path.relpath(folder, root).split(os.sep)) >= 6:
+            if dirs: complete = False
+            dirs[:] = []
+        visited += len(dirs)+len(files)+1
+        if visited > 4096 or time.monotonic()-started > 1.5:
+            complete = False
+            break
+        for name in sorted(files):
+            if name in P["names"]:
+                path = os.path.join(folder,name)
+                if os.path.isfile(path) and not os.path.islink(path):
+                    matches.append(os.path.realpath(path))
+        if len(matches) > 32:
+            complete = False
+            break
+    if not complete: break
+matches = sorted(set(matches))
+out.update(candidates=matches[:32], scan_complete=complete and not errors, scan_errors=errors[:8])
+if len(matches) == 1:
+    path = matches[0]
+    out.update(status="ok", root=os.path.dirname(path), statement=os.path.basename(path),
+               entries=[{"path":os.path.basename(path), "kind":"file"}], completeness="complete",
+               selection="unique_observed_candidate; scan completeness recorded separately")
+else:
+    out.update(status="ambiguous" if len(matches)>1 else "incomplete" if not complete or errors else "not_found",
+               completeness="unknown")
+print(json.dumps(out, ensure_ascii=False))
+'''
+
+
+def locate_task(context, environment, names):
+    python, cwd = environment.get("python"), environment.get("root")
+    if not isinstance(python, str) or not python.startswith("/") or not isinstance(cwd, str) or not cwd.startswith("/"):
+        raise ValueError("interpreter/cwd not discovered")
+    if not names or any(not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*\.md", name) for name in names):
+        raise ValueError("task document names unavailable")
+    payload = {"context":context, "cwd":cwd, "names":names}
+    return shlex.quote(python) + " -I -c " + shlex.quote("P = " + repr(payload) + "\n" + LOCATE_SCRIPT)

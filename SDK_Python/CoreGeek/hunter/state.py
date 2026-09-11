@@ -2,7 +2,7 @@
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
-from .protocol import obj, array, fingerprint, distance
+from .protocol import obj, array, fingerprint, distance, position
 from .rules import Clock
 from .tasks import TaskEngine
 from .intelligence import Intelligence
@@ -17,6 +17,11 @@ from .navigation import neighbours
 from .protocol import pos_json
 
 
+def _move_retry_round(failure):
+    count, last = failure
+    return last + min(32, 2**min(count, 5))
+
+
 @dataclass
 class Session:
     epoch: int
@@ -26,6 +31,8 @@ class Session:
     last_response: dict = field(default_factory=dict)
     cache: OrderedDict = field(default_factory=OrderedDict)
     failed: dict = field(default_factory=dict)
+    failed_moves: dict = field(default_factory=dict)
+    last_positions: dict = field(default_factory=dict)
     enemy_memory: dict = field(default_factory=dict)
     news: list = field(default_factory=list)
     feedback_counts: dict = field(default_factory=dict)
@@ -64,12 +71,30 @@ class Session:
             for identity, command in previous.items():
                 outcome = feedback.get(identity)
                 signature = (identity, fingerprint(command))
+                if command.get("action") == "move" and identity in self.last_positions:
+                    origin = self.last_positions[identity]
+                    target = position(command.get("targetPos", [{}])[0])
+                    key = (identity, origin, target)
+                    actor = world.ours.get(identity)
+                    if outcome is False and actor is not None and actor.alive and actor.pos == origin:
+                        count = self.failed_moves.get(key, (0, 0))[0] + 1
+                        self.failed_moves[key] = (count, world.round)
+                    elif outcome is True:
+                        self.failed_moves.pop(key, None)
                 if outcome is False:
                     old = self.failed.get(signature, (0, 0))
                     self.failed[signature] = (old[0]+1, world.round)
                     self.feedback_counts["action_false"] = self.feedback_counts.get("action_false", 0)+1
                 elif outcome is True:
                     self.failed.pop(signature, None)
+        self.failed_moves = {k:v for k,v in self.failed_moves.items()
+                             if world.round-v[1] <= 130 and k[0] in world.ours and world.ours[k[0]].alive}
+        self.failed_moves = dict(list(self.failed_moves.items())[-128:])
+        world.navigation_avoided = {actor.pos: {target for (identity, origin, target), (count, last) in self.failed_moves.items()
+                                   if identity == actor.id and origin == actor.pos and target is not None
+                                   and world.round < _move_retry_round((count, last))}
+                                   for actor in world.movers}
+        self.last_positions = {actor.id: actor.pos for actor in world.movers}
         # A skipped round cannot be attributed to the last command we sent.
         self.failed = {k: v for k, v in self.failed.items() if world.round-v[1] <= 8}
         self.failed = dict(list(self.failed.items())[-64:])
@@ -103,17 +128,31 @@ class Session:
         return clock
 
     def backed_off(self, actor, command, round_no):
+        if command.get("action") == "move":
+            targets = array(command.get("targetPos"))
+            target = position(targets[0]) if targets else None
+            failure = self.failed_moves.get((actor, self.last_positions.get(actor), target))
+            if failure and round_no < _move_retry_round(failure):
+                return True
         failure = self.failed.get((actor, fingerprint(command)))
         return bool(failure and round_no-failure[1] < min(4, failure[0]+1))
+
+    def move_retry_windows(self, round_no):
+        return [{"actor": actor, "origin": origin, "target": target,
+                 "failures": failure[0], "last_failure_round": failure[1],
+                 "retry_round": _move_retry_round(failure)}
+                for (actor, origin, target), failure in self.failed_moves.items()
+                if self.last_positions.get(actor) == origin and round_no < _move_retry_round(failure)]
 
     def failed_move_steps(self, world):
         """Temporary first-step exclusions from attributed action feedback only.
 
         A false result does not reveal its cause or an enemy's future position.
-        Reuse the action retry window, without changing observed occupancy.
+        Reuse both retry windows, without changing observed occupancy.
         """
         return {actor.id: {p for p in neighbours(actor.pos)
                            if self.backed_off(actor.id, {"action": "move", "targetPos": [pos_json(p)]}, world.round)}
+                          | world.navigation_avoided.get(actor.pos, set())
                 for actor in world.movers}
 
     def filter_failures(self, candidates, round_no):

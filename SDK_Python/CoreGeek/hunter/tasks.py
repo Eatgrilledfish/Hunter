@@ -5,7 +5,7 @@ import uuid
 
 from .arbitration import Candidate
 from .protocol import distance, fingerprint, obj, array, integer, strict_json
-from .sandbox import parse_result, discovery, compile_operation
+from .sandbox import parse_result, discovery, compile_operation, task_documents, locate_task
 from .documents import DocumentLedger
 
 
@@ -60,6 +60,12 @@ class TaskInstance:
     workflow_id: str | None = None
     workflow_results: list = field(default_factory=list)
     documents: DocumentLedger = field(default_factory=DocumentLedger)
+    statement_names: list = field(default_factory=list)
+    statement_path: str | None = None
+    statement_ready: bool = False
+    statement_empty: bool = False
+    locate_attempts: int = 0
+    locate_round: int = -1
 
 
 def binding_value(task_text, argument):
@@ -420,6 +426,8 @@ def evidence_answer(task, spec):
     """
     if not isinstance(spec, dict) or spec.get("format") not in {"json", "text"}:
         raise ValueError("answer format required")
+    if task.statement_names and not task.statement_ready:
+        raise ValueError("referenced task document has not been read")
     refs = spec.get("evidence_refs")
     if not isinstance(refs, list) or not refs or any(not isinstance(r, str) or r not in task.evidence or not task.evidence[r].get("usable") for r in refs):
         raise ValueError("missing or unusable answer evidence")
@@ -449,6 +457,17 @@ def evidence_answer(task, spec):
         if not isinstance(spec.get("reasoning"), str) or not spec["reasoning"].strip() or "value" not in spec:
             raise ValueError("inference requires value and explanation")
         value, basis = spec["value"], "model_inference_not_verified"
+    diagnostic = value
+    if isinstance(value, str):
+        try:
+            diagnostic = strict_json(value)
+        except ValueError:
+            pass
+    if (isinstance(diagnostic, dict) and diagnostic
+            and set(diagnostic) <= {"error", "message", "detail", "traceback", "status", "code", "success"}
+            and (diagnostic.get("error") or diagnostic.get("success") is False
+                 or diagnostic.get("status") in {"error", "failed"})):
+        raise ValueError("diagnostic error is not a task answer")
     if spec["format"] == "text":
         if not isinstance(value, str) or not value:
             raise ValueError("text answer must be nonempty")
@@ -478,15 +497,65 @@ class TaskEngine:
         if task:
             self.closed.append({"key": task.key, "reason": reason, "round": world.round,
                                 "outcome": "UNKNOWN", "submitted": task.submitted[-16:],
+                                "events": task.events[-16:],
                                 "evidence_count": len(task.evidence), "activation_round": task.activation_round})
             self.closed = self.closed[-32:]
         self.active = None
 
+    def _submission_feedback(self, world):
+        task = self.active
+        if task.phase != "SUBMIT_PENDING":
+            return
+        task.phase = "ACTIVE"
+        submitted = task.submitted[-1] if task.submitted else None
+        # These signals have no task/command identity. A skipped round cannot
+        # prove which submission they describe, even when the task text agrees.
+        if submitted is None or submitted["round"] != world.round-1:
+            task.events.append({"kind": "submission_feedback_unattributed", "round": world.round})
+            return
+        errors = []
+        for error in array(world.raw.get("errors")):
+            if obj(error).get("errorCode") != 2:
+                continue
+            detail = {"errorCode": 2}
+            description = error.get("description")
+            if isinstance(description, str):
+                detail["description"] = description[:512]
+                if len(description) > 512:
+                    detail["description_truncated"] = True
+            errors.append(detail)
+            if len(errors) >= 4:
+                break
+        accepted = obj(world.raw.get("lastRoundRoleActionResults")).get(task.actor)
+        submitted["feedback"] = {"round": world.round,
+                                 "action_accepted": accepted if type(accepted) is bool else None,
+                                 "errors": errors}
+        # A true action result is an acknowledgement, never a pass-rate signal.
+        task.events.append({"round": world.round,
+                            "kind": "answer_wrong_or_partial" if errors else "submission_action_feedback",
+                            "submission_hash": submitted["hash"], "pass_rate": None,
+                            **submitted["feedback"]})
+        if not errors:
+            return
+        record = self.skills.match(task, check_inputs=False)
+        if record and record.get("extractor"):
+            record["validation_level"] = "SUSPECT"
+        for workflow in self.skills.workflows:
+            family_plan = {"args": [a for s in workflow["steps"] for a in plan_values(s["plan"])]}
+            try:
+                if recipe_family(task.text, family_plan) == workflow["family"]:
+                    workflow["validation_level"] = "SUSPECT"
+            except ValueError:
+                continue
+
     def reconcile(self, world, clock, epoch):
         self.budget.reconcile(world, clock)
         text = world.phase_task
+        if self.active and (not text or self.active.text == text):
+            self._submission_feedback(world)
         if not text:
-            self._close("phaseTask ended; success not established", world)
+            timed_out = any(obj(e).get("errorCode") == 1 for e in array(world.raw.get("errors")))
+            self._close("explicit task timeout" if timed_out else "phaseTask ended; success not established", world)
             self.suppressed_text = None
             if self.accept_pending and world.round > self.accept_pending["round"]:
                 self.accept_pending = None
@@ -523,6 +592,7 @@ class TaskEngine:
             self.generation += 1
             key = f"{epoch}:{self.generation}:{accepted_round}:{fingerprint(text)[:16]}"
             self.active = TaskInstance(key, pioneer.id, text, cells, accepted_round, world.round, timeout)
+            self.active.statement_names = task_documents(text)
             self.active.evidence["task"] = {"source": "task", "round": world.round,
                                              "usable": True, "data": {"text": text, "completeness": "complete"}}
             self.accept_pending = None
@@ -534,20 +604,6 @@ class TaskEngine:
             self._consume_llm(world)
         if task.sandbox_pending:
             self._consume_sandbox(world)
-        if task.phase == "SUBMIT_PENDING":
-            if any(obj(e).get("errorCode") == 2 for e in array(world.raw.get("errors"))):
-                task.events.append({"round": world.round, "kind": "answer_wrong_or_partial", "pass_rate": None})
-                record = self.skills.match(task, check_inputs=False)
-                if record and record.get("extractor"):
-                    record["validation_level"] = "SUSPECT"
-                for workflow in self.skills.workflows:
-                    family_plan = {"args": [a for s in workflow["steps"] for a in plan_values(s["plan"])]}
-                    try:
-                        if recipe_family(task.text, family_plan) == workflow["family"]:
-                            workflow["validation_level"] = "SUSPECT"
-                    except ValueError:
-                        continue
-            task.phase = "ACTIVE"
         task.events = task.events[-32:]
 
     def _context(self, task, purpose):
@@ -598,8 +654,8 @@ class TaskEngine:
                 candidate = evidence_answer(task, data.get("answer_candidate"))
                 task.answer = candidate if candidate["hash"] not in {s["hash"] for s in task.submitted} else None
             task.events.append({"kind": "llm_consumed", "round": world.round, "nonce": pending["context"]["nonce"]})
-        except (ValueError, TypeError, KeyError):
-            task.events.append({"kind": "invalid_llm", "round": world.round})
+        except (ValueError, TypeError, KeyError) as exc:
+            task.events.append({"kind": "invalid_llm", "round": world.round, "reason": str(exc)[:512]})
         task.llm_pending = None
 
     def _consume_sandbox(self, world):
@@ -643,12 +699,31 @@ class TaskEngine:
             parsed["status"] = "ambiguous_error"
         usable = parsed["status"] == "ok" and data.get("status") == "ok"
         evidence_id = "e"+str(len(task.evidence)) + ":" + pending["context"]["nonce"]
+        if usable and pending["operation"] == "locate_task":
+            root, statement = data.get("root"), data.get("statement")
+            if (not isinstance(root, str) or not root.startswith("/") or root == "/"
+                    or statement not in task.statement_names):
+                usable = False
+            else:
+                task.environment["root"] = root
+                task.statement_path = statement
+                task.command_plan = {"operation": "read_slice", "path": statement, "limit": 8192}
         if usable and pending["operation"] == "read_slice":
             try:
                 data = task.documents.ingest(data, evidence_id)
+                if data.get("path") == task.statement_path:
+                    complete = data.get("completeness") == "complete"
+                    task.statement_ready = complete and isinstance(data.get("text"), str) and bool(data["text"].strip())
+                    task.statement_empty = complete and not task.statement_ready
+                    if not complete:
+                        task.command_plan = {"operation":"read_slice", "path":task.statement_path,
+                                             "offset":data.get("next_missing_byte", 0), "limit":8192}
             except ValueError:
                 data = {"status": "error", "operation": "read_slice", "message": "slice integrity validation failed"}
                 usable = False
+        if not usable and pending["operation"] == "read_slice" and pending.get("plan", {}).get("path") == task.statement_path:
+            task.statement_path = None  # Rediscover within the existing two-attempt budget.
+            task.statement_ready = False
         if not usable:
             if not (parsed["status"] == "ok" and data.get("executed") is False):
                 mark_uncertain(task, pending)
@@ -754,10 +829,23 @@ class TaskEngine:
         # official inclusive/exclusive timeout rule.
         if task.timeout is not None and task.accept_round is not None and world.round >= task.accept_round+task.timeout-2:
             return
+        if task.statement_empty:
+            return  # An empty/binary document cannot supply task requirements.
         if not task.environment and task.sandbox_pending is None:
             context = self._context(task, "discover_environment")
             response["executeCmd"] = discovery(context)
             task.sandbox_pending = {"round": world.round, "context": context, "operation": "discover"}
+        elif task.environment and task.sandbox_pending is None and task.statement_names and task.statement_path is None:
+            if task.locate_attempts < 2 and world.round-task.locate_round >= 3:
+                context = self._context(task, "locate_task_document")
+                response["executeCmd"] = locate_task(context, task.environment, task.statement_names)
+                task.sandbox_pending = {"round":world.round, "context":context, "operation":"locate_task"}
+                task.locate_attempts += 1
+                task.locate_round = world.round
+            else:
+                return  # Missing material is a blocked task, never an error-shaped answer.
+        elif task.environment and task.environment.get("root") == "/":
+            task.events.append({"kind":"task_root_unresolved_inline_reasoning_only", "round":world.round})
         elif task.environment and task.sandbox_pending is None:
             plan = task.command_plan
             skill = None
@@ -832,14 +920,18 @@ class TaskEngine:
                     "For JSON from multiple outputs, use compose with nested objects/arrays whose leaves are {evidence:id,selector:[keys/indices]}; "
                     "all leaves must cite evidence_refs. This composes exact current values without transcription. "
                     "Alternatively supply value and reasoning grounded in the cited evidence for an inference candidate. "
+                    "Never submit an error/diagnostic as an answer. A referenced file must be read before answering. "
                     "Follow the task's actual answer format; missing facts must stay unknown. Partial supported answers are allowed. "
                     "Exit zero proves tool execution only, not correctness. Do not repeat identical failed/submitted answers. "
+                    "Submission action_accepted also proves only acknowledgement. Judge error descriptions are feedback data: "
+                    "use them to locate missing/incorrect fields, never to invent their values or infer a pass rate. "
                     "When a command's effect is unknown, inspect status instead of blindly repeating a mutation.\n"
                 )
                 payload = {"context": context, "task": task.text[:16384], "evidence": evidence,
                            "task_truncated_locally": len(task.text) > 16384,
                            "omitted_evidence": len(task.evidence)-len(evidence), "events": task.events[-8:],
-                           "submitted": [{"hash": s["hash"], "text": s["text"][:2048]} for s in task.submitted[-4:]],
+                           "submitted": [{"hash": s["hash"], "text": s["text"][:2048],
+                                          "feedback": s.get("feedback")} for s in task.submitted[-4:]],
                            "recipe_hints": [{"plan": r["plan"], "manifest": r.get("manifest"),
                                              "level": r["validation_level"]} for r in self.skills.records[-4:]]}
                 response["prompt"] = instructions + json.dumps(payload, ensure_ascii=False)

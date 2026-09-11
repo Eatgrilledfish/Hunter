@@ -15,16 +15,25 @@ def movement(actor, steps, value, reason, *, route_goal=None):
             for i, p in enumerate(steps[:4])]
 
 
+def construction_cash_reserve(world, policy):
+    # Establish two guns before saving for replenishment. A cash reserve with
+    # no current shop/Medicine has no executable use and must not block builds.
+    if (policy is None or len(world.weapons) < 2 or not world.zones.get("weaponShop")
+            or world.shop.get("Medicine", 0) <= 0):
+        return 0
+    return policy.reserve_gold
+
+
 def construction_jobs(world, rules, policy=None):
     if policy is not None and policy.weapon_portfolio_enabled:
         try:
-            return _construction_jobs(world, rules, portfolio=True, repair_saturation=policy.portfolio_saturation_enabled)
+            return _construction_jobs(world, rules, portfolio=True, repair_saturation=policy.portfolio_saturation_enabled, reserve_gold=construction_cash_reserve(world, policy))
         except TimeoutError:
             pass  # Discard the whole partial portfolio, retain complete baseline.
-    return _construction_jobs(world, rules)
+    return _construction_jobs(world, rules, reserve_gold=construction_cash_reserve(world, policy))
 
 
-def _construction_jobs(world, rules, portfolio=False, repair_saturation=False):
+def _construction_jobs(world, rules, portfolio=False, repair_saturation=False, reserve_gold=0):
     """Assign prospective material jobs within current gold, cells and slots.
 
     Materials remain personal. This is recomputed from observations every turn;
@@ -38,12 +47,15 @@ def _construction_jobs(world, rules, portfolio=False, repair_saturation=False):
     available = {name: (rule, {p for p in rule.cells if world.inside(p) and p not in world.occupied})
                  for name in sorted(WEAPONS | {"wall"}) if (rule := rules.build_rule(world, name)) is not None}
     result, reserved_cells = {}, set()
-    gold, slots = world.gold, max(0, rules.weapon_limit-len(world.weapons))
+    gold, slots = max(0, world.gold-reserve_gold), max(0, rules.weapon_limit-len(world.weapons))
     wall_slots = max(0, rules.wall_limit-rules.wall_count(world))
+    # Optional walls must not tie up the entire workforce while cash is needed.
+    earnable = bool(world.zones.get("vendor")) and any(world.vendor.get(k, 0)>0 and world.zones.get(k) for k in MINERALS)
+    wall_workers = max(0, len(workers)-1) if earnable else len(workers)
     while workers:
         options = []
         for name, (rule, cells) in available.items():
-            if rule.gold > gold or (name in WEAPONS and not slots) or (name == "wall" and not wall_slots):
+            if rule.gold > gold or (name in WEAPONS and not slots) or (name == "wall" and (not wall_slots or wall_workers <= 0)):
                 continue
             for identity, actor in workers.items():
                 targets = cells-reserved_cells
@@ -63,6 +75,7 @@ def _construction_jobs(world, rules, portfolio=False, repair_saturation=False):
         gold -= rule.gold
         slots -= int(name in WEAPONS)
         wall_slots -= int(name == "wall")
+        wall_workers -= int(name == "wall")
         if name in WEAPONS:
             planned.append((name,1,target))
         workers.pop(identity)
@@ -87,7 +100,7 @@ def ready_construction(world, clock, rules, policy, deadline, *, jobs=None):
         if (time.monotonic() >= deadline or job["name"] not in WEAPONS or actor.backpack is None
                 or any(actor.inventory[name] < amount for name, amount in job["items"].items())):
             continue
-        result.extend(construction(world, clock, rules, actor, deadline, names={job["name"]}, target_cell=job["target"], finish_before_night=True))
+        result.extend(construction(world, clock, rules, actor, deadline, names={job["name"]}, target_cell=job["target"], finish_before_night=True, reserve_gold=construction_cash_reserve(world, policy)))
     return result
 
 
@@ -147,7 +160,7 @@ def operator_goals(world, actor):
                                       distance(actor.pos, p), p))
 
 
-def construction(world, clock, rules, actor, deadline, *, names=None, target_cell=None, finish_before_night=False):
+def construction(world, clock, rules, actor, deadline, *, names=None, target_cell=None, finish_before_night=False, reserve_gold=0):
     if clock.phases != {"day"} or not world.stations:
         return []
     station = world.stations[0]
@@ -156,7 +169,7 @@ def construction(world, clock, rules, actor, deadline, *, names=None, target_cel
     options = []
     for name in sorted(names if names is not None else WEAPONS | {"wall"}):
         rule = rules.build_rule(world, name)
-        if rule is None or rule.gold > (world.gold or 0) or any(actor.inventory[k] < n for k, n in rule.items.items()):
+        if rule is None or rule.gold > max(0, (world.gold or 0)-reserve_gold) or any(actor.inventory[k] < n for k, n in rule.items.items()):
             continue
         if name in WEAPONS and len(world.weapons) >= rules.weapon_limit:
             continue
@@ -262,7 +275,7 @@ def propose(world, clock, rules, policy, deadline, task_actor=None, operator_sta
         if policy.weapon_portfolio_enabled:
             job = build_jobs.get(actor.id)
             if job:
-                result.extend(construction(world, clock, rules, actor, deadline, names={job['name']}, target_cell=job['target']))
+                result.extend(construction(world, clock, rules, actor, deadline, names={job['name']}, target_cell=job['target'], reserve_gold=construction_cash_reserve(world, policy)))
         else:
-            result.extend(construction(world, clock, rules, actor, deadline))
+            result.extend(construction(world, clock, rules, actor, deadline, reserve_gold=construction_cash_reserve(world, policy)))
     return result

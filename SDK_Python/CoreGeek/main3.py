@@ -22,6 +22,8 @@ app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024  # Local input budget, not an
 app.json.ensure_ascii = False
 diagnostics = Diagnostics()
 logging.getLogger("hunter").addHandler(diagnostics)
+logging.getLogger("hunter").propagate = False  # Avoid a second unbounded traceback via the root handler.
+logging.getLogger("werkzeug").setLevel(logging.WARNING)  # Successful POST access lines are redundant.
 agent = Agent(diagnostics=diagnostics, rules=Rules.load(os.environ["HUNTER_RULES_PATH"]) if os.environ.get("HUNTER_RULES_PATH") else None,
               policy=Policy.load(os.environ["HUNTER_POLICY_PATH"]) if os.environ.get("HUNTER_POLICY_PATH") else None)
 
@@ -40,9 +42,10 @@ def process_request():
     body = request.get_data(cache=False)
     try:
         data = strict_json(body.decode("utf-8"))
-    except (ValueError, UnicodeError):
-        diagnostics.event("malformed_request", raw_base64=base64.b64encode(body).decode("ascii"),
-                          response=empty_response(), http_status=200)
+    except (ValueError, UnicodeError) as exc:
+        detail = {"raw_base64":base64.b64encode(body).decode("ascii"),"response":empty_response()} if diagnostics.mode == "full" else {
+            "bytes":len(body),"error":type(exc).__name__,"detail":str(exc)[:160]}
+        diagnostics.event("malformed_request", **detail, http_status=200)
         return jsonify(empty_response())
     return jsonify(callback(data))
 

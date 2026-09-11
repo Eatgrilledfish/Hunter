@@ -8,7 +8,7 @@ import time
 
 from . import combat, economy, director, joint_lookahead
 from .arbitration import select
-from .protocol import parse_request, fingerprint, empty_response, validate_response
+from .protocol import parse_request, fingerprint, empty_response, validate_response, distance, position
 from .rules import Rules, Policy, Clock
 from .state import Session
 
@@ -97,6 +97,8 @@ class Agent:
             deadline = start + self.policy.planning_seconds
             guidance = director.propose(world, clock, task_actor, draft.tasks.active, min(deadline, time.monotonic()+0.12), self.policy, draft.risk,
                                         failed_steps=draft.failed_move_steps(world) if self.policy.return_detour_enabled else None)
+            for actor in world.movers:
+                guidance.blocked_moves.setdefault(actor.id, set()).update(world.navigation_avoided.get(actor.pos, set()))
             # Check the return/triage incumbent before procurement or other
             # optional preparation can fail. Failed actions are excluded here
             # as well as in the final selection.
@@ -254,6 +256,10 @@ class Agent:
                       "risk_scenarios": guidance.observations, "operator_stands": guidance.operator_stands,
                       "operator_plan_status": guidance.operator_plan_status,
                       "return_routes": guidance.return_routes,
+                      "navigation_retry_exclusions": {u.id:sorted(world.navigation_avoided.get(u.pos, set())) for u in world.movers},
+                      "movement_retry_windows": draft.move_retry_windows(world.round),
+                      "construction_jobs": build_jobs,
+                      "feedback_counts": dict(draft.feedback_counts),
                       "construction_commitments": sorted(guidance.construction_actions),
                       "upgrade_commitments": sorted(guidance.upgrade_actions),
                       "base_recovery": deepcopy(draft.recovery.diagnostic),
@@ -269,11 +275,23 @@ class Agent:
                 self.telemetry.append(record)
                 self._diagnostic("decision", **record)
                 if self.diagnostics is not None:
+                    checks = []
+                    for identity, command in response["roleCommandMap"].items():
+                        if command["action"] != "attack":
+                            continue
+                        gun = world.ours[identity]
+                        controller = world.ours[command["controllerId"]]
+                        checks.append({"weapon":identity, "controller":controller.id, "range":gun.attack_range,
+                                       "controller_distance":distance(gun.pos,controller.pos), "cooldown":gun.cooldown,
+                                       "level":gun.level, "target_distances":[distance(gun.pos,position(p)) for p in command["targetPos"]]})
+                    self._diagnostic("attack_checks", checks=checks, metric="chebyshev")
+                if self.diagnostics is not None:
                     task = draft.tasks.active
                     self._diagnostic("task_state", active={name: getattr(task, name, None) for name in
                         ("key", "actor", "phase", "seq", "accept_round", "activation_round", "timeout",
-                         "llm_pending", "sandbox_pending", "command_plan", "answer", "submitted", "events",
-                         "uncertain_operations", "executions", "workflow_id", "workflow_results")} if task else None,
+                         "llm_pending", "sandbox_pending", "command_plan", "answer", "submitted", "events", "environment",
+                         "uncertain_operations", "executions", "workflow_id", "workflow_results",
+                         "statement_names", "statement_path", "statement_ready", "statement_empty", "locate_attempts")} if task else None,
                         accept_pending=draft.tasks.accept_pending, closed=draft.tasks.closed,
                         budget=draft.tasks.budget)
 

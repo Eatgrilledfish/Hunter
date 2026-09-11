@@ -394,7 +394,7 @@ def triage(world, clock, task_actor, task, policy=None):
         risk = exposure(world, clock, actor.pos)
         result.observations[actor.id] = risk
         upper = risk["upper_per_attack_opportunity"]
-        if policy.lethal_entry_guard_enabled and clock.phases == {"night"} and upper < actor.health:
+        if (policy.lethal_entry_guard_enabled or actor.kind == "pioneer") and clock.phases == {"night"} and upper < actor.health:
             blocked = []
             for pos in neighbours(actor.pos):
                 if not world.inside(pos) or pos in world.occupied:
@@ -408,7 +408,15 @@ def triage(world, clock, task_actor, task, policy=None):
             continue
         critical = upper >= actor.health
         # These thresholds are triage policy, not calibrated mortality estimates.
-        if not critical and upper*2 < actor.health:
+        # A travelling pioneer often cannot return fire; waiting for half HP
+        # before offering escape reproduced the first-night death in the report.
+        can_control = any(distance(actor.pos, gun.pos) <= 1 and gun.cooldown in (0, None)
+                          and gun.attack_range is not None and any(
+                              robot.alive and distance(robot.pos, gun.pos) <= gun.attack_range
+                              for robot in world.robots.values()) for gun in world.weapons)
+        travelling_pioneer = (actor.kind == "pioneer" and actor.id != task_actor
+                              and (world.navigation_avoided.get(actor.pos) or (not can_control and upper*4 >= actor.health)))
+        if not critical and upper*2 < actor.health and not travelling_pioneer:
             continue
         if actor.inventory["Medicine"]:
             maximum = 200 if actor.kind == "pioneer" else 220
@@ -465,6 +473,22 @@ def propose(world, clock, task_actor, task, deadline, policy=None, risk_memory=N
         result.operator_plan_status = "optimized"
     result.return_routes = baseline[0]
     result.candidates.extend(baseline[1])
+    # With fewer guns than roles, an unassigned pioneer still needs a return
+    # destination. The base is a landmark, not assumed invulnerability.
+    if world.stations and policy.pioneer_defence_enabled:
+        for actor in world.movers:
+            if actor.kind != "pioneer" or actor.id == task_actor or actor.id in result.operator_stands:
+                continue
+            goals = interaction_cells(world, [p for station in world.stations for p in station.cells], actor.pos)
+            field = distance_field(world, [actor.pos], actor.pos, deadline)
+            reachable = goals & field.keys()
+            if not reachable:
+                continue
+            stand = min(reachable, key=lambda p:(exposure(world, clock, p)["upper_per_attack_opportunity"], field[p], p))
+            shelter = return_plan(world, clock, {actor.id:stand}, policy, deadline, failed_steps=failed_steps)
+            if shelter is not None:
+                result.return_routes.update(shelter[0])
+                result.candidates.extend(shelter[1])
     for actor in world.movers:
         actor_task = task if actor.id == task_actor else None
         proposed, observation = lookahead.propose(world, clock, actor, actor_task, risk_memory,

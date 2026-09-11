@@ -11,7 +11,7 @@ def neighbours(pos):
 
 
 def interaction_cells(world, targets, actor_pos=None, extra_blocked=()):
-    blocked = world.occupied | set(extra_blocked)
+    blocked = world.occupied | set(extra_blocked) | world.navigation_avoided.get(actor_pos, set())
     if actor_pos is not None:
         blocked = blocked - {actor_pos}
     return {p for target in targets for p in neighbours(target) + [target]
@@ -19,7 +19,7 @@ def interaction_cells(world, targets, actor_pos=None, extra_blocked=()):
 
 
 def distance_field(world, goals, actor_pos, deadline=float("inf"), extra_blocked=()):
-    blocked = (world.occupied | set(extra_blocked)) - {actor_pos}
+    blocked = (world.occupied | set(extra_blocked) | world.navigation_avoided.get(actor_pos, set())) - {actor_pos}
     distances = {p: 0 for p in sorted(goals) if world.inside(p) and p not in blocked}
     queue = deque(distances)
     count = 0

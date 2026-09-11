@@ -1,4 +1,5 @@
-"""Structured stdout diagnostics; the competition platform owns log collection."""
+"""Copyable stdout summaries by default; full event capture is opt-in."""
+from collections import Counter, OrderedDict
 from dataclasses import asdict, is_dataclass
 import hashlib
 import json
@@ -11,18 +12,226 @@ import time
 import traceback
 import uuid
 
+from .protocol import obj, array
+
 
 class Diagnostics(logging.Handler):
-    def __init__(self):
+    def __init__(self, mode=None, interval=20):
         super().__init__(logging.WARNING)
+        self.mode = "full" if (mode or os.environ.get("HUNTER_LOG_MODE")) == "full" else "compact"
+        self.interval = max(1, int(interval))
         self.run_id = uuid.uuid4().hex
         self.local = threading.local()
         self.output_lock = threading.RLock()
         self.sequence = 0
+        self.sessions = OrderedDict()
+        self.external_counts = Counter()
+
+    @staticmethod
+    def _brief(value, limit=160):
+        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+        return text if len(text) <= limit else text[:limit-1] + "…"
+
+    @staticmethod
+    def _pos(value):
+        return f"{value.get('x','?')},{value.get('y','?')}" if isinstance(value, dict) else "?"
+
+    def _command(self, command):
+        action = command.get("action", "?")
+        detail = command.get("controllerId", "")
+        if "targetPos" in command:
+            detail += ">" + ";".join(self._pos(p) for p in command["targetPos"][:3])
+        if "name" in command:
+            detail += ":" + str(command["name"]) + "*" + str(command.get("num",1))
+        if "taskAnswer" in command:
+            answer = command["taskAnswer"]
+            detail += ":" + self._brief(answer,72) + "#" + hashlib.sha256(answer.encode()).hexdigest()[:8]
+        return self._brief(action + detail,120)
+
+    def _write_compact(self, event, **data):
+        record = dict(schema=2, run=self.run_id[:8], round=getattr(self.local,"round",None), event=event, **data)
+        # Valid single-line JSON, never a byte slice of a serialized record.
+        # Essential issue details take precedence over optional current context.
+        for optional in ("reasons", "channels", "commands", "units", "task"):
+            if len(json.dumps(record,ensure_ascii=False,separators=(",", ":")).encode()) <= 1400:
+                break
+            record.pop(optional,None)
+            record["context_cut"] = True
+        if len(json.dumps(record,ensure_ascii=False,separators=(",", ":")).encode()) > 1400:
+            record["issue"] = [self._brief(i,100) for i in record.get("issue",[])[:2]]
+            record["context_cut"] = True
+            if "detail" in record:
+                record["detail"] = self._brief(record["detail"],180)
+        print("HUNTER " + json.dumps(record,ensure_ascii=False,separators=(",", ":")),flush=True)
+
+    def _compact_event(self, event, data):
+        if event == "decision":
+            self.local.decision = data
+        elif event == "attack_checks":
+            self.local.attacks = data.get("checks",[])
+        elif event == "task_state":
+            active = data.get("active") or {}
+            pending = active.get("sandbox_pending") or {}
+            closed = data.get("closed") or []
+            self.local.task = {
+                "id": hashlib.sha256(str(active.get("key")).encode()).hexdigest()[:8] if active else None,
+                "phase":active.get("phase"), "file":self._brief(active.get("statement_path"),100),
+                "root":self._brief((active.get("environment") or {}).get("root"),100),
+                "read":active.get("statement_ready"), "op":pending.get("operation"),
+                "llm":bool(active.get("llm_pending")),
+                "last": self._brief(active.get("events",[])[-1:],180),
+                "end":self._brief(closed[-1].get("reason"),120) if not active and closed else None}
+            self.local.task = {k:v for k,v in self.local.task.items() if v is not None and v not in ("null","[]")}
+            if not active and not closed:
+                self.local.task = {}
+        elif event not in {"request","response"}:
+            issue = self._brief({"kind":event,**data},320)
+            if hasattr(self.local,"issues"):
+                self.local.issues.append(issue)
+                if event in {"exception","uncaught_exception"}:
+                    self.local.critical = True
+            else:
+                # Malformed requests can recur without entering Agent.callback.
+                with self.output_lock:
+                    self.external_counts[event] += 1
+                    count = self.external_counts[event]
+                    if count == 1 or count % self.interval == 0:
+                        self._write_compact(event,count=count,detail=issue)
+
+    def _compact_turn(self, raw, response, elapsed):
+        raw = obj(raw)
+        team = obj(raw.get("teamOur"))
+        key = (str(team.get("teamId","?")),str(team.get("type","?")))
+        number = raw.get("roundNo")
+        commands = {str(k):self._command(c) for k,c in response.get("roleCommandMap",{}).items()}
+        units = {str(u.get("id")):u for u in array(team.get("roles")) if isinstance(u,dict)}
+        with self.output_lock:
+            state = self.sessions.setdefault(key,dict(round=None,commands={},units={},attacks={},
+                failures={},seen=set(),stats=Counter(),calls=0,task=None,issues=[],issue_round=None,
+                details=0,critical_reported=False,targets={}))
+            self.sessions.move_to_end(key)
+            while len(self.sessions)>4:
+                self.sessions.popitem(last=False)
+            if type(number) is not int or (state["round"] is not None and number<=state["round"]):
+                state["stats"]["duplicate_or_stale"] += 1
+                if self.local.outcome not in {"ok","cache_hit","isolated_stale_or_other_session"}:
+                    count = state["stats"]["duplicate_or_stale"]
+                    if count == 1 or count % self.interval == 0:
+                        self._write_compact("callback_error",count=count,outcome=self.local.outcome,
+                                            issue=getattr(self.local,"issues",[])[:2])
+                return
+            previous_round = state["round"]
+            state["calls"] += 1
+            state["stats"].update(c.get("action","?") for c in response.get("roleCommandMap",{}).values())
+            issues = list(getattr(self.local,"issues",[]))[:2]
+            critical = getattr(self.local,"critical",False)
+            if critical:
+                state["stats"]["exceptions"] += 1
+            failures = []
+            new_failure = False
+            feedback = obj(raw.get("lastRoundRoleActionResults"))
+            for actor, accepted in feedback.items():
+                actor = str(actor)
+                if accepted is not False:
+                    if accepted is True:
+                        state["failures"].pop(actor,None)
+                    continue
+                state["stats"]["action_fail"] += 1
+                attributed = previous_round is not None and number == previous_round+1 and actor in state["commands"]
+                action = state["commands"].get(actor) if attributed else "unknown_previous_command"
+                origin = self._pos(state["units"].get(actor,{}).get("pos")) if attributed else "?"
+                signature = (action,origin)
+                old = state["failures"].get(actor)
+                count = old[1]+1 if old and old[0]==signature else 1
+                state["failures"][actor] = (signature,count)
+                new_failure |= count == 1
+                detail = f"{actor} {action} from={origin} now={self._pos(units.get(actor,{}).get('pos'))} n={count}"
+                if attributed and actor in state["attacks"]:
+                    check = state["attacks"][actor]
+                    detail += " check=" + self._brief({"control_d":check.get("controller_distance"),
+                        "range":check.get("range"),"target_d":check.get("target_distances"),"cd":check.get("cooldown")},140)
+                elif attributed and state["targets"].get(actor):
+                    detail += " occupied=" + state["targets"][actor]
+                failures.append(self._brief(detail,260))
+            for error in array(raw.get("errors"))[:3]:
+                if isinstance(error,dict):
+                    state["stats"]["error_"+self._brief(str(error.get("errorCode")),8)] += 1
+                    detail = "judge:"+self._brief(error,180)
+                    if error.get("errorCode")==2 and previous_round is not None and number==previous_round+1:
+                        submitted = [(a,c) for a,c in state["commands"].items() if c.startswith("submitAnswer")]
+                        if submitted:
+                            actor, action = submitted[0]
+                            detail += f" after={actor} ack={feedback.get(actor)} {action}"
+                    issues.append(self._brief(detail,320))
+            task = getattr(self.local,"task",{})
+            task_marker = (task.get("id"),task.get("phase"),task.get("file"),task.get("read"),task.get("end"))
+            task_changed = task_marker != state["task"] and bool(task.get("id") or task.get("end"))
+            # Keep the latest issue sample in periodic summaries even when
+            # repeated individual reports are suppressed.
+            if issues or failures:
+                state["issues"] = (issues+failures)[:3]
+                state["issue_round"] = number
+            fresh_issue = any(i not in state["seen"] for i in issues)
+            state["seen"].update(issues)
+            if len(state["seen"])>32:
+                state["seen"] = set(issues)
+            periodic = state["calls"] % self.interval == 0
+            trigger = new_failure or fresh_issue or task_changed
+            # At most two extra lines per twenty accepted observations. The
+            # periodic summary retains counters and the latest suppressed issue.
+            urgent = critical and fresh_issue and not state["critical_reported"]
+            emit = state["calls"] == 1 or periodic or urgent or (trigger and state["details"]<2)
+            if trigger and not emit:
+                state["stats"]["merged_events"] += 1
+            if emit:
+                if critical:
+                    state["critical_reported"] = True
+                if state["calls"] != 1 and not periodic:
+                    state["details"] += 1
+                mobiles = [f"{i}@{self._pos(u.get('pos'))}/{u.get('health','?')}" for i,u in units.items()
+                           if u.get("roleType") in {"worker","pioneer"}][:3]
+                bases = [u.get("health") if type(u.get("health")) is int else None
+                         for u in units.values() if u.get("roleType")=="station"][:2]
+                decision = getattr(self.local,"decision",{})
+                reasons = [self._brief(f"{c.get('actor')}:{c.get('reason')}",90) for c in decision.get("selected",[])][:3]
+                channels = {k:self._brief(raw.get(k),140) for k in ("lastCmdResult","llmResp") if raw.get(k)} if issues else {}
+                self._write_compact("summary" if periodic else "turn",team=self._brief("/".join(key),48),
+                    gold=team.get("goldNum") if type(team.get("goldNum")) is int else None,
+                    score=team.get("totalScore") if type(team.get("totalScore")) is int else None,base_hp=bases,
+                    robots=len(array(obj(raw.get("robot")).get("roles"))),units=mobiles,
+                    commands=commands,task=task,reasons=reasons,channels=channels,
+                    issue=state["issues"] if periodic else (issues+failures)[:3],
+                    issue_round=state["issue_round"] if periodic else number if issues or failures else None,
+                    stats=dict(state["stats"]),ms=round(elapsed,1),outcome=self.local.outcome)
+            occupied = {}
+            for group in (team,obj(raw.get("teamEnemy")),obj(raw.get("robot"))):
+                for unit in array(group.get("roles")):
+                    unit = obj(unit); pos = obj(unit.get("pos"))
+                    if unit.get("health")==0 or type(pos.get("x")) is not int or type(pos.get("y")) is not int:
+                        continue
+                    cells = [(pos['x'],pos['y'])]
+                    if unit.get('roleType')=='station':
+                        cells += [(pos['x']+1,pos['y']),(pos['x'],pos['y']-1),(pos['x']+1,pos['y']-1)]
+                    for x,y in cells:
+                        occupied[f"{x},{y}"] = f"{unit.get('id')}:{unit.get('roleType')}"
+            for zone in array(obj(raw.get("mapInfo")).get("zones")):
+                zone = obj(zone)
+                occupied[self._pos(zone.get('pos'))] = str(zone.get('neutralType'))
+            targets = {str(actor):self._brief(','.join(occupied.get(self._pos(p),'') for p in array(cmd.get('targetPos'))[:3]),100)
+                       for actor,cmd in response.get('roleCommandMap',{}).items() if cmd.get('action')=='move'}
+            state.update(round=number,commands=commands,units={i:{"pos":u.get("pos")} for i,u in units.items()},targets=targets,
+                         attacks={c.get("weapon"):c for c in getattr(self.local,"attacks",[])},task=task_marker)
+            if periodic:
+                state["stats"].clear()
+                state["details"] = 0
+                state["critical_reported"] = False
 
     def event(self, event, **data):
         # Logging must never replace a valid competition response with a failure.
         try:
+            if self.mode == "compact":
+                self._compact_event(event,data)
+                return
             payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"),
                                  default=lambda x: asdict(x) if is_dataclass(x) else
                                  sorted(x, key=repr) if isinstance(x, set) else repr(x))
@@ -44,6 +253,11 @@ class Diagnostics(logging.Handler):
                 pass
 
     def emit(self, record):
+        if self.mode == "compact":
+            where = [f"{Path(f.filename).name}:{f.lineno}:{f.name}" for f in traceback.extract_tb(record.exc_info[2])[-3:]] if record.exc_info else []
+            self.event("exception" if record.exc_info else "warning",message=self._brief(record.getMessage(),160),
+                       error=record.exc_info[0].__name__ if record.exc_info else None,at=where)
+            return
         self.event("exception" if record.exc_info else "warning", message=record.getMessage(),
                    logger=record.name, traceback="".join(traceback.format_exception(*record.exc_info))
                    if record.exc_info else None)
@@ -54,7 +268,14 @@ class Diagnostics(logging.Handler):
                   for p in sorted((root / "CoreGeek").rglob("*"))
                   if p.is_file() and p.suffix in {".py", ".json"}}
         hashes["run.sh"] = hashlib.sha256((root / "run.sh").read_bytes()).hexdigest()
+        if self.mode == "compact":
+            self._write_compact("startup",mode="compact",every=self.interval,python=sys.version.split()[0],
+                sdk=hashlib.sha256(json.dumps(hashes,sort_keys=True).encode()).hexdigest()[:12],
+                config=hashlib.sha256(repr((agent.rules,agent.policy)).encode()).hexdigest()[:12],bind="0.0.0.0")
+            return
         self.event("startup", python=sys.version, pid=os.getpid(), files=hashes,
+                   entrypoint=str(root / "CoreGeek/main3.py"), cwd=os.getcwd(),
+                   file_manifest_sha256=hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest(),
                    rules=agent.rules, policy=agent.policy)
 
     def run(self, raw, function):
@@ -62,15 +283,28 @@ class Diagnostics(logging.Handler):
         self.local.call = uuid.uuid4().hex
         self.local.round = raw.get("roundNo") if isinstance(raw, dict) else None
         self.local.outcome = "ok"
+        self.local.issues = []
+        self.local.critical = False
         started = time.monotonic()
         try:
             self.event("request", request=raw)
             response = function(raw)
+            if self.mode == "compact":
+                try:
+                    self._compact_turn(raw,response,(time.monotonic()-started)*1000)
+                except Exception:
+                    pass  # Diagnostics must not change a valid response.
             self.event("response", response=response, outcome=self.local.outcome,
                        elapsed_ms=round((time.monotonic()-started)*1000, 3))
             return response
         except Exception:
             self.event("uncaught_exception", traceback=traceback.format_exc())
+            if self.mode == "compact":
+                self.local.outcome = "uncaught_exception"
+                try:
+                    self._compact_turn(raw,{},(time.monotonic()-started)*1000)
+                except Exception:
+                    pass
             raise
         finally:
             self.local.__dict__.clear()

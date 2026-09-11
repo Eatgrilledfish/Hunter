@@ -1,6 +1,6 @@
 """Strict output contract and tolerant, uncertainty-preserving input adapter."""
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 
@@ -117,6 +117,7 @@ class World:
     tasks: list[dict]
     phase_task: str
     warnings: list[str]
+    navigation_avoided: dict = field(default_factory=dict)
 
     def inside(self, pos):
         return 0 <= pos[0] < self.width and 0 <= pos[1] < self.height
