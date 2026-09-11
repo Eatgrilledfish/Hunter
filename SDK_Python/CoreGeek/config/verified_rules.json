@@ -1,0 +1,186 @@
+{
+  "schema_version": 1,
+  "version": "user-confirmed-2026-09-10+station-rings-v3",
+  "source": "user-confirmed-2026-09-10: docs/source/TASKBOOK_USER_CONFIRMED_2026-09-10.md §4.5.1; interface from API_SPEC_ORIGINAL.md; no official runtime validation; user-confirmed build geometry: docs/source/BUILD_ZONES_USER_CONFIRMED_2026-09-10.md",
+  "round_origin": null,
+  "round_origin_source": null,
+  "empty_actions_verified": false,
+  "duplicate_targets": null,
+  "build_map_signature": null,
+  "builds": {},
+  "rail_energy": {},
+  "max_health": {},
+  "unknowns": [
+    "official SDK and run.sh",
+    "PRO-002 omitted/empty actions",
+    "TIM-001 round origin",
+    "MAP-002 boundary/overlap/opponent-building/base-destruction region lifetime",
+    "COM-002 ray rasterization/blockers/rail energy",
+    "COM-003 missing cooldown"
+  ],
+  "build_profiles": {},
+  "wall_limit": 20,
+  "wall_limit_source": "user-confirmed-2026-09-10: docs/source/TASKBOOK_USER_CONFIRMED_2026-09-10.md §4.5.1",
+  "build_costs": {
+    "gatling": {
+      "gold": 25,
+      "items": {},
+      "source": "user-confirmed-2026-09-10: docs/source/TASKBOOK_USER_CONFIRMED_2026-09-10.md §4.5.1"
+    },
+    "railgun": {
+      "gold": 25,
+      "items": {},
+      "source": "user-confirmed-2026-09-10: docs/source/TASKBOOK_USER_CONFIRMED_2026-09-10.md §4.5.1"
+    },
+    "rocket": {
+      "gold": 25,
+      "items": {},
+      "source": "user-confirmed-2026-09-10: docs/source/TASKBOOK_USER_CONFIRMED_2026-09-10.md §4.5.1"
+    },
+    "wall": {
+      "gold": 0,
+      "items": {
+        "stone": 1
+      },
+      "source": "user-confirmed-2026-09-10: docs/source/TASKBOOK_USER_CONFIRMED_2026-09-10.md §4.5.1"
+    }
+  },
+  "build_masks": {},
+  "building_stats": {
+    "station": {
+      "1": {
+        "health": 1500,
+        "attack_range": null,
+        "listed_power": null,
+        "projectiles": null,
+        "cooldown": null,
+        "source": "user-confirmed-2026-09-10: docs/source/TASKBOOK_USER_CONFIRMED_2026-09-10.md §4.5.1"
+      },
+      "2": {
+        "health": 3000,
+        "attack_range": null,
+        "listed_power": null,
+        "projectiles": null,
+        "cooldown": null,
+        "source": "user-confirmed-2026-09-10: docs/source/TASKBOOK_USER_CONFIRMED_2026-09-10.md §4.5.1"
+      },
+      "3": {
+        "health": 4500,
+        "attack_range": null,
+        "listed_power": null,
+        "projectiles": null,
+        "cooldown": null,
+        "source": "user-confirmed-2026-09-10: docs/source/TASKBOOK_USER_CONFIRMED_2026-09-10.md §4.5.1"
+      }
+    },
+    "gatling": {
+      "1": {
+        "health": 1000,
+        "attack_range": 3,
+        "listed_power": 10,
+        "projectiles": 1,
+        "cooldown": 0,
+        "source": "user-confirmed-2026-09-10: docs/source/TASKBOOK_USER_CONFIRMED_2026-09-10.md §4.5.1"
+      },
+      "2": {
+        "health": 1500,
+        "attack_range": 5,
+        "listed_power": 10,
+        "projectiles": 2,
+        "cooldown": 0,
+        "source": "user-confirmed-2026-09-10: docs/source/TASKBOOK_USER_CONFIRMED_2026-09-10.md §4.5.1"
+      },
+      "3": {
+        "health": 2000,
+        "attack_range": 7,
+        "listed_power": 10,
+        "projectiles": 3,
+        "cooldown": 0,
+        "source": "user-confirmed-2026-09-10: docs/source/TASKBOOK_USER_CONFIRMED_2026-09-10.md §4.5.1"
+      }
+    },
+    "railgun": {
+      "1": {
+        "health": 1000,
+        "attack_range": 6,
+        "listed_power": 10,
+        "projectiles": 1,
+        "cooldown": 0,
+        "source": "user-confirmed-2026-09-10: docs/source/TASKBOOK_USER_CONFIRMED_2026-09-10.md §4.5.1"
+      },
+      "2": {
+        "health": 1500,
+        "attack_range": 8,
+        "listed_power": 20,
+        "projectiles": 1,
+        "cooldown": 0,
+        "source": "user-confirmed-2026-09-10: docs/source/TASKBOOK_USER_CONFIRMED_2026-09-10.md §4.5.1"
+      },
+      "3": {
+        "health": 2000,
+        "attack_range": 10,
+        "listed_power": 30,
+        "projectiles": 1,
+        "cooldown": 0,
+        "source": "user-confirmed-2026-09-10: docs/source/TASKBOOK_USER_CONFIRMED_2026-09-10.md §4.5.1"
+      }
+    },
+    "rocket": {
+      "1": {
+        "health": 1000,
+        "attack_range": 10,
+        "listed_power": 20,
+        "projectiles": 1,
+        "cooldown": 3,
+        "source": "user-confirmed-2026-09-10: docs/source/TASKBOOK_USER_CONFIRMED_2026-09-10.md §4.5.1"
+      },
+      "2": {
+        "health": 1500,
+        "attack_range": 15,
+        "listed_power": 20,
+        "projectiles": 2,
+        "cooldown": 3,
+        "source": "user-confirmed-2026-09-10: docs/source/TASKBOOK_USER_CONFIRMED_2026-09-10.md §4.5.1"
+      },
+      "3": {
+        "health": 2000,
+        "attack_range": "map",
+        "listed_power": 20,
+        "projectiles": 3,
+        "cooldown": 3,
+        "source": "user-confirmed-2026-09-10: docs/source/TASKBOOK_USER_CONFIRMED_2026-09-10.md §4.5.1"
+      }
+    },
+    "wall": {
+      "1": {
+        "health": 1500,
+        "attack_range": null,
+        "listed_power": null,
+        "projectiles": null,
+        "cooldown": null,
+        "source": "user-confirmed-2026-09-10: docs/source/TASKBOOK_USER_CONFIRMED_2026-09-10.md §4.5.1"
+      },
+      "2": {
+        "health": 3000,
+        "attack_range": null,
+        "listed_power": null,
+        "projectiles": null,
+        "cooldown": null,
+        "source": "user-confirmed-2026-09-10: docs/source/TASKBOOK_USER_CONFIRMED_2026-09-10.md §4.5.1"
+      },
+      "3": {
+        "health": 4500,
+        "attack_range": null,
+        "listed_power": null,
+        "projectiles": null,
+        "cooldown": null,
+        "source": "user-confirmed-2026-09-10: docs/source/TASKBOOK_USER_CONFIRMED_2026-09-10.md §4.5.1"
+      }
+    }
+  },
+  "building_stats_note": "listed_power is per bullet/rocket centre, or the table-listed railgun value; projectiles records 1/2/3. This does not establish the API attackPower-to-rail-energy mapping. map means full map, not missing range.",
+  "build_geometry": {
+    "type": "station_rings_v1",
+    "source": "user-confirmed-2026-09-10: docs/source/BUILD_ZONES_USER_CONFIRMED_2026-09-10.md; screenshot and relative coordinate record"
+  }
+}
