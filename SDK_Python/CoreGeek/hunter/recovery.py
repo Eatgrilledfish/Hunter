@@ -34,8 +34,14 @@ class BaseRecovery:
             loss = max(0, reference-base.health)
             self.diagnostic["bases"][base.id] = {"reference_hp": reference, "observed_hp": base.health,
                 "loss_lower_bound": loss, "source": "verified_maximum" if verified >= prior["peak"] else "observed_peak"}
-            # 20% is a strategy threshold, not an official maximum or damage model.
-            if policy.base_recovery_enabled and loss > 0 and loss >= reference*.2:
+            # While weapons still need upgrades, reserve base priority for a
+            # critical 35% HP remainder. Ordinary damage must not consume the
+            # first weapon budget. These are policy thresholds, not game rules.
+            weapon_demand = any(u.level in (1,2) for u in world.weapons)
+            threshold = .65 if weapon_demand else .2
+            self.diagnostic['bases'][base.id].update(priority_loss_fraction=threshold,
+                weapon_demand=weapon_demand)
+            if policy.base_recovery_enabled and loss > 0 and loss >= reference*threshold:
                 result.add(base.id)
         return result
 

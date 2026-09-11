@@ -32,6 +32,48 @@ class DaySchedule:
     diagnostic: dict = field(default_factory=dict)
     day: int | None = None
 
+    def funded_delivery(self, world, clock, policy, jobs, stands, plans, deadline):
+        """Finish an actually affordable weapon circuit using its own route.
+
+        Ordinary harvesting keeps the conservative macro buffer. A funded
+        delivery may use that buffer if buy -> use -> assigned stand plus a
+        small explicit traffic/closure margin still fits before night.
+        """
+        actions=[];budgets={}
+        if not policy.upgrade_commitment_enabled or clock.phases != {'day'}:return actions,budgets
+        for identity,plan in plans.items():
+            if not plan['name'].startswith('WeaponUpgradeVoucher') or identity not in stands:continue
+            actor=world.ours[identity];job=jobs.get(identity,{})
+            if actor.kind!='worker' or (job and not job.get('gate')) or world.seal_cells:continue
+            home=distance_field(world,[stands[identity]],actor.pos,deadline)
+            target=world.ours.get(plan['target'])
+            if target is None:continue
+            ends=interaction_cells(world,[target.pos],actor.pos)
+            deliver=weighted_field(world,{p:home[p]+1 for p in ends if p in home},actor,deadline)
+            if deliver is None:continue
+            if plan['stage']=='deliver':route=deliver
+            else:
+                if (world.gold or 0)<world.shop.get(plan['name'],float('inf')):continue
+                shops=interaction_cells(world,world.zones.get('weaponShop',()),actor.pos)
+                route=weighted_field(world,{p:deliver[p]+1 for p in shops if p in deliver},actor,deadline)
+            if route is None or actor.pos not in route or time.monotonic()>=deadline:continue
+            margin=2+(1 if job.get('gate') else 0)
+            required=route[actor.pos]+margin
+            if required>clock.until_night:continue
+            # Reuse legal purchase/use candidates and their shared-gold checks;
+            # route toward a feasible interaction cell, not back via the vendor.
+            direct=[c for c in plan['candidates'] if c.command['action'] in {'buy','use'}]
+            if direct:
+                direct_cost=(home.get(actor.pos,float('inf'))+1 if plan['stage']=='deliver'
+                             else deliver.get(actor.pos,float('inf'))+1)+margin
+                if direct_cost>clock.until_night:direct=[]
+                else:required=direct_cost
+            selected=direct or self.moves(actor,route,'funded weapon circuit fits buy, use and return deadline')
+            if selected:
+                actions.extend(selected);budgets[identity]={'required':required,'left':clock.until_night,
+                    'margin':margin,'target':target.id,'stage':plan['stage']}
+        return actions,budgets
+
     def candidates(self, world, clock, policy, jobs, stands, upgrades, excluded, deadline):
         self.diagnostic={}
         if clock.day!=self.day:

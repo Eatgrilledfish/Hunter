@@ -125,8 +125,12 @@ class Diagnostics(logging.Handler):
             ended=task.get('id')!=pending['task']
             if reply or ended or number-pending['round']>2:
                 identity=pending['task'];counts.setdefault(identity,0)
+                output=llm_trace.received(reply,pending['input'].get('_documents','')) if isinstance(reply,str) and reply else {}
+                if output.get('code_hash'):
+                    mappings=state.setdefault('program_rids',{})
+                    mappings[output['code_hash']]=pending['input'].get('rid')
+                    if len(mappings)>16:del mappings[next(iter(mappings))]
                 if counts[identity]<3:
-                    output=llm_trace.received(reply,pending['input'].get('_documents','')) if isinstance(reply,str) and reply else {}
                     verdict=getattr(self.local,'llm_verdict',{})
                     record={'task':identity,'rid':pending['input'].get('rid'),'sent_round':pending['round'],
                             'wait_rounds':number-pending['round'],
@@ -142,10 +146,6 @@ class Diagnostics(logging.Handler):
                         record['output']={k:v for k,v in output.items() if k in {'reply_hash','reply_chars','parse','code_hash','intent','op'}}
                         record['cut']=True
                     self._write_compact('llm',**record);counts[identity]+=1;logged=True
-                    if output.get('code_hash'):
-                        mappings=state.setdefault('program_rids',{})
-                        mappings[output['code_hash']]=pending['input'].get('rid')
-                        if len(mappings)>16:del mappings[next(iter(mappings))]
                 else:state['stats']['llm_trace_omitted']+=1
                 state['llm_trace_pending']=None
         if response.get('prompt') and task.get('id'):
@@ -229,6 +229,7 @@ class Diagnostics(logging.Handler):
                         op=tool.get("op"),path=self._brief(tool.get("path"),100),status=tool.get("status"),
                         exit=tool.get("exit"),usable=tool.get("usable"),answer_usable=tool.get('answer_usable'),
                         failure=tool.get('failure'),cwd=tool.get('cwd'),entries=(tool.get('entries') or [])[:8],
+                        adapters=tool.get('adapters',[]),
                         root_entries=(tool.get('root_entries') or [])[:8],
                         program=str(tool.get('program') or '')[:12],docs=tool.get('docs'),result=self._brief(tool.get("result",""),480),
                         result_round=tool.get("round"))
@@ -236,6 +237,8 @@ class Diagnostics(logging.Handler):
                 if len(state["task_tools"]) > 32:state["task_tools"]={tool_key}
             fault = getattr(self.local,"task_fault",None)
             fault_key = (task.get("id"),(fault or {}).get("kind"))
+            if fault and llm_logged and fault.get('round')==number:
+                state['task_faults'].add(fault_key)
             if fault and fault_key not in state["task_faults"] and not (llm_logged and fault.get("round")==number):
                 # One diagnostic per failure kind per task, capped to two per
                 # task. Never let discovery events consume this allowance.
@@ -282,7 +285,8 @@ class Diagnostics(logging.Handler):
                 if decision and (periodic or state["calls"]==1):
                     self._write_compact("defence",supply=decision.get("wall_supply"),guns=decision.get("gun_status"),
                         returns={i:{k:r.get(k) for k in ("due","length")} for i,r in decision.get("return_routes",{}).items()},
-                        upgrades=decision.get("gatling_upgrades"),
+                        upgrades={i:{'hp':u.get('health'),'level':u.get('level')} for i,u in units.items()
+                                  if u.get('roleType') in {'rocket','gatling','railgun'}},
                         layout=next((r.get("reason") for r in decision.get("rejected",[]) if r.get("verdict")=="layout_bundle_rejected"),
                                     obj(decision.get("battery_plan")).get("mode")))
                 self._write_compact("summary" if periodic else "turn",team=self._brief("/".join(key),48),

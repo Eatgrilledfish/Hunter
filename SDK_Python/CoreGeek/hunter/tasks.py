@@ -807,6 +807,7 @@ class TaskEngine:
                             "answer_usable":usable and not failure, "failure":failure,
                             "cwd":data.get('cwd'), "entries":data.get('cwd_entries'), "root_entries":data.get('root_entries'),
                             "program":data.get('file_sha256'),
+                            "adapters":data.get('program_adapters',[]),
                             "docs":[{'path':e.get('data',{}).get('path'), 'complete':e.get('data',{}).get('completeness')=='complete'}
                                     for e in task.evidence.values() if e.get('data',{}).get('operation')=='read_slice'][-6:],
                             "result":result_excerpt(data.get("data", data.get("text", data.get("error", ""))))
@@ -942,6 +943,16 @@ class TaskEngine:
                             and e.get("data",{}).get("operation")=="read_slice"}
                     if "API_DOCS.md" in listed-read:
                         plan = {"operation":"read_slice", "path":"API_DOCS.md", "limit":8192}
+                    if plan is None and not task.executions:
+                        documents = '\n'.join(e.get('data',{}).get('text','') or '' for e in task.evidence.values()
+                            if e.get('usable') and e.get('data',{}).get('operation')=='read_slice'
+                            and e['data'].get('completeness')=='complete')
+                        directories = {entry.get('path') for e in task.evidence.values() if e.get('usable')
+                            for entry in e.get('data',{}).get('entries',[]) if entry.get('kind')=='directory'}
+                        specs = [p+'/spec.md' for p in sorted(directories) if p and p in documents
+                                 and 'spec.md' in documents and p+'/spec.md' not in read]
+                        if len(specs)==1:
+                            plan = {'operation':'read_slice','path':specs[0],'limit':8192}
                     if plan is None and self.reuse_enabled and (task.workflow_id or not task.executions):
                         plan, workflow = self.skills.workflow_next(task)
                     if plan is None and not task.workflow_id:
@@ -1019,6 +1030,7 @@ class TaskEngine:
                     "Read the spec before changing files; restrict all work to the authorized task. "
                     "Print a compact JSON result with actual values/check token. Runtime is bounded to 11 seconds; "
                     "code runs with cwd=path and standard Python environment, with no implicit local import path. "
+                    "If path is ws_1, open('spec.md') and subprocess.run(['./check']) are already inside ws_1; do NOT set cwd='ws_1' again. "
                     "Do not use fictitious example data, endpoints, fields, or tokens. "
                     "list_dir returns has_more and next_after; request the same directory with after:next_after to continue. "
                     "Pages are observations, not an atomic directory snapshot; restart from after:'' if contents change. "

@@ -43,6 +43,7 @@ class Directive:
     horizon_risk: dict = field(default_factory=dict)
     construction_actions: dict = field(default_factory=dict)
     day_actions: dict = field(default_factory=dict)
+    funded_actions: dict = field(default_factory=dict)
     seal_builds: dict = field(default_factory=dict)
     upgrade_actions: dict = field(default_factory=dict)
     recovery_actions: dict = field(default_factory=dict)
@@ -69,6 +70,9 @@ class Directive:
             return False
         if candidate.actor in self.urgent_upgrades:
             return candidate.command == self.urgent_upgrades[candidate.actor]
+        if candidate.actor in self.funded_actions:
+            medical = candidate.command['action']=='use' and candidate.command.get('name') in {'Medicine','Bomb','DizzyWeapon'}
+            return medical or candidate.command in self.funded_actions[candidate.actor]
         for commitments in (self.recovery_actions, self.construction_actions, self.upgrade_actions, self.medical_actions, self.day_actions):
             if candidate.actor in commitments and not any(candidate is c for c in self.candidates):
                 medical = candidate.command['action'] == 'use' and candidate.command.get('name') in {'Medicine','Bomb','DizzyWeapon'}

@@ -61,9 +61,11 @@ def urgent_gatling_upgrades(world, policy, rules, task_actor=None, *, priority_i
         state, _ = gatling_upgrade_status(world,gun,policy,rules)
         maximum = rules.max_health.get('gatling',{}).get(gun.level) if rules else None
         return (state != 'heal', gun.health/maximum if maximum else 1, gun.id)
-    guns = sorted((g for g in world.weapons if g.kind == 'gatling' and g.level in (1, 2)
+    guns = sorted((g for g in world.weapons if g.kind in {'gatling','rocket'} and g.level in (1, 2)
+                   and (g.kind!='rocket' or policy.upgrade_commitment_enabled)
                    and g.health is not None
-                   and gatling_upgrade_status(world,g,policy,rules)[0] in {'heal','range_priority'}),
+                   and upgrade_allowed(world,g,policy,rules)
+                   and (g.kind=='rocket' or gatling_upgrade_status(world,g,policy,rules)[0] in {'heal','range_priority'})),
                   key=priority)[:3]
     if not guns or not actors:
         return []
@@ -87,7 +89,7 @@ def urgent_gatling_upgrades(world, policy, rules, task_actor=None, *, priority_i
                                  'targetPos':[pos_json(gun.pos)]}, 1000,
                       'upgrade low-health Gatling with held voucher before firing'
                       if gatling_upgrade_status(world,gun,policy,rules)[0]=='heal'
-                      else 'upgrade Gatling to level 2 for initial firing range')
+                      else 'use held weapon voucher before firing for increased firepower')
             for gun,identity in zip(guns,best[1]) if identity is not None]
 
 

@@ -8,6 +8,7 @@ import shlex
 from .protocol import strict_json, integer
 from .dependencies import execution_manifest, input_manifest
 from .receipts import guarded_script
+from .task_program import prepare as prepare_program
 
 
 def parse_result(text):
@@ -164,7 +165,8 @@ runpy.run_path(entry, run_name="__main__")
         argv = [P["python"], "-I", "-B", "-c", bootstrap, path] if path.endswith(".py") else [path]
         argv.extend(P["args"])
         if op == "run_python":
-            argv = [P["python"], "-I", "-B", "-c", P["code"]]
+            argv = [P["python"], "-I", "-B", "-c", P.get("runtime_code", P["code"])]
+            out['program_adapters'] = P.get('program_adapters', [])
         execution_cwd = path if op == "run_python" else root
         out['cwd'] = os.path.relpath(execution_cwd, root)
         # Bounded names only: no credential contents, judge internals or external reads.
@@ -302,6 +304,11 @@ def compile_operation(context, plan, environment, evidence):
                 documented.update(re.findall(r"[A-Za-z0-9_][A-Za-z0-9_./-]*", data["text"]))
     if path not in known_paths:
         named = any(path == token.rstrip(".") or token.startswith(path+"/") for token in documented)
+        parent, leaf = posixpath.split(path)
+        # A statement may name the workspace and spec separately. Reading that
+        # named file is allowed; existence/type/containment remain runtime checks.
+        if operation == 'read_slice' and parent and leaf in {t.rstrip('.') for t in documented}:
+            named = named or known_paths.get(parent) == 'directory' or parent in documented
         if operation == "run_tool" or not named:
             raise ValueError("path not discovered or named in current task documentation: "+path[:120])
         # This is permission to attempt the operation, not proof of existence.
@@ -349,6 +356,11 @@ def compile_operation(context, plan, environment, evidence):
         import hashlib
         payload.update(code=code, code_sha256=hashlib.sha256(code.encode()).hexdigest(),
                        args=[], manifest=manifest, input_manifest={}, import_candidates=[])
+        runtime, adapters = prepare_program(code, root, path,
+            [inspections[p]['text'] for p in manifest])
+        if adapters:
+            payload.update(runtime_code=runtime, program_adapters=adapters,
+                           runtime_sha256=hashlib.sha256(runtime.encode()).hexdigest())
     else:
         inspection = inspections.get(path)
         if inspection is None or inspection.get("completeness") != "complete":

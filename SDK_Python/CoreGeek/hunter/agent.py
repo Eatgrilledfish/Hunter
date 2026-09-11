@@ -202,8 +202,15 @@ class Agent:
             for candidate in recovery:
                 guidance.recovery_actions.setdefault(candidate.actor, []).append(candidate.command)
             candidates.extend(recovery)
+            funded, funded_budgets = draft.day_schedule.funded_delivery(world,clock,self.policy,build_jobs,
+                guidance.operator_stands,upgrade_plans,min(deadline,time.monotonic()+.08))
+            for c in draft.filter_failures(funded,world.round):
+                if c.actor in guidance.recovery_actions or c.actor in guidance.urgent_upgrades:continue
+                guidance.funded_actions.setdefault(c.actor,[]).append(c.command)
+                c.utility=90
+                candidates.append(c)
             scheduled = draft.day_schedule.candidates(world,clock,self.policy,build_jobs,guidance.operator_stands,
-                upgrade_plans,{task_actor}|set(guidance.recovery_actions)|set(guidance.urgent_upgrades),
+                upgrade_plans,{task_actor}|set(guidance.recovery_actions)|set(guidance.urgent_upgrades)|set(guidance.funded_actions),
                 min(deadline,time.monotonic()+.12))
             scheduled = [c for c in draft.filter_failures(scheduled,world.round) if guidance.permit(c)]
             for c in scheduled:guidance.day_actions.setdefault(c.actor,[]).append(c.command)
@@ -357,6 +364,7 @@ class Agent:
                           "job":({"name":build_jobs[u.id]["name"],"gate":build_jobs[u.id].get("gate",False)} if u.id in build_jobs else None),
                           "slack":guidance.return_routes.get(u.id,{}).get("slack_before_buffer"),
                           "schedule":draft.day_schedule.diagnostic.get(u.id),
+                          "funded":funded_budgets.get(u.id),
                           "idle":("return_hold" if guidance.return_routes.get(u.id,{}).get("due") else "no_selected_feasible_work")
                               if u.id not in response['roleCommandMap'] and not any(c.get('controllerId')==u.id for c in response['roleCommandMap'].values()) else None,
                           "trip":draft.economic_routes.diagnostic.get(u.id,{}).get("goal"),
@@ -381,6 +389,7 @@ class Agent:
                       "upgrade_commitments": sorted(guidance.upgrade_actions),
                       "urgent_upgrade_commitments": sorted(guidance.urgent_upgrades),
                       "base_recovery": deepcopy(draft.recovery.diagnostic),
+                      "funded_upgrades": funded_budgets,
                       "recovery_commitments": sorted(guidance.recovery_actions),
                       "economic_routes": deepcopy(draft.economic_routes.diagnostic),
                       "opponent": deepcopy(draft.opponent.diagnostic),
