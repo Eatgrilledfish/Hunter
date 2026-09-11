@@ -18,7 +18,13 @@ def threat_weights(world):
         near = min((distance(robot.pos, p) for p in assets), default=30)
         intent = 0.45 if robot.target_team is not None and robot.target_team != world.side else 1.0
         pressure = {"smallRobot": 1.0, "middleRobot": 1.2, "largeRobot": 1.6, "bossRobot": 2.0}.get(robot.kind, 1.0)
-        weights[robot.id] = intent * (1.0 + 8.0 / (near + 1)) * pressure * (0.6 if robot.abnormal == "dizzy" else 1.0)
+        # A rear gun must cover enemies reaching the base, even when they
+        # bypass other turrets. No assumption about the judge's target order.
+        base_cells = [p for base in world.stations for p in (
+            base.pos, (base.pos[0]+1, base.pos[1]), (base.pos[0], base.pos[1]-1), (base.pos[0]+1, base.pos[1]-1))]
+        base_distance = min((distance(robot.pos, p) for p in base_cells), default=30)
+        base_pressure = 2.0 if base_distance <= 3 else 1.4 if base_distance <= 5 else 1.0
+        weights[robot.id] = intent * (1.0 + 8.0 / (near + 1)) * pressure * base_pressure * (0.6 if robot.abnormal == "dizzy" else 1.0)
     return weights
 
 

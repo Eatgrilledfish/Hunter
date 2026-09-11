@@ -16,9 +16,9 @@ def movement(actor, steps, value, reason, *, route_goal=None):
 
 
 def construction_cash_reserve(world, policy):
-    # Establish two guns before saving for replenishment. A cash reserve with
+    # Establish all three guns before saving for replenishment. A cash reserve with
     # no current shop/Medicine has no executable use and must not block builds.
-    if (policy is None or len(world.weapons) < 2 or not world.zones.get("weaponShop")
+    if (policy is None or len(world.weapons) < 3 or not world.zones.get("weaponShop")
             or world.shop.get("Medicine", 0) <= 0):
         return 0
     return policy.reserve_gold
@@ -43,6 +43,7 @@ def _construction_jobs(world, rules, portfolio=False, repair_saturation=False, r
         return {}
     evaluator = WeaponPortfolio(world, rules, time.monotonic()+0.025, repair_saturation=repair_saturation) if portfolio else None
     planned = []
+    layout = LayoutGuard(world, time.monotonic()+0.04)
     workers = {u.id: u for u in world.movers if u.kind == "worker"}
     available = {name: (rule, {p for p in rule.cells if world.inside(p) and p not in world.occupied})
                  for name in sorted(WEAPONS | {"wall"}) if (rule := rules.build_rule(world, name)) is not None}
@@ -52,12 +53,16 @@ def _construction_jobs(world, rules, portfolio=False, repair_saturation=False, r
     # Optional walls must not tie up the entire workforce while cash is needed.
     earnable = bool(world.zones.get("vendor")) and any(world.vendor.get(k, 0)>0 and world.zones.get(k) for k in MINERALS)
     wall_workers = max(0, len(workers)-1) if earnable else len(workers)
+    # Keep one named builder across observations; the other worker earns cash.
+    wall_owner = min(workers, key=lambda i: (not bool(workers[i].inventory["stone"]), i)) if workers else None
     while workers:
         options = []
         for name, (rule, cells) in available.items():
             if rule.gold > gold or (name in WEAPONS and not slots) or (name == "wall" and (not wall_slots or wall_workers <= 0)):
                 continue
             for identity, actor in workers.items():
+                if name == "wall" and earnable and identity != wall_owner:
+                    continue
                 targets = cells-reserved_cells
                 if not targets:
                     continue
@@ -65,10 +70,20 @@ def _construction_jobs(world, rules, portfolio=False, repair_saturation=False, r
                 ordered = sorted(targets, key=lambda p: (distance(actor.pos,p),p))
                 for target in ordered[:4] if evaluator and name in WEAPONS else ordered[:1]:
                     gain = evaluator.marginal(name,target,planned) if evaluator and name in WEAPONS else 0
-                    options.append((name == "wall", deficit, distance(actor.pos,target)-gain/20, identity, name, target))
+                    # Two short guns leave the rear unable to cover the base's
+                    # opposite approach. Finish the battery with verified long
+                    # range splash fire when all existing/planned guns are short.
+                    short_battery = len(world.weapons)+len(planned) >= 2 and all(
+                        (u.attack_range or 0) <= 3 for u in world.weapons) and all(n == "gatling" for n, _, _ in planned)
+                    preference = int(short_battery and name in WEAPONS and name != "rocket" and "rocket" in available)
+                    options.append((name == "wall", deficit, preference, distance(actor.pos,target)-gain/20, identity, name, target))
         if not options:
             break
-        _, _, _, identity, name, target = min(options)
+        _, _, _, _, identity, name, target = min(options)
+        preview = Candidate(identity, {"action":"build", "name":name, "targetPos":[pos_json(target)]}, 0, "layout preview")
+        if not layout.check([preview])[0]:
+            available[name][1].discard(target)
+            continue
         rule = available[name][0]
         result[identity] = {"name": name, "target": target, "items": Counter(rule.items)}
         reserved_cells.add(target)
@@ -87,7 +102,7 @@ def construction_reservations(world, rules, *, jobs=None):
 
 
 def ready_construction(world, clock, rules, policy, deadline, *, jobs=None):
-    """Complete funded weapon jobs once personal materials are ready.
+    """Complete assigned buildings, including the wall material/return pipeline.
 
     The existing build policy chooses jobs. This prevents monetary bids from
     starving their finishing actions; it does not choose an optimal gun mix.
@@ -97,8 +112,36 @@ def ready_construction(world, clock, rules, policy, deadline, *, jobs=None):
     result = []
     for identity, job in (construction_jobs(world, rules, policy) if jobs is None else jobs).items():
         actor = world.ours[identity]
-        if (time.monotonic() >= deadline or job["name"] not in WEAPONS or actor.backpack is None
-                or any(actor.inventory[name] < amount for name, amount in job["items"].items())):
+        if time.monotonic() >= deadline or actor.backpack is None:
+            continue
+        rule = rules.build_rule(world, job["name"])
+        if rule is None:
+            continue
+        if job["name"] == "wall":
+            mineral = next((k for k, n in rule.items.items() if actor.inventory[k] < n), None)
+            # Batch a few stones while at the mine, then spend them on the wall.
+            # This is a policy stock target, not a change to the one-stone cost.
+            if mineral is None and actor.inventory["stone"] < min(4, rules.wall_limit-rules.wall_count(world)):
+                if world.near_zone(actor.pos, "stone"):
+                    mineral = "stone"
+            if mineral is not None:
+                build_goals = interaction_cells(world, [job["target"]], actor.pos, {job["target"]})
+                home = distance_field(world, build_goals, actor.pos, deadline)
+                options = []
+                for mine in world.zones.get(mineral, ()):
+                    length, steps = route(world, actor, [mine], deadline)
+                    back = min((home[p] for p in interaction_cells(world, [mine], actor.pos) if p in home), default=None)
+                    if length is not None and back is not None and length+back+5+policy.return_buffer < clock.until_night:
+                        options.append((length+back, mine, length, steps))
+                if options:
+                    _, mine, length, steps = min(options)
+                    if length == 0:
+                        result.append(Candidate(actor.id, {"action":"collect", "targetPos":[pos_json(mine)]}, 18,
+                                                "wall builder: stock stone before returning to build"))
+                    else:
+                        result.extend(movement(actor, steps, 18, "wall builder: reserved stone route then construction"))
+                    continue
+        if any(actor.inventory[name] < amount for name, amount in rule.items.items()):
             continue
         result.extend(construction(world, clock, rules, actor, deadline, names={job["name"]}, target_cell=job["target"], finish_before_night=True, reserve_gold=construction_cash_reserve(world, policy)))
     return result
@@ -108,10 +151,40 @@ def construction_materials(world, rules, actor):
     return construction_reservations(world, rules).get(actor.id, Counter())
 
 
+def harvest_jobs(world, reserves):
+    """Allocate reachable mines once by stable worker order, with material priority.
+
+    Sharing is allowed only when no distinct useful mine remains. Route length
+    beats straight-line proximity; no remaining ore quantity is invented.
+    """
+    workers = sorted((u for u in world.movers if u.kind == "worker"), key=lambda u: (
+        not any(u.inventory[k] < n for k, n in reserves.get(u.id, {}).items()), u.id))
+    chosen, claimed = {}, set()
+    deadline = time.monotonic()+0.04
+    for actor in workers:
+        field = distance_field(world, [actor.pos], actor.pos, deadline)
+        options = []
+        for mineral in sorted(MINERALS):
+            need = actor.inventory[mineral] < reserves.get(actor.id, {}).get(mineral, 0)
+            price = world.vendor.get(mineral, 0)
+            if not need and price <= 0:
+                continue
+            for mine in sorted(world.zones.get(mineral, ())):
+                length = min((field[p] for p in neighbours(mine) if p in field), default=None)
+                if length is not None:
+                    options.append((not need, (mineral, mine) in claimed, (length+6)/max(1, price), mineral, mine))
+        if options:
+            *_, mineral, mine = min(options)
+            chosen[actor.id] = (mineral, mine)
+            claimed.add((mineral, mine))
+    return chosen
+
+
 def immediate(world, rules, task_actor=None, *, jobs=None, policy=None):
     """Cheap, current-snapshot incumbent available before advanced planning."""
     result = []
     reserves = construction_reservations(world, rules, jobs=jobs)
+    ore_jobs = harvest_jobs(world, reserves)
     for actor in world.movers:
         if actor.id == task_actor:
             continue
@@ -132,7 +205,7 @@ def immediate(world, rules, task_actor=None, *, jobs=None, policy=None):
         if actor.kind == "worker":
             for mineral in sorted(MINERALS):
                 for pos in sorted(world.zones.get(mineral, ())):
-                    if distance(actor.pos, pos) <= 1:
+                    if ore_jobs.get(actor.id) == (mineral, pos) and distance(actor.pos, pos) <= 1:
                         result.append(Candidate(actor.id, {"action": "collect", "targetPos": [pos_json(pos)]},
                                                 world.vendor.get(mineral, 0)*0.4 + (8 if actor.inventory[mineral] < materials[mineral] else 0),
                                                 "collect current adjacent ore, including verified construction need"))
@@ -209,6 +282,7 @@ def propose(world, clock, rules, policy, deadline, task_actor=None, operator_sta
     if build_jobs is None:
         build_jobs = construction_jobs(world, rules, policy)
     reserves = construction_reservations(world, rules, jobs=build_jobs)
+    ore_jobs = harvest_jobs(world, reserves)
     for actor in world.movers:
         if actor.id == task_actor or time.monotonic() >= deadline:
             continue
@@ -250,6 +324,8 @@ def propose(world, clock, rules, policy, deadline, task_actor=None, operator_sta
         if not bag_full and not (ore_count >= policy.sell_batch and world.zones.get("vendor")):
             for mineral in sorted(MINERALS):
                 for pos in sorted(world.zones.get(mineral, ())):
+                    if ore_jobs.get(actor.id) != (mineral, pos):
+                        continue
                     if time.monotonic() >= deadline:
                         break
                     length, steps = route(world, actor, [pos], deadline)
@@ -277,5 +353,8 @@ def propose(world, clock, rules, policy, deadline, task_actor=None, operator_sta
             if job:
                 result.extend(construction(world, clock, rules, actor, deadline, names={job['name']}, target_cell=job['target'], reserve_gold=construction_cash_reserve(world, policy)))
         else:
-            result.extend(construction(world, clock, rules, actor, deadline, reserve_gold=construction_cash_reserve(world, policy)))
+            job = build_jobs.get(actor.id)
+            if job:
+                result.extend(construction(world, clock, rules, actor, deadline, names={job["name"]},
+                                           target_cell=job["target"], reserve_gold=construction_cash_reserve(world, policy)))
     return result

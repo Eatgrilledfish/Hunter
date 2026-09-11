@@ -1,4 +1,5 @@
 """Generate bounded judge-side operations. Nothing here executes in the service."""
+import ast
 import json
 import re
 import shlex
@@ -112,10 +113,11 @@ try:
                    completeness="complete" if offset == 0 and len(block) == size else "slice")
         if len(json.dumps(out, ensure_ascii=False).encode("utf-8")) > 30000:
             out.pop("text", None)  # Raw bytes remain complete; decode in the SDK.
-    elif op == "run_tool":
-        path = safe(P["path"], True)
+    elif op in {"run_tool", "run_python"}:
+        path = safe(P["path"], op == "run_tool")
         out.update(executed=False, path=P["path"], manifest=P["manifest"], input_manifest=P["input_manifest"],
-                   dependency_scope="declared files and static local Python imports; dynamic/system dependencies not complete")
+                   dependency_scope=("task documentation only; generated program dependencies not fingerprinted" if op == "run_python"
+                                     else "declared files and static local Python imports; dynamic/system dependencies not complete"))
         def verify_manifest():
             for candidate in P["import_candidates"]:
                 location = safe(candidate)
@@ -139,7 +141,7 @@ try:
                         raise InputChanged(str(exc)) from exc
                     raise
         verify_manifest()
-        sha = P["manifest"][P["path"]]
+        sha = P.get("code_sha256") or P["manifest"][P["path"]]
         # Load local Python source directly, so a stale timestamp-based .pyc
         # cannot disagree with the files whose hashes were just verified.
         bootstrap = """
@@ -160,7 +162,9 @@ runpy.run_path(entry, run_name="__main__")
 """
         argv = [P["python"], "-I", "-B", "-c", bootstrap, path] if path.endswith(".py") else [path]
         argv.extend(P["args"])
-        child = subprocess.Popen(argv, cwd=root, stdin=subprocess.DEVNULL,
+        if op == "run_python":
+            argv = [P["python"], "-I", "-B", "-c", P["code"]]
+        child = subprocess.Popen(argv, cwd=path if op == "run_python" else root, stdin=subprocess.DEVNULL,
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
         out["executed"] = True
         output, status = bytearray(), "ok"
@@ -246,7 +250,7 @@ RESULT = encoded
 
 def compile_operation(context, plan, environment, evidence):
     """Validate discovered paths, inspected tool fingerprint, and bounded argv."""
-    if not isinstance(plan, dict) or plan.get("operation") not in {"list_dir", "read_slice", "run_tool"}:
+    if not isinstance(plan, dict) or plan.get("operation") not in {"list_dir", "read_slice", "run_tool", "run_python"}:
         raise ValueError("unsupported command plan")
     operation = plan["operation"]
     root, python = environment.get("root"), environment.get("python")
@@ -285,6 +289,33 @@ def compile_operation(context, plan, environment, evidence):
         if known_paths[path] != "file":
             raise ValueError("not a discovered file")
         payload.update(offset=offset, limit=limit)
+    elif operation == "run_python":
+        code = plan.get("code")
+        refs = plan.get("evidence_refs")
+        if known_paths[path] != "directory":
+            raise ValueError("working directory must be discovered")
+        if not isinstance(code, str) or not code.strip() or len(code.encode()) > 16384:
+            raise ValueError("invalid Python program size")
+        try:
+            ast.parse(code)
+        except SyntaxError as exc:
+            raise ValueError("invalid Python syntax: "+str(exc)) from exc
+        if plan.get("effect") not in {"read_only", "mutation"}:
+            raise ValueError("program effect declaration required")
+        if not isinstance(refs, list) or not refs or len(refs) > 8:
+            raise ValueError("program requires inspected task documentation")
+        manifest = {}
+        for ref in refs:
+            record = evidence.get(ref, {}) if isinstance(ref, str) else {}
+            data = record.get("data", {})
+            if (not record.get("usable") or data.get("operation") != "read_slice"
+                    or data.get("completeness") != "complete" or not data.get("file_sha256")
+                    or not isinstance(data.get("text"), str)):
+                raise ValueError("program documentation must be completely read")
+            manifest[data["path"]] = data["file_sha256"]
+        import hashlib
+        payload.update(code=code, code_sha256=hashlib.sha256(code.encode()).hexdigest(),
+                       args=[], manifest=manifest, input_manifest={}, import_candidates=[])
     else:
         inspection = inspections.get(path)
         if inspection is None or inspection.get("completeness") != "complete":
@@ -300,7 +331,7 @@ def compile_operation(context, plan, environment, evidence):
         manifest, import_candidates = execution_manifest(plan, evidence)
         inputs = input_manifest(plan, evidence, manifest)
         payload.update(manifest=manifest, import_candidates=import_candidates, input_manifest=inputs)
-    if operation == "run_tool":
+    if operation in {"run_tool", "run_python"}:
         namespace = environment.get("receipt_namespace")
         if namespace is None:
             # Direct compiler clients without a TaskEngine retain command-local

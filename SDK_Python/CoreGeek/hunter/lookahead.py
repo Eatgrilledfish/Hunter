@@ -42,6 +42,8 @@ class RiskMemory:
     samples: dict = field(default_factory=dict)
     pending: dict = field(default_factory=dict)
     last_comparison: list = field(default_factory=list)
+    recent_hp_losses: dict = field(default_factory=dict)
+    damaged_actors: set = field(default_factory=set)
 
     def weights(self):
         return {name: 1/(1+4*self.errors.get(name, 0)) for name, _, _ in SCENARIOS}
@@ -50,12 +52,23 @@ class RiskMemory:
         self.last_comparison = []
         pending, self.pending = self.pending, {}
         if pending.get("round") != world.round-1:
+            self.recent_hp_losses.clear()
+            self.damaged_actors.clear()
             return
+        self.recent_hp_losses = {i:[row for row in rows if row[0] >= world.round-2]
+                                 for i,rows in self.recent_hp_losses.items() if i in world.ours and world.ours[i].alive}
+        self.damaged_actors.intersection_update(i for i,u in world.ours.items() if u.alive)
         for identity, prior in pending.get("assets", {}).items():
             current = world.ours.get(identity)
+            if current is not None and current.health is not None and current.health > prior["health"]:
+                self.damaged_actors.discard(identity)
             if current is None or current.health is None or current.health > prior["health"] or prior["healing"] or current.pos != prior["position"]:
+                self.recent_hp_losses.pop(identity, None)
                 continue
             observed = prior["health"]-current.health
+            self.recent_hp_losses.setdefault(identity, []).append((world.round, observed))
+            if observed > 0:
+                self.damaged_actors.add(identity)
             # HP changes are not labelled as robot damage or a learned cadence.
             # Compare only this one-step loss proxy, including suppression error.
             for name, predicted in prior["losses"].items():

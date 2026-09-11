@@ -199,6 +199,9 @@ class Diagnostics(logging.Handler):
                     gold=team.get("goldNum") if type(team.get("goldNum")) is int else None,
                     score=team.get("totalScore") if type(team.get("totalScore")) is int else None,base_hp=bases,
                     robots=len(array(obj(raw.get("robot")).get("roles"))),units=mobiles,
+                    walls=sum(u.get("roleType")=="wall" and (u.get("health") or 0)>0 for u in units.values()),
+                    guns=[f"{i}:{u.get('roleType')}@{self._pos(u.get('pos'))}" for i,u in units.items()
+                          if u.get("roleType") in {"gatling","railgun","rocket"}][:3],
                     commands=commands,task=task,reasons=reasons,channels=channels,
                     issue=state["issues"] if periodic else (issues+failures)[:3],
                     issue_round=state["issue_round"] if periodic else number if issues or failures else None,

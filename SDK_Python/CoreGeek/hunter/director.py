@@ -375,7 +375,7 @@ def assign_operator_stands(world, clock, deadline, *, include_pioneer=True,
     return {operator.id: pos for operator, pos in zip(operators, best[1]) if pos is not None} if best else {}
 
 
-def triage(world, clock, task_actor, task, policy=None):
+def triage(world, clock, task_actor, task, policy=None, risk_memory=None):
     """Immediate rescue candidates shared by real and hypothetical decisions.
 
     No future movement, observation mutation, or operator-layout search occurs
@@ -394,7 +394,9 @@ def triage(world, clock, task_actor, task, policy=None):
         risk = exposure(world, clock, actor.pos)
         result.observations[actor.id] = risk
         upper = risk["upper_per_attack_opportunity"]
-        if (policy.lethal_entry_guard_enabled or actor.kind == "pioneer") and clock.phases == {"night"} and upper < actor.health:
+        observed_loss = max((loss for r, loss in (risk_memory.recent_hp_losses.get(actor.id, []) if risk_memory else [])
+                             if world.round-2 <= r <= world.round), default=0)
+        if (policy.lethal_entry_guard_enabled or actor.kind == "pioneer" or ((observed_loss > 0 or (risk_memory and actor.id in risk_memory.damaged_actors)) and actor.health <= 110)) and clock.phases == {"night"} and upper < actor.health:
             blocked = []
             for pos in neighbours(actor.pos):
                 if not world.inside(pos) or pos in world.occupied:
@@ -416,6 +418,26 @@ def triage(world, clock, task_actor, task, policy=None):
                               for robot in world.robots.values()) for gun in world.weapons)
         travelling_pioneer = (actor.kind == "pioneer" and actor.id != task_actor
                               and (world.navigation_avoided.get(actor.pos) or (not can_control and upper*4 >= actor.health)))
+        # The sum is a worst-case opportunity bound, not damage actually aimed
+        # at this role. Healthy defenders keep the gun online under pressure;
+        # otherwise three independent escape bids dismantle the whole battery.
+        covering = [gun for gun in world.weapons if distance(actor.pos, gun.pos) <= 1
+                    and gun.attack_range is not None and any(
+                        robot.alive and distance(robot.pos, gun.pos) <= gun.attack_range
+                        for robot in world.robots.values())]
+        largest_hit = max((ROBOT_DAMAGE.get(world.robots[i].kind, world.robots[i].attack_power or 0)
+                           for i in risk["sources"]), default=0)
+        withdrawal_hp = max(2*largest_hit, 2*observed_loss+largest_hit, (200 if actor.kind == "pioneer" else 220)*0.3)
+        hold_fire = bool(covering) and actor.health > withdrawal_hp
+        risk.update(defence_hold=hold_fire, withdrawal_hp=withdrawal_hp, observed_hp_loss=observed_loss,
+                    covering_guns=[gun.id for gun in covering])
+        if hold_fire:
+            # Treatment remains useful; do not spend a healthy firing action on
+            # a small scratch merely because many robots are visible.
+            if actor.inventory["Medicine"] and actor.health <= (200 if actor.kind == "pioneer" else 220)*0.5:
+                result.candidates.append(Candidate(actor.id, {"action":"use", "name":"Medicine"},
+                                                    1200, "defender: heal then resume fire"))
+            continue
         if not critical and upper*2 < actor.health and not travelling_pioneer:
             continue
         if actor.inventory["Medicine"]:
@@ -435,7 +457,10 @@ def triage(world, clock, task_actor, task, policy=None):
             if not improves:
                 continue
             reduction = upper-future["upper_per_attack_opportunity"]
+            retains_gun = any(distance(pos, gun.pos) <= 1 for gun in covering)
             value = (1000 if critical else 150) + reduction*2 + future["nearest"]
+            if retains_gun:
+                value += 100  # Prefer a safer operating stand over abandoning fire.
             within_task = actor.id == task_actor and task and any(distance(pos, p) <= 1 for p in task.cells)
             if within_task:
                 value += 10  # Preserve a task when escape quality is comparable.
@@ -448,7 +473,7 @@ def triage(world, clock, task_actor, task, policy=None):
 
 def propose(world, clock, task_actor, task, deadline, policy=None, risk_memory=None, *, failed_steps=None):
     policy = policy or Policy()
-    result = triage(world, clock, task_actor, task, policy)
+    result = triage(world, clock, task_actor, task, policy, risk_memory)
     # Reserve a complete current-state route bundle before optional placement
     # optimization can exhaust its time budget. Keep triage candidates separate.
     if policy.return_commitment_enabled:
