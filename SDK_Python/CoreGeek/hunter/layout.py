@@ -10,6 +10,7 @@ import time
 
 from .protocol import MOBILE, MINERALS, WEAPONS, position
 from .navigation import neighbours
+from . import battery
 
 
 class LayoutGuard:
@@ -50,7 +51,11 @@ class LayoutGuard:
         self.static = world.occupied-dynamic
         # Preserve a known static object even in an overlapping/partial snapshot.
         self.static.update(p for cells in world.zones.values() for p in cells)
-        self.static.update(p for u in entities if u.kind not in MOBILE for p in u.cells)
+        # The adapter releases known destroyed buildings, including removed
+        # walls whose health=0 records remain in the next snapshot. Do not
+        # resurrect those obstacles while restoring overlapping static objects.
+        # Unknown/missing health still blocks through the shared Unit predicate.
+        self.static.update(p for u in entities if u.kind not in MOBILE and u.blocks for p in u.cells)
         for kind, cells in world.zones.items():
             if kind.startswith(world.side+"TaskPoint"):
                 # A two-cell task point remains usable from either cell.
@@ -71,6 +76,10 @@ class LayoutGuard:
                               for c in candidates if c.command["action"] == "build"))
         if not builds:
             return True, "no new structural blockage"
+        if self.world.battery_plan is not None:
+            for _,kind,point in builds:
+                if point not in battery.cells(self.world,kind,{point}):
+                    return False, "build conflicts with reserved battery site or firing port"
         if builds in self.cache:
             return self.cache[builds]
         if time.monotonic() >= self.deadline or len(self.cache) >= self.max_checks:

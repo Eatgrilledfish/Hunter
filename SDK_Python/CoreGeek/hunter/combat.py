@@ -56,7 +56,8 @@ def line_damage(world, weapon, target, rules, allow_empty=False):
     robots = [r for r in world.robots.values() if r.alive and r.pos in ray]
     robots.sort(key=lambda r: (distance(weapon.pos, r.pos), r.id))
     robot_cells = {r.pos for r in robots}
-    # Unknown non-robot blocker/damage rules: avoid firing through other objects.
+    # User confirmed Gatling bullets stop at walls. Other object/damage rules
+    # remain unknown; conservatively avoid firing through those objects too.
     if any(p in world.occupied and p not in robot_cells for p in ray):
         return None
     if not robots:
@@ -72,6 +73,39 @@ def line_damage(world, weapon, target, rules, allow_empty=False):
         damage[robot.id] = amount
         energy -= amount
     return damage
+
+
+def fire_status(world, clock, rules, response, candidates):
+    """Bounded diagnostics: observed range is not a guaranteed clear shot."""
+    rows = []
+    for gun in world.weapons:
+        controllers = [u.id for u in world.movers if distance(u.pos, gun.pos) <= 1]
+        targets = sorted((r for r in world.robots.values() if r.alive and
+                          distance(gun.pos,r.pos) <= (gun.attack_range or 0)), key=lambda r:r.id)
+        count = sum(c.actor == gun.id and c.command.get("action") == "attack" for c in candidates)
+        fired = response["roleCommandMap"].get(gun.id,{}).get("action") == "attack"
+        why = ("fire" if fired else "day" if clock.phases != {"night"} else "no_controller" if not controllers
+               else "cooldown" if gun.cooldown else "no_target_in_range" if not targets else
+               "arbitration_or_controller_busy" if count else "no_damage_candidate")
+        row = {"id":gun.id,"cd":gun.cooldown,"range":gun.attack_range,"controllers":controllers,
+               "targets":len(targets),"fired":fired,"why":why,"candidates":count}
+        if why == "no_damage_candidate" and gun.kind != "rocket":
+            robot_cells = {r.pos for r in world.robots.values() if r.alive}
+            for target in targets[:8]:
+                ray = axis_ray(gun.pos,target.pos)
+                if ray is None:
+                    continue
+                blockers = [p for p in ray if p in world.occupied and p not in robot_cells]
+                if blockers:
+                    point = blockers[0]
+                    kinds = sorted({u.kind for u in list(world.ours.values())+list(world.enemies.values()) if point in u.cells})
+                    row["sample"] = {"target":target.pos,"blocked_at":point,"kind":kinds or ["neutral"]}
+                    row["why"] = "wall_blocks_gatling" if gun.kind == 'gatling' and 'wall' in kinds else "unverified_object_blocking"
+                    break
+            else:
+                row["why"] = "unverified_ray_or_damage"
+        rows.append(row)
+    return rows
 
 
 def propose(world, clock, rules, deadline, task_actor=None, *, base_fire_enabled=False):

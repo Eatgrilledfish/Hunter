@@ -2,6 +2,7 @@
 import ast
 import json
 import re
+import posixpath
 import shlex
 
 from .protocol import strict_json, integer
@@ -261,8 +262,14 @@ def compile_operation(context, plan, environment, evidence):
     path = plan.get("path", ".")
     if not isinstance(path, str) or len(path) > 1024 or "\x00" in path:
         raise ValueError("invalid path")
+    if path.startswith(root.rstrip("/")+"/"):
+        path = path[len(root.rstrip("/"))+1:]
+    path = posixpath.normpath(path)
+    if path.startswith("/") or path == ".." or path.startswith("../"):
+        raise ValueError("outside task root")
     known_paths = {".": "directory"}
     inspections = {}
+    documented = set()
     for record in evidence.values():
         if record.get("source") != "sandbox" or not record.get("usable"):
             continue
@@ -272,8 +279,17 @@ def compile_operation(context, plan, environment, evidence):
                 known_paths[entry["path"]] = entry.get("kind")
         if data.get("operation") == "read_slice" and data.get("file_sha256"):
             inspections[data.get("path")] = data
+            if data.get("completeness") == "complete" and isinstance(data.get("text"), str):
+                # A task naming ws_1/spec.md already authorizes inspecting it;
+                # don't spend another LLM round rediscovering the same name.
+                documented.update(re.findall(r"[A-Za-z0-9_][A-Za-z0-9_./-]*", data["text"]))
     if path not in known_paths:
-        raise ValueError("path not discovered in current task")
+        named = any(path == token.rstrip(".") or token.startswith(path+"/") for token in documented)
+        if operation == "run_tool" or not named:
+            raise ValueError("path not discovered or named in current task documentation: "+path[:120])
+        # This is permission to attempt the operation, not proof of existence.
+        # The sandbox still checks realpath containment/type and returns errors.
+        known_paths[path] = "file" if operation == "read_slice" else "directory"
     payload = {"context": context, "root": root, "python": python, "operation": operation, "path": path}
     if operation == "list_dir":
         if known_paths[path] != "directory":
@@ -391,6 +407,24 @@ if len(matches) == 1:
     out.update(status="ok", root=os.path.dirname(path), statement=os.path.basename(path),
                entries=[{"path":os.path.basename(path), "kind":"file"}], completeness="complete",
                selection="unique_observed_candidate; scan completeness recorded separately")
+    # Reuse this round trip for a bounded root listing. Larger/changing folders
+    # keep the ordinary paginated listing path; no claim of a complete snapshot.
+    try:
+        folder = os.path.dirname(path)
+        before = os.stat(folder)
+        listing, listing_complete = [], True
+        with os.scandir(folder) as items:
+            for count, item in enumerate(items, 1):
+                if count > 128:
+                    listing_complete = False
+                    break
+                if not item.is_symlink() and (item.is_file() or item.is_dir()):
+                    listing.append({"path":item.name,"kind":"file" if item.is_file() else "directory"})
+        after = os.stat(folder)
+        if listing_complete and (before.st_mtime_ns,before.st_ctime_ns)==(after.st_mtime_ns,after.st_ctime_ns) and len(json.dumps(listing).encode())<=12000:
+            out.update(entries=sorted(listing,key=lambda e:e["path"]),root_listing_complete=True)
+    except OSError:
+        pass
 else:
     out.update(status="ambiguous" if len(matches)>1 else "incomplete" if not complete or errors else "not_found",
                completeness="unknown")

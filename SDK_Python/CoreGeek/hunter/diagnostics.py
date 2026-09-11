@@ -52,7 +52,7 @@ class Diagnostics(logging.Handler):
         record = dict(schema=2, run=self.run_id[:8], round=getattr(self.local,"round",None), event=event, **data)
         # Valid single-line JSON, never a byte slice of a serialized record.
         # Essential issue details take precedence over optional current context.
-        for optional in ("reasons", "channels", "commands", "units", "task", "defence"):
+        for optional in ("reasons", "channels", "work", "commands", "units", "task", "defence"):
             if len(json.dumps(record,ensure_ascii=False,separators=(",", ":")).encode()) <= 1400:
                 break
             record.pop(optional,None)
@@ -76,6 +76,9 @@ class Diagnostics(logging.Handler):
             faults = [e for e in active.get("events",[]) if e.get("kind") in
                       {"quarantined_llm", "invalid_llm", "invalid_command_plan", "missing_llm", "missing_command_effect_unknown"}]
             self.local.task_fault = faults[-1] if faults else None
+            executed = [e for e in active.get("events",[]) if e.get("kind") == "sandbox_result"
+                        and e.get("op") in {"run_python", "run_tool"}]
+            self.local.task_tool = executed[-1] if executed else None
             self.local.task = {
                 "id": hashlib.sha256(str(active.get("key")).encode()).hexdigest()[:8] if active else None,
                 "phase":active.get("phase"), "file":self._brief(active.get("statement_path"),100),
@@ -114,7 +117,7 @@ class Diagnostics(logging.Handler):
         with self.output_lock:
             state = self.sessions.setdefault(key,dict(round=None,commands={},units={},attacks={},
                 failures={},seen=set(),stats=Counter(),calls=0,task=None,issues=[],issue_round=None,
-                details=0,critical_reported=False,targets={},task_faults=set()))
+                details=0,critical_reported=False,targets={},task_faults=set(),task_tools=set()))
             self.sessions.move_to_end(key)
             while len(self.sessions)>4:
                 self.sessions.popitem(last=False)
@@ -170,6 +173,16 @@ class Diagnostics(logging.Handler):
                             detail += f" after={actor} ack={feedback.get(actor)} {action}"
                     issues.append(self._brief(detail,320))
             task = getattr(self.local,"task",{})
+            tool = getattr(self.local,"task_tool",None)
+            tool_key = (task.get("id"),(tool or {}).get("round"))
+            if tool and task.get("id") and tool_key not in state["task_tools"]:
+                if sum(k[0]==task["id"] for k in state["task_tools"]) < 2:
+                    self._write_compact("task_exec",task=task["id"],left=task.get("left"),
+                        op=tool.get("op"),path=self._brief(tool.get("path"),100),status=tool.get("status"),
+                        exit=tool.get("exit"),usable=tool.get("usable"),result=self._brief(tool.get("result",""),480),
+                        result_round=tool.get("round"))
+                state["task_tools"].add(tool_key)
+                if len(state["task_tools"]) > 32:state["task_tools"]={tool_key}
             fault = getattr(self.local,"task_fault",None)
             fault_key = (task.get("id"),(fault or {}).get("kind"))
             if fault and fault_key not in state["task_faults"]:
@@ -178,6 +191,7 @@ class Diagnostics(logging.Handler):
                 if sum(k[0]==task.get("id") for k in state["task_faults"]) < 2:
                     self._write_compact("task_fault",task=task.get("id"),left=task.get("left"),
                         kind=fault.get("kind"),reason=self._brief(fault.get("reason",""),120),
+                        op=fault.get("op"),path=self._brief(fault.get("path"),100),
                         expected=fault.get("expected"),received=self._brief(fault.get("received",""),120),
                         reply=self._brief(fault.get("reply",""),240),fault_round=fault.get("round"))
                 state["task_faults"].add(fault_key)
@@ -217,7 +231,9 @@ class Diagnostics(logging.Handler):
                 if decision and (periodic or state["calls"]==1):
                     self._write_compact("defence",supply=decision.get("wall_supply"),guns=decision.get("gun_status"),
                         returns={i:{k:r.get(k) for k in ("due","length")} for i,r in decision.get("return_routes",{}).items()},
-                        layout=next((r.get("reason") for r in decision.get("rejected",[]) if r.get("verdict")=="layout_bundle_rejected"),None))
+                        upgrades=decision.get("gatling_upgrades"),
+                        layout=next((r.get("reason") for r in decision.get("rejected",[]) if r.get("verdict")=="layout_bundle_rejected"),
+                                    obj(decision.get("battery_plan")).get("mode")))
                 self._write_compact("summary" if periodic else "turn",team=self._brief("/".join(key),48),
                     gold=team.get("goldNum") if type(team.get("goldNum")) is int else None,
                     score=team.get("totalScore") if type(team.get("totalScore")) is int else None,base_hp=bases,
@@ -226,6 +242,7 @@ class Diagnostics(logging.Handler):
                     guns=[f"{i}:{u.get('roleType')}@{self._pos(u.get('pos'))}" for i,u in units.items()
                           if u.get("roleType") in {"gatling","railgun","rocket"}][:3],
                     commands=commands,task=task,reasons=reasons,channels=channels,
+                    work=decision.get("work_status"),
 
                     issue=state["issues"] if periodic else (issues+failures)[:3],
                     issue_round=state["issue_round"] if periodic else number if issues or failures else None,

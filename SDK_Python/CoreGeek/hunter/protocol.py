@@ -121,6 +121,9 @@ class World:
     seal_cells: frozenset = field(default_factory=frozenset)
     defence_cells: frozenset = field(default_factory=frozenset)
     build_interior: frozenset = field(default_factory=frozenset)
+    battery_plan: dict | None = None
+    wall_targets: frozenset | None = None
+    firing_ports: frozenset = field(default_factory=frozenset)
 
     def inside(self, pos):
         return 0 <= pos[0] < self.width and 0 <= pos[1] < self.height

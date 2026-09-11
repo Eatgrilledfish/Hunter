@@ -4,7 +4,8 @@ Robot target choice and attack cadence are not supplied. The lower damage bound
 is therefore zero; the upper is one attack opportunity from each visible robot
 in range. It is a triage scenario, not a claimed next-round damage forecast.
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from copy import copy
 from itertools import product
 import time
 
@@ -49,6 +50,8 @@ class Directive:
     economic_route_goals: dict = field(default_factory=dict)
     operator_plan_status: str = "unplanned"
     blocked_moves: dict = field(default_factory=dict)
+    urgent_upgrades: dict = field(default_factory=dict)
+    upgrading_guns: set = field(default_factory=set)
 
     def permit(self, candidate):
         """A due return is a macro commitment, not a price-dependent bid.
@@ -60,6 +63,11 @@ class Directive:
             targets = candidate.command.get("targetPos", [])
             if len(targets) == 1 and (targets[0].get("x"), targets[0].get("y")) in self.blocked_moves.get(candidate.actor, set()):
                 return False
+        if candidate.command.get('action') == 'attack' and (
+                candidate.actor in self.upgrading_guns or candidate.command.get('controllerId') in self.urgent_upgrades):
+            return False
+        if candidate.actor in self.urgent_upgrades:
+            return candidate.command == self.urgent_upgrades[candidate.actor]
         for commitments in (self.recovery_actions, self.construction_actions, self.upgrade_actions, self.medical_actions):
             if candidate.actor in commitments and not any(candidate is c for c in self.candidates):
                 medical = candidate.command['action'] == 'use' and candidate.command.get('name') in {'Medicine','Bomb','DizzyWeapon'}
@@ -503,12 +511,13 @@ def propose(world, clock, task_actor, task, deadline, policy=None, risk_memory=N
         result.operator_plan_status = "optimized"
     result.return_routes = baseline[0]
     result.candidates.extend(baseline[1])
-    # With a wall ring, enter the nearest available interior cell first. Routing
-    # all the way to a gun through a teammate-blocked corridor can oscillate
-    # around the outside and never get the final role through the gate.
+    # If the gun stand is unreachable, enter an available interior cell first.
+    # Preserve an existing reachable stand route: it may briefly cross a yellow
+    # gate cell. Replacing it there with the nearest interior cell can send the
+    # role back to its previous position forever instead of reaching the gun.
     if world.defence_cells:
         for actor in world.movers:
-            if actor.id == task_actor or actor.pos in world.defence_cells:
+            if actor.id == task_actor or actor.pos in world.defence_cells or actor.id in result.return_routes:
                 continue
             goals = set(world.defence_cells)-world.occupied
             field = distance_field(world, [actor.pos], actor.pos, deadline)
@@ -538,6 +547,41 @@ def propose(world, clock, task_actor, task, deadline, policy=None, risk_memory=N
             if shelter is not None:
                 result.return_routes.update(shelter[0])
                 result.candidates.extend(shelter[1])
+    # A teammate can temporarily make the one-gate return route unreachable.
+    # Diagnose that using a relaxed map, but move only blockers with a real,
+    # currently unobstructed route. Never send a move into an occupied cell.
+    if world.defence_cells and clock.phases == {"day"}:
+        relaxed = copy(world)
+        relaxed.occupied = world.occupied-{u.pos for u in world.movers}
+        for actor in world.movers:
+            if actor.id == task_actor or actor.pos in world.defence_cells or actor.id in result.return_routes:
+                continue
+            field = distance_field(relaxed,world.defence_cells,actor.pos,deadline)
+            if actor.pos not in field:
+                continue
+            path, cursor = [], actor.pos
+            while field[cursor] > 0:
+                cursor = min((p for p in neighbours(cursor) if p in field and field[p]<field[cursor]),key=lambda p:(field[p],p))
+                path.append(cursor)
+            for blocker in world.movers:
+                prior = result.return_routes.get(blocker.id)
+                if blocker.id == task_actor or blocker.pos not in path or not prior:
+                    continue
+                stand = prior["stand"]
+                if not prior["length"]:
+                    # The only inner landing may itself be a gun's current
+                    # stand. Vacate it, including diagonal movement permitted
+                    # by the rules; holding there cannot clear gate traffic.
+                    real = distance_field(world,[blocker.pos],blocker.pos,deadline)
+                    available = (set(world.defence_cells)-world.occupied-set(path)) & real.keys()
+                    if not available:
+                        continue
+                    stand = min(available,key=lambda p:(real[p],p))
+                yielding = return_plan(world,clock,{blocker.id:stand},replace(policy,return_buffer=130),deadline)
+                if yielding is not None:
+                    yielding[0][blocker.id]["yield_for"] = actor.id
+                    for candidate in yielding[1]:candidate.reason="clear teammate's blocked gate return route"
+                    result.return_routes.update(yielding[0]);result.candidates.extend(yielding[1])
     for actor in world.movers:
         actor_task = task if actor.id == task_actor else None
         proposed, observation = lookahead.propose(world, clock, actor, actor_task, risk_memory,

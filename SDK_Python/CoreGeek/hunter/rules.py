@@ -333,6 +333,10 @@ class Policy:
     medical_gold_limit: int = 60
     pioneer_defence_enabled: bool = True
     construction_commitment_enabled: bool = True
+    closed_ring_rockets_enabled: bool = True
+    forward_battery_enabled: bool = False
+    corner_battery_ports_enabled: bool = False
+    gatling_upgrade_health_fraction: float = 0.5
     upgrade_commitment_enabled: bool = True
     base_recovery_enabled: bool = True
     economic_route_commitment_enabled: bool = True
@@ -384,6 +388,8 @@ class Policy:
             elif type(value) not in (int, float) or not 0 <= value <= 3:
                 raise ValueError(f"{name} exceeds local timing bounds")
         result = cls(**parameters)
+        if not 0 < result.gatling_upgrade_health_fraction <= 1:
+            raise ValueError("gatling upgrade health fraction must be in (0, 1]")
         if not 4 <= result.lookahead_horizon <= 8 or not 0 <= result.lookahead_weight <= 1:
             raise ValueError("lookahead parameters exceed bounded scenario policy")
         if not 0 <= result.joint_lookahead_seconds <= .5:

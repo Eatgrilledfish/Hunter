@@ -89,7 +89,7 @@ class Agent:
             draft.tasks.reuse_enabled = self.policy.skill_reuse_enabled
             clock = draft.reconcile(world)
             task_actor = draft.task_actor(world)
-            economy.prepare_wall_cycle(world, clock, self.rules)
+            economy.prepare_wall_cycle(world, clock, self.rules, self.policy)
             build_jobs = economy.construction_jobs(world, self.rules, self.policy)
             immediate = draft.filter_failures(economy.immediate(world, self.rules, task_actor, jobs=build_jobs, policy=self.policy), world.round)
             incumbent = self._base(world, clock, task_actor, immediate)
@@ -99,6 +99,28 @@ class Agent:
             deadline = start + self.policy.planning_seconds
             guidance = director.propose(world, clock, task_actor, draft.tasks.active, min(deadline, time.monotonic()+0.12), self.policy, draft.risk,
                                         failed_steps=draft.failed_move_steps(world) if self.policy.return_detour_enabled else None)
+            # A fixed gun site may initially be occupied by an idle pioneer.
+            # Keep the site stable and move the role using real free cells.
+            if world.battery_plan and clock.phases == {'day'}:
+                from .navigation import distance_field, neighbours
+                sites = {p:n for n,p in world.battery_plan['slots']}
+                for actor in world.movers:
+                    if actor.id == task_actor or actor.pos not in sites:
+                        continue
+                    rule = self.rules.build_rule(world,sites[actor.pos])
+                    if rule is None or world.gold is None or world.gold < rule.gold:
+                        continue
+                    field = distance_field(world,[actor.pos],actor.pos,min(deadline,time.monotonic()+.01))
+                    free = (world.build_interior-world.occupied-set(sites)) & field.keys()
+                    if not free:
+                        continue
+                    goal = min(free,key=lambda p:(field[p],p))
+                    clear = director.return_plan(world,clock,{actor.id:goal},replace(self.policy,return_buffer=130),min(deadline,time.monotonic()+.01))
+                    if clear is not None:
+                        guidance.return_routes.update(clear[0])
+                        guidance.candidates = [c for c in guidance.candidates if c.actor!=actor.id]
+                        for c in clear[1]:c.reason='clear reserved gun site for construction'
+                        guidance.candidates.extend(clear[1])
             # Stage the worker who actually owns the final stone before the
             # gate closes. A different worker cannot spend that inventory.
             if clock.phases == {"day"}:
@@ -107,8 +129,28 @@ class Agent:
                     actor = world.ours[identity]
                     if not job.get("gate") or not actor.inventory["stone"]:
                         continue
+                    if guidance.return_routes.get(identity,{}).get("yield_for"):
+                        continue  # Finish the real gate-traffic clearing route first.
                     entries = set(neighbours(job["target"])) & world.build_interior
                     goals = entries-(world.occupied-{actor.pos})
+                    if world.seal_cells and not goals:
+                        # The last arrival may occupy the builder's only work
+                        # cell. Give it back before sealing: a pioneer cannot
+                        # spend the worker's personal stone.
+                        for blocker in world.movers:
+                            if blocker.id == task_actor or blocker.pos not in entries:
+                                continue
+                            field = distance_field(world,[blocker.pos],blocker.pos,min(deadline,time.monotonic()+.01))
+                            free = (world.build_interior-entries-world.occupied) & field.keys()
+                            if not free:
+                                continue
+                            clear = min(free,key=lambda p:(field[p],p))
+                            yielding = director.return_plan(world,clock,{blocker.id:clear},replace(self.policy,return_buffer=130),min(deadline,time.monotonic()+.01))
+                            if yielding is not None:
+                                guidance.return_routes.update(yielding[0])
+                                guidance.candidates = [c for c in guidance.candidates if not (c.actor==blocker.id and c.command.get("action")=="move")]
+                                for c in yielding[1]:c.reason="clear final wall builder's work cell"
+                                guidance.candidates.extend(yielding[1])
                     if any(u.pos not in world.build_interior for u in world.movers):
                         # The staging worker must leave an inner landing free
                         # for the last returning teammate, not plug the gate.
@@ -122,7 +164,9 @@ class Agent:
                     if not reachable:
                         continue
                     stand = min(reachable,key=lambda p:(distance(p,job["target"]),field[p],p))
-                    staged = director.return_plan(world,clock,{identity:stand},replace(self.policy,return_buffer=130),min(deadline,time.monotonic()+.02))
+                    # Reserve the stone, not the worker's whole day. The normal
+                    # distance/buffer deadline still leaves time to stage/seal.
+                    staged = director.return_plan(world,clock,{identity:stand},self.policy,min(deadline,time.monotonic()+.02))
                     if staged is not None:
                         guidance.return_routes.update(staged[0])
                         guidance.candidates = [c for c in guidance.candidates if not (c.actor==identity and c.reason.startswith("execute due return"))]
@@ -130,10 +174,18 @@ class Agent:
                         guidance.candidates.extend(staged[1])
             for actor in world.movers:
                 guidance.blocked_moves.setdefault(actor.id, set()).update(world.navigation_avoided.get(actor.pos, set()))
+            recovery_targets = draft.recovery.targets(world, self.rules, self.policy)
+            urgent_upgrades = draft.filter_failures(economy.procurement.urgent_gatling_upgrades(
+                world,self.policy,self.rules,task_actor,priority_ids=recovery_targets),world.round)
+            for c in urgent_upgrades:
+                guidance.urgent_upgrades[c.actor] = c.command
+                target = position(c.command['targetPos'][0])
+                guidance.upgrading_guns.update(u.id for u in world.weapons if u.pos==target)
+            candidates.extend(urgent_upgrades)
             # Check the return/triage incumbent before procurement or other
             # optional preparation can fail. Failed actions are excluded here
             # as well as in the final selection.
-            if guidance.candidates or guidance.return_routes or guidance.blocked_moves:
+            if guidance.candidates or guidance.return_routes or guidance.blocked_moves or guidance.urgent_upgrades:
                 early = [c for c in draft.filter_failures(candidates + guidance.candidates, world.round)
                          if guidance.permit(c)]
                 incumbent = select(world, clock, self.rules, self.policy, early, time.monotonic()+0.03,
@@ -141,10 +193,9 @@ class Agent:
                                    allow_task_control=guidance.allow_task_control,
                                    incumbent=[c for c in incumbent.selected if guidance.permit(c)])
                 fallback = incumbent.response
-            recovery_targets = draft.recovery.targets(world, self.rules, self.policy)
             upgrade_plans = {}
             upgrade_candidates = economy.procurement.propose(world, self.policy, min(deadline, time.monotonic()+0.08),
-                                                              task_actor, plans=upgrade_plans, priority_ids=recovery_targets)
+                                                              task_actor, plans=upgrade_plans, priority_ids=recovery_targets, rules=self.rules)
             recovery = draft.recovery.ready(world, clock, self.policy, upgrade_plans, recovery_targets,
                                             guidance.operator_stands, min(deadline, time.monotonic()+0.08))
             recovery = [c for c in draft.filter_failures(recovery, world.round) if guidance.permit(c)]
@@ -152,7 +203,7 @@ class Agent:
                 guidance.recovery_actions.setdefault(candidate.actor, []).append(candidate.command)
             candidates.extend(recovery)
             ready = economy.ready_construction(world, clock, self.rules, self.policy, min(deadline, time.monotonic()+0.08), jobs=build_jobs)
-            if world.seal_cells and self.rules.wall_count(world) == self.rules.wall_limit-1:
+            if world.seal_cells and len(economy.battery.missing_walls(world,self.rules)) == 1:
                 for c in ready:
                     if c.command.get("action") == "build" and c.command.get("name") == "wall":
                         guidance.seal_builds[c.actor] = c.command
@@ -162,7 +213,7 @@ class Agent:
             for candidate in ready:
                 guidance.construction_actions.setdefault(candidate.actor, []).append(candidate.command)
             candidates.extend(ready)
-            upgrades = economy.procurement.ready_upgrades(world, clock, self.policy, min(deadline, time.monotonic()+0.08), task_actor, plans=upgrade_plans)
+            upgrades = economy.procurement.ready_upgrades(world, clock, self.policy, min(deadline, time.monotonic()+0.08), task_actor, plans=upgrade_plans, rules=self.rules)
             upgrades = [c for c in draft.filter_failures(upgrades, world.round) if guidance.permit(c)]
             for candidate in upgrades:
                 guidance.upgrade_actions.setdefault(candidate.actor, []).append(candidate.command)
@@ -188,7 +239,7 @@ class Agent:
             candidates.extend(guidance.candidates)
             candidates = [c for c in candidates if guidance.permit(c)]
             # Preserve a checked triage incumbent even if later planning runs out.
-            if guidance.candidates or guidance.return_routes or guidance.blocked_moves or guidance.construction_actions or guidance.upgrade_actions or guidance.recovery_actions or guidance.economic_route_actions or guidance.medical_actions:
+            if guidance.candidates or guidance.return_routes or guidance.blocked_moves or guidance.construction_actions or guidance.upgrade_actions or guidance.recovery_actions or guidance.economic_route_actions or guidance.medical_actions or guidance.urgent_upgrades:
                 incumbent = select(world, clock, self.rules, self.policy,
                                    draft.filter_failures(candidates, world.round), time.monotonic()+0.03,
                                    task_actor=task_actor, task_moves=guidance.task_moves,
@@ -296,20 +347,27 @@ class Agent:
                       "navigation_retry_exclusions": {u.id:sorted(world.navigation_avoided.get(u.pos, set())) for u in world.movers},
                       "movement_retry_windows": draft.move_retry_windows(world.round),
                       "construction_jobs": build_jobs,
-                      "wall_supply": {"need":max(0,self.rules.wall_limit-self.rules.wall_count(world)),
+                      "work_status":{u.id:{"ore":[u.inventory[k] for k in ("stone","iron","copper")],
+                          "upgrade":({k:upgrade_plans[u.id][k] for k in ("name","steps","stage")} if u.id in upgrade_plans else None)}
+                          for u in world.movers if u.kind=="worker"},
+                      "battery_plan": world.battery_plan,
+                      "gatling_upgrades": {u.id:{"hp":u.health,"level":u.level,
+                          "state":economy.procurement.gatling_upgrade_status(world,u,self.policy,self.rules)[0],
+                          "threshold":economy.procurement.gatling_upgrade_status(world,u,self.policy,self.rules)[1]}
+                          for u in world.weapons if u.kind=='gatling' and u.level in (1,2)},
+                      "wall_supply": {"need":len(economy.battery.missing_walls(world,self.rules)),
+                          "goal":len(world.wall_targets) if world.wall_targets is not None else self.rules.wall_limit,
+                          "ports":sorted(world.firing_ports),
                           "stone":{u.id:u.inventory["stone"] if u.backpack is not None else None for u in world.movers if u.kind=="worker"},
                           "quotas":{i:j.get("stock_target") for i,j in build_jobs.items() if j["name"]=="wall"},
                           "mines":sorted(world.zones.get("stone", ()))[:8],
-                          "gaps":sorted((self.rules.build_rule(world,"wall").cells if self.rules.build_rule(world,"wall") else set())-
-                                        {u.pos for u in world.ours.values() if u.alive and u.kind=="wall"}),
+                          "gaps":sorted(economy.battery.missing_walls(world,self.rules)),
                           "seal_ready":bool(world.seal_cells)},
-                      "gun_status":[{"id":w.id,"cd":w.cooldown,"range":w.attack_range,
-                          "controllers":[u.id for u in world.movers if distance(w.pos,u.pos)<=1],
-                          "targets":sum(distance(w.pos,r.pos)<=(w.attack_range or 0) for r in world.robots.values()),
-                          "fired":response["roleCommandMap"].get(w.id,{}).get("action")=="attack"} for w in world.weapons],
+                      "gun_status":combat.fire_status(world,clock,self.rules,response,candidates),
                       "feedback_counts": dict(draft.feedback_counts),
                       "construction_commitments": sorted(guidance.construction_actions),
                       "upgrade_commitments": sorted(guidance.upgrade_actions),
+                      "urgent_upgrade_commitments": sorted(guidance.urgent_upgrades),
                       "base_recovery": deepcopy(draft.recovery.diagnostic),
                       "recovery_commitments": sorted(guidance.recovery_actions),
                       "economic_routes": deepcopy(draft.economic_routes.diagnostic),

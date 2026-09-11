@@ -8,6 +8,7 @@ from .protocol import MINERALS, WEAPONS, distance, pos_json
 from . import procurement
 from .layout import LayoutGuard
 from .weapon_portfolio import WeaponPortfolio
+from . import battery
 
 
 def movement(actor, steps, value, reason, *, route_goal=None):
@@ -15,7 +16,7 @@ def movement(actor, steps, value, reason, *, route_goal=None):
             for i, p in enumerate(steps[:4])]
 
 
-def prepare_wall_cycle(world, clock, rules):
+def prepare_wall_cycle(world, clock, rules, policy=None):
     """Allow a verified ring seal only after every living role is back inside.
 
     Daytime access is restored by removing one owned wall; no refund assumed.
@@ -29,28 +30,40 @@ def prepare_wall_cycle(world, clock, rules):
     if rule.cells != yellow or len(yellow) != rules.wall_limit:
         return
     world.build_interior = blue
+    battery.prepare(world, rules, policy)
     if rules.wall_count(world) >= 10:
         world.defence_cells = blue
     if (clock.phases == {"day"} and clock.until_night <= 10 and len(world.movers) == 3
             and all(u.pos in blue for u in world.movers)
             and not any(u.pos in blue or u.pos in world.stations[0].cells for u in world.robots.values())):
-        world.seal_cells = yellow
+        world.seal_cells = world.wall_targets if world.wall_targets is not None else yellow
 
 
 def open_day_gate(world, clock, rules, deadline):
-    if clock.phases != {"day"} or clock.until_night <= 10 or len(world.stations) != 1:
+    if clock.phases != {"day"} or len(world.stations) != 1:
         return []
     from .rules import station_rings
     blue, yellow = station_rings(world.stations[0].pos)
     rule = rules.build_rule(world, "wall")
     walls = {u.pos for u in world.ours.values() if u.alive and u.kind == "wall"}
-    if not rule or rule.cells != yellow or not yellow <= walls:
+    if not rule or rule.cells != yellow:
         return []
+    if world.firing_ports:
+        gates = walls & world.firing_ports
+        reason = "clear reserved Gatling firing port; do not rebuild this wall"
+        if not gates and clock.until_night > 10 and not battery.has_exit(world):
+            gates = walls & battery.cells(world,'wall',yellow)
+            reason = "open one owned wall for daytime access; stone is not refunded"
+    else:
+        if clock.until_night <= 10 or not yellow <= walls:
+            return []
+        gates = yellow
+        reason = "open one owned wall for daytime access; stone is not refunded"
     options = []
     for actor in world.movers:
         if actor.kind != "worker" or actor.pos not in blue:
             continue
-        for gate in sorted(yellow):
+        for gate in sorted(gates):
             length, steps = route(world, actor, [gate], deadline)
             if length is not None:
                 options.append((length, actor.id, gate, steps))
@@ -59,8 +72,8 @@ def open_day_gate(world, clock, rules, deadline):
     length, identity, gate, steps = min(options)
     if length == 0:
         return [Candidate(identity, {"action":"remove", "targetPos":[pos_json(gate)]}, 40,
-                          "open one owned wall for daytime access; stone is not refunded")]
-    return movement(world.ours[identity], steps, 40, "approach daytime gate to reopen access")
+                          reason)]
+    return movement(world.ours[identity], steps, 40, reason)
 
 
 def construction_cash_reserve(world, policy):
@@ -73,15 +86,21 @@ def construction_cash_reserve(world, policy):
 
 
 def construction_jobs(world, rules, policy=None):
+    if policy is not None:
+        battery.prepare(world, rules, policy)
+    if world.battery_plan is not None:
+        # The requested composition and complete gun/port layout have already
+        # been chosen. A portfolio timeout must not silently replace the mix.
+        return _construction_jobs(world, rules, reserve_gold=construction_cash_reserve(world, policy), prefer_closed_ring=False)
     if policy is not None and policy.weapon_portfolio_enabled:
         try:
-            return _construction_jobs(world, rules, portfolio=True, repair_saturation=policy.portfolio_saturation_enabled, reserve_gold=construction_cash_reserve(world, policy))
+            return _construction_jobs(world, rules, portfolio=True, repair_saturation=policy.portfolio_saturation_enabled, reserve_gold=construction_cash_reserve(world, policy), prefer_closed_ring=policy.closed_ring_rockets_enabled)
         except TimeoutError:
             pass  # Discard the whole partial portfolio, retain complete baseline.
-    return _construction_jobs(world, rules, reserve_gold=construction_cash_reserve(world, policy))
+    return _construction_jobs(world, rules, reserve_gold=construction_cash_reserve(world, policy), prefer_closed_ring=policy is None or policy.closed_ring_rockets_enabled)
 
 
-def _construction_jobs(world, rules, portfolio=False, repair_saturation=False, reserve_gold=0):
+def _construction_jobs(world, rules, portfolio=False, repair_saturation=False, reserve_gold=0, prefer_closed_ring=True):
     """Assign prospective material jobs within current gold, cells and slots.
 
     Materials remain personal. This is recomputed from observations every turn;
@@ -93,7 +112,7 @@ def _construction_jobs(world, rules, portfolio=False, repair_saturation=False, r
     planned = []
     layout = LayoutGuard(world, time.monotonic()+0.04)
     workers = {u.id: u for u in world.movers if u.kind == "worker"}
-    available = {name: (rule, {p for p in rule.cells if world.inside(p) and p not in world.occupied})
+    available = {name: (rule, {p for p in battery.cells(world,name,rule.cells) if world.inside(p) and p not in world.occupied})
                  for name in sorted(WEAPONS | {"wall"}) if (rule := rules.build_rule(world, name)) is not None}
     result, reserved_cells = {}, set()
     gold, slots = max(0, world.gold-reserve_gold), max(0, rules.weapon_limit-len(world.weapons))
@@ -124,7 +143,14 @@ def _construction_jobs(world, rules, portfolio=False, repair_saturation=False, r
                     # range splash fire when all existing/planned guns are short.
                     short_battery = len(world.weapons)+len(planned) >= 2 and all(
                         (u.attack_range or 0) <= 3 for u in world.weapons) and all(n == "gatling" for n, _, _ in planned)
-                    preference = int(short_battery and name in WEAPONS and name != "rocket" and "rocket" in available)
+                    # A full yellow ring intersects outward bullet paths. Its
+                    # projectile semantics are unknown; rockets are explicitly
+                    # unblocked. Use that guaranteed capability for this layout,
+                    # including the timeout fallback, rather than two silent guns.
+                    closed_ring = prefer_closed_ring and bool(world.build_interior)
+                    preference = int((closed_ring or short_battery) and name in WEAPONS and name != "rocket" and "rocket" in available)
+                    if world.battery_plan is not None:
+                        preference = int(name == 'rocket' and sum(u.kind=='gatling' for u in world.weapons)+sum(n=='gatling' for n,_,_ in planned)<2)
                     options.append((name == "wall", deficit, preference, distance(actor.pos,target)-gain/20, identity, name, target))
         if not options:
             break
@@ -146,8 +172,9 @@ def _construction_jobs(world, rules, portfolio=False, repair_saturation=False, r
     # Keep a material/staging job for the final gate even while the layout
     # policy correctly refuses to close it before the pioneer returns.
     wall_rule = rules.build_rule(world, "wall")
-    missing = (set(wall_rule.cells)-{u.pos for u in world.ours.values() if u.alive and u.kind=="wall"}) if wall_rule else set()
-    if len(missing)==1 and world.build_interior and len(world.weapons)>=rules.weapon_limit:
+    missing = battery.missing_walls(world,rules)
+    enclosing = not world.firing_ports or bool(world.battery_plan and world.battery_plan['enclosure'])
+    if len(missing)==1 and enclosing and world.build_interior and len(world.weapons)>=rules.weapon_limit:
         target = next(iter(missing))
         free_workers = [u for u in world.movers if u.kind=="worker" and (u.id not in result or result[u.id]["name"]=="wall")]
         if free_workers:
@@ -159,7 +186,7 @@ def _construction_jobs(world, rules, portfolio=False, repair_saturation=False, r
     # Allocate carried stock first (inventories cannot be transferred), then
     # balance outstanding collection rather than repeatedly fetching four stones.
     builders = sorted(i for i,j in result.items() if j["name"] == "wall")
-    remaining = max(0, rules.wall_limit-rules.wall_count(world))
+    remaining = min(len(missing),max(0, rules.wall_limit-rules.wall_count(world)))
     quotas = {}
     for i in sorted(builders, key=lambda i: (-world.ours[i].inventory["stone"], i)):
         quotas[i] = min(remaining, world.ours[i].inventory["stone"])
@@ -170,7 +197,10 @@ def _construction_jobs(world, rules, portfolio=False, repair_saturation=False, r
         i = min(builders, key=lambda i:(quotas[i],i))
         quotas[i] += 1
     for i in builders:
-        result[i]["stock_target"] = quotas[i]
+        if quotas[i] == 0:
+            del result[i]  # Another worker already carries all needed stone.
+        else:
+            result[i]["stock_target"] = quotas[i]
     return result
 
 
@@ -300,7 +330,7 @@ def immediate(world, rules, task_actor=None, *, jobs=None, policy=None):
             prefix = "Weapon" if building.kind in WEAPONS else "Station" if building.kind == "station" else "Wall" if building.kind == "wall" else None
             if prefix and building.level in {1, 2}:
                 name = f"{prefix}UpgradeVoucher{building.level}"
-                if actor.inventory[name]:
+                if actor.inventory[name] and procurement.upgrade_allowed(world,building,policy,rules):
                     result.append(Candidate(actor.id, {"action": "use", "name": name, "targetPos": [pos_json(building.pos)]},
                                             30 if prefix != "Wall" else 12, "use carried level-matched voucher"))
             max_hp = rules.max_health.get(building.kind, {}).get(building.level)
@@ -333,7 +363,7 @@ def construction(world, clock, rules, actor, deadline, *, names=None, target_cel
             continue
         if name == "wall" and rules.wall_count(world) >= rules.wall_limit:
             continue
-        for target in sorted(rule.cells):
+        for target in sorted(battery.cells(world,name,rule.cells)):
             if target_cell is not None and target != target_cell:
                 continue
             if world.inside(target) and target not in world.occupied:
@@ -362,7 +392,7 @@ def construction(world, clock, rules, actor, deadline, *, names=None, target_cel
 
 
 def propose(world, clock, rules, policy, deadline, task_actor=None, operator_stands=None, *, upgrade_candidates=None, build_jobs=None):
-    result = (procurement.propose(world, policy, deadline, task_actor)
+    result = (procurement.propose(world, policy, deadline, task_actor, rules=rules)
               if upgrade_candidates is None else list(upgrade_candidates))
     if build_jobs is None:
         build_jobs = construction_jobs(world, rules, policy)
@@ -401,7 +431,12 @@ def propose(world, clock, rules, policy, deadline, task_actor=None, operator_sta
         bag_full = actor.capacity is not None and actor.backpack is not None and len(actor.backpack) >= actor.capacity
         if ore_count:
             length, steps = route(world, actor, world.zones.get("vendor", ()), deadline)
-            if length:
+            vendor_stands = interaction_cells(world, world.zones.get("vendor", ()), actor.pos)
+            home_from_vendor = min((defence_field[p] for p in vendor_stands if p in defence_field), default=None)
+            sale_actions = sum(actor.inventory[k] > materials[k] for k in MINERALS)
+            sale_fits = (not world.build_interior or (home_from_vendor is not None and length is not None and
+                length+sale_actions+home_from_vendor+policy.return_buffer+8 <= clock.until_night))
+            if length and sale_fits:
                 carried_value = sum(max(0, actor.inventory[k]-materials[k])*world.vendor.get(k, 0) for k in MINERALS)
                 value = carried_value/(length+1) * (1.2 if ore_count >= policy.sell_batch or bag_full else 0.25)
                 result.extend(movement(actor, steps, value, "sell route valued by current prices and carried quantity",
@@ -428,7 +463,9 @@ def propose(world, clock, rules, policy, deadline, task_actor=None, operator_sta
                     utility = 8/(length+1) if needed else 0
                     if sell_length is not None:
                         horizon = length + policy.sell_batch + sell_length + 1
-                        utility += policy.sell_batch*world.vendor.get(mineral, 0)/horizon
+                        home = min((defence_field[p] for p in vendor_goals if p in defence_field), default=None)
+                        if not world.build_interior or (home is not None and horizon+home+policy.return_buffer+8 <= clock.until_night):
+                            utility += policy.sell_batch*world.vendor.get(mineral, 0)/horizon
                     if length and utility > 0:
                         result.extend(movement(actor, steps, utility, "gather verified building materials" if needed
                                                else "ore route includes harvest and vendor return",
