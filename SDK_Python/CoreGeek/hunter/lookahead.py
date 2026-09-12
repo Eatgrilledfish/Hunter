@@ -12,6 +12,7 @@ from .arbitration import Candidate
 from .navigation import neighbours
 from .protocol import distance, pos_json
 from .rules import Clock
+from .robot_threats import active as active_threats
 
 ROBOT_DAMAGE = {"smallRobot": 5, "middleRobot": 10, "largeRobot": 20, "bossRobot": 40}
 SCENARIOS = (("fixed_full", False, 1.0), ("fixed_half", False, .5),
@@ -105,6 +106,10 @@ def weighted_loss(values, weights):
 def propose(world, clock, actor, task, memory, policy, deadline):
     if clock.phases != {"night"} or not world.robots or not policy.lookahead_enabled:
         return [], {"status": "inactive"}
+    if hasattr(world,'night_roster') and actor.kind == 'worker' and actor.id not in world.night_defenders and not any(
+            r.attack_range is not None and distance(actor.pos,r.pos)<=r.attack_range
+            for r in active_threats(world)):
+        return [], {"status": "outside observed attack range"}
     weights = memory.weights() if memory else {name: 1.0 for name, _, _ in SCENARIOS}
     horizon = max(4, min(8, policy.lookahead_horizon))
     baseline = losses(world, clock, [actor.pos]*horizon)

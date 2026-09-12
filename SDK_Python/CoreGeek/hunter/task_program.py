@@ -8,7 +8,7 @@ import re
 from urllib.parse import urlsplit
 
 
-def prepare(code, root, cwd, documents, diagnostics=None):
+def prepare(code, root, cwd, documents, diagnostics=None, feedback=()):
     tree = ast.parse(code)
     changes = []
     # The wrapper already chdir's to cwd. Resolve a repeated root-relative cwd
@@ -39,10 +39,18 @@ def prepare(code, root, cwd, documents, diagnostics=None):
         origins.add((parsed.scheme,parsed.hostname,parsed.port or 80))
     bearer = bool(re.search(
         r'Authorization[\s`\"\'|:：=*]{0,32}f?[`\"\']?\s*Bearer\b',texts,re.I))
+    documented_bearer = bearer
+    observed_bearer = any(e.get('kind')=='http' and e.get('status')==401
+        and isinstance(e.get('origin'),str)
+        and (lambda p:(p.scheme,p.hostname,p.port or 80) in origins)(urlsplit(e['origin']))
+        and re.search(r'Authorization:\s*Bearer\s',e.get('error_hint',''),re.I)
+        for e in feedback if isinstance(e,dict))
+    bearer = bearer or observed_bearer
     auth = len(keys)==1 and len(origins)==1 and bearer
     if diagnostics is not None:
         diagnostics.update(documents=len(documents), matched_credentials=len(keys), origins=len(origins),
-                           documented_header='Authorization/Bearer' if bearer else None,
+                           documented_header='Authorization/Bearer' if documented_bearer else None,
+                           observed_header='Authorization/Bearer' if observed_bearer else None,
                            auth=('ready' if auth else 'credential_not_uniquely_bound' if len(keys)!=1
                                  else 'origin_not_unique' if len(origins)!=1 else 'header_contract_unrecognized'))
     source=ast.unparse(tree) if changes else code
@@ -89,6 +97,20 @@ def _hunter_open(self,url,data=None,timeout=5):
     return _hunter_opener_open(self,url,data=data,timeout=timeout)
 _hu.OpenerDirector.open = _hunter_open
 _hu.HTTPRedirectHandler.redirect_request = _hunter_redirect_request
+try:
+    import requests as _hrequests
+except ImportError:
+    pass
+else:
+    _hunter_auth_requests_send = _hrequests.Session.send
+    def _hunter_send(self, req, **kwargs):
+        if _hunter_origin(req.url) in _hunter_origins:
+            req.headers['Authorization'] = 'Bearer '+_hunter_key
+            kwargs['proxies'] = {}
+            kwargs['allow_redirects'] = False
+            kwargs['timeout'] = 5
+        return _hunter_auth_requests_send(self, req, **kwargs)
+    _hrequests.Session.send = _hunter_send
 '''
         source='_hunter_key = '+repr(next(iter(keys)))+'\n_hunter_origins = '+repr(sorted(origins))+'\n'+bootstrap+'\nexec(compile('+repr(source)+',"<task_program>","exec"))'
         changes.append('documented_local_bearer')

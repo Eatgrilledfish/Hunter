@@ -383,7 +383,10 @@ def compile_operation(context, plan, environment, evidence):
                 manifest['API_DOCS.md'] = data['file_sha256']
         contract = {'refs': sorted(manifest)}
         runtime, adapters = prepare_program(code, root, path,
-            [inspections[p]['text'] for p in manifest], contract)
+            [inspections[p]['text'] for p in manifest], contract,
+            feedback=[event for record in evidence.values()
+                      if record.get('data',{}).get('operation') in ('run_python','run_tool')
+                      for event in record['data'].get('runtime_events',[])])
         runtime = runtime_prelude(root) + '\nexec(compile(' + repr(runtime) + ', "<task_program>", "exec"))'
         payload.update(runtime_code=runtime, program_adapters=adapters, program_contract=contract,
                        runtime_sha256=hashlib.sha256(runtime.encode()).hexdigest())

@@ -34,6 +34,8 @@ def execution_failure(data):
     if re.search(r'HTTP(?: Error)?\s*[45][0-9]{2}\b', text, re.I):return 'api_request_failed'
     if 'FileNotFoundError' in text and 'No such file or directory' in text:
         return 'file_or_interpreter_missing'
+    if data.get('status') in ('exit_error','timeout','output_limit'):
+        return 'sandbox_execution_failed'
     return None
 
 
@@ -1182,6 +1184,7 @@ class TaskEngine:
                                if e.get('usable') and e.get('data',{}).get('operation')=='read_slice'
                                and e['data'].get('completeness')=='complete'},
                            "latest_execution_failure":next(({'kind':e.get('failure'),'cwd':e['data'].get('cwd'),
+                               'runtime':e['data'].get('runtime_events',[]),
                                'entries':e['data'].get('cwd_entries'),'root_entries':e['data'].get('root_entries'),'tail':result_excerpt(e['data'].get('text',''))}
                                for e in reversed(list(task.evidence.values())) if e.get('failure')),None),
                            "rounds_left": None if task.timeout is None else max(0, task.timeout-(world.round-(task.accept_round or task.activation_round))),

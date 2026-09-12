@@ -122,7 +122,7 @@ class Agent:
             evasion_report={'status':'emergency gate plan active'}
             if not draft.external_gate.emergency_active and not draft.external_gate.deferred_night:
                 evasion,evasion_report=world.duty_budget.run('exterior_evasion', lambda budget_end:
-                    exterior_evasion.propose(world,clock,budget_end), min(start+self.policy.planning_seconds,time.monotonic()+.01))
+                    exterior_evasion.propose(world,clock,budget_end,trapped=draft.external_gate.stage=='RETURN_BLOCKED'), min(start+self.policy.planning_seconds,time.monotonic()+.01))
                 if evasion:
                     identity=evasion[0].actor
                     gate_candidates=[c for c in gate_candidates if c.actor!=identity]+evasion
@@ -166,7 +166,7 @@ class Agent:
                         draft.tasks.active, bool(task_actor or draft.tasks.active or draft.tasks.accept_pending)),
                     min(deadline,time.monotonic()+.06))
                 evasion,evasion_report=world.duty_budget.run('exterior_evasion', lambda budget_end:
-                    exterior_evasion.propose(world,clock,budget_end),min(deadline,time.monotonic()+.01))
+                    exterior_evasion.propose(world,clock,budget_end,trapped=draft.external_gate.stage=='RETURN_BLOCKED'),min(deadline,time.monotonic()+.01))
                 if evasion:
                     identity=evasion[0].actor
                     gate_candidates=[c for c in gate_candidates if c.actor!=identity]+evasion

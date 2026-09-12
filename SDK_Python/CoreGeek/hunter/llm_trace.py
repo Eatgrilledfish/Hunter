@@ -42,7 +42,9 @@ def result_shape(data):
         elif event.get('kind') == 'checker_exit':exits[event.get('path')]=event.get('returncode')
     if data.get('operation') == 'run_tool':exits[data.get('path')]=data.get('tool_exit_code')
     value = data.get('data')
-    return {'data_type':type(value).__name__ if 'data' in data else 'absent',
+    exceptions = re.findall(r'(?m)^([A-Za-z_][A-Za-z0-9_]*(?:Error|Exception))(?::|$)', text) if isinstance(text,str) else []
+    return {'exception':exceptions[-1] if exceptions else None,
+            'data_type':type(value).__name__ if 'data' in data else 'absent',
             'data_keys':list(value)[:6] if isinstance(value,dict) else [],
             'token_n':len(tokens), 'token_hash':digest(tokens[-1]) if tokens else None,
             'checker_exits':dict(list(exits.items())[:4])}

@@ -9,6 +9,7 @@ import time
 
 from .arbitration import Candidate
 from .navigation import neighbours
+from .robot_threats import active as active_threats
 from .protocol import distance, pos_json
 from .rules import station_rings
 from .task_side_layout import _field, BudgetExpired
@@ -192,7 +193,7 @@ class ExternalGate:
             # W's ordinary gate duty stays inside; it never replaces M outside.
             if label=='w':
                 blocked|={(x,y) for x in range(world.width) for y in range(world.height) if (x,y) not in blue}
-            threats=[u for u in world.robots.values() if u.alive and u.abnormal!='dizzy']
+            threats=active_threats(world)
             if any(u.attack_power is None or u.attack_range is None for u in threats):continue
             for robot in threats:
                 for x in range(max(0,robot.pos[0]-robot.attack_range),min(world.width,robot.pos[0]+robot.attack_range+1)):
@@ -432,7 +433,7 @@ class ExternalGate:
                 self.stage='ROLE_UNAVAILABLE'
                 return []
             blocked=(world.occupied|world.navigation_avoided.get(m.pos,set()))-{m.pos}
-            threats=[u for u in world.robots.values() if u.alive and u.abnormal!='dizzy']
+            threats=active_threats(world)
             risk_known=all(u.attack_power is not None and u.attack_range is not None for u in threats)
             # Reject currently exposed routes using an explicit two-opportunity
             # upper scenario, not a prediction of a robot's chosen target.
@@ -445,7 +446,7 @@ class ExternalGate:
                     for y in range(max(0,robot.pos[1]-radius),min(world.height,robot.pos[1]+radius+1)):
                         q=(x,y)
                         danger[q]=danger.get(q,0)+(robot.attack_power if robot.attack_power is not None else m.health)
-            blocked.update(q for q,h in danger.items() if 2*h>=m.health)
+            blocked.update(q for q,h in danger.items() if h>0)
             night_boundary=blue|yellow|world.stations[0].cells if open_exit is not None else frozenset()
             blocked.update(night_boundary)
             blocked.discard(m.pos)
@@ -636,7 +637,7 @@ class ExternalGate:
                 return []
             return None
         blue,yellow=station_rings(plan['anchor']);gate=plan['gate']
-        threats=[r for r in world.robots.values() if r.alive and r.abnormal!='dizzy']
+        threats=active_threats(world)
         known=all(r.attack_power is not None and r.attack_range is not None for r in threats)
         wall=next((u for u in world.ours.values() if u.alive and u.kind=='wall' and u.pos==gate),None)
         hit=(2*sum(r.attack_power for r in threats if distance(m.pos,r.pos)<=r.attack_range)) if known else None

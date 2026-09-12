@@ -26,7 +26,8 @@ def _hunter_http_detail(url, error=None):
     headers={k.lower():v for k,v in url.header_items()} if isinstance(url,_hr.Request) else {}
     names=[k for k in headers if _hre.search('authorization|api.?key|token',k)][:4]
     scheme=headers.get('authorization','').split(' ',1)[0].lower()
-    info={'path':_hp.urlsplit(address).path[:96],'auth_headers':names,
+    parsed=_hp.urlsplit(address)
+    info={'path':parsed.path[:96],'origin':parsed.scheme+'://'+str(parsed.hostname)+(':'+str(parsed.port) if parsed.port else ''),'auth_headers':names,
           'authorization_scheme':scheme if scheme in ('bearer','basic') else 'other' if scheme else 'absent'}
     if error is not None:
         # peek does not consume the HTTPError body the generated program may read.
@@ -56,6 +57,33 @@ def _hunter_observe_http(self, url, data=None, timeout=5):
         if local:_hunter_event(kind='http',error=type(exc).__name__)
         raise
 _hr.OpenerDirector.open = _hunter_observe_http
+try:
+    import requests as _hrequests
+except ImportError:
+    pass
+else:
+    _hunter_requests_send = _hrequests.Session.send
+    def _hunter_observe_requests(self, req, **kwargs):
+        local = _hp.urlsplit(req.url).hostname in ('localhost','127.0.0.1')
+        if local:
+            kwargs['proxies'] = {}
+        try:
+            response = _hunter_requests_send(self, req, **kwargs)
+            if local:
+                view = _hr.Request(req.url, headers=dict(req.headers))
+                detail = _hunter_http_detail(view)
+                # Do not force a streamed response body to be downloaded.
+                if response.status_code >= 400 and not kwargs.get('stream'):
+                    import io as _hio
+                    error = type('_HunterError',(),{})()
+                    error.fp = _hio.BufferedReader(_hio.BytesIO(response.content[:384]))
+                    detail = _hunter_http_detail(view,error)
+                _hunter_event(kind='http',status=response.status_code,**detail)
+            return response
+        except _hrequests.RequestException as exc:
+            if local:_hunter_event(kind='http',error=type(exc).__name__)
+            raise
+    _hrequests.Session.send = _hunter_observe_requests
 _hunter_popen = _hsub.Popen
 class _HunterPopen(_hunter_popen):
     def __init__(self, args, *positional, **kwargs):

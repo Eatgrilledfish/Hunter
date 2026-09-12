@@ -98,7 +98,8 @@ class Diagnostics(logging.Handler):
             self.local.task_active = active
             self.local.task_evidence = active.get('evidence') or {}
             self.local.task_required = checker_paths(SimpleNamespace(
-                evidence=self.local.task_evidence,statement_path=active.get('statement_path')))
+                evidence=self.local.task_evidence,statement_path=active.get('statement_path'),
+                environment=active.get('environment',{})))
             faults = [e for e in active.get("events",[]) if e.get("kind") in
                       {"quarantined_llm", "invalid_llm", "invalid_command_plan", "missing_llm", "oversized_llm", "missing_command_effect_unknown"}]
             self.local.task_fault = faults[-1] if faults else None
@@ -148,6 +149,10 @@ class Diagnostics(logging.Handler):
         commands = obj(response.get('roleCommandMap'))
         point = lambda p: list(p) if isinstance(p, (list, tuple)) and len(p) == 2 else None
         duty = {}
+        evasion = obj(decision.get('exterior_evasion'))
+        if evasion.get('status') not in (None,'inactive','not an exterior economist','interior transit handled by roster'):
+            duty['evasion'] = {key:evasion[key] for key in ('status','nearest','in_range',
+                'known_damage_before','known_damage_after','route_damage_bound','damage_budget') if key in evasion}
         if layout.get('c'):
             duty['layout'] = {k:point(layout.get(k)) for k in ('c','w','gate')}
         if roster:

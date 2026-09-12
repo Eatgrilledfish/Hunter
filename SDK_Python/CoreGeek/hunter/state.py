@@ -81,9 +81,24 @@ class Session:
         self.joint_risk.observe(world)
         self.recovery.observe(world)
         self.economic_routes.observe(world, clock)
+        world.move_yielding = set()
         if world.round == self.last_round + 1:
             feedback = obj(world.raw.get("lastRoundRoleActionResults"))
             previous = self.last_response.get("roleCommandMap", {})
+            collisions = {}
+            for identity, command in previous.items():
+                actor = world.ours.get(identity)
+                if (command.get('action')=='move' and feedback.get(identity) is False
+                        and actor and actor.alive and actor.pos==self.last_positions.get(identity)):
+                    target = position(command.get('targetPos',[{}])[0])
+                    if target is not None:
+                        collisions.setdefault(target,[]).append(identity)
+            retry = set()
+            for identities in collisions.values():
+                if len(identities)>1:
+                    ordered = sorted(identities)
+                    retry.add(ordered[0])
+                    world.move_yielding.update(ordered[1:])
             for identity, command in previous.items():
                 outcome = feedback.get(identity)
                 signature = (identity, fingerprint(command))
@@ -92,6 +107,13 @@ class Session:
                     target = position(command.get("targetPos", [{}])[0])
                     key = (identity, origin, target)
                     actor = world.ours.get(identity)
+                    if identity in retry:
+                        # A shared-target failure is not proof of a blocked
+                        # edge. Retry one actor while its peers wait. A later
+                        # solo failure still enters ordinary obstacle backoff.
+                        self.failed_moves.pop(key,None)
+                        self.failed.pop(signature,None)
+                        continue
                     if outcome is False and actor is not None and actor.alive and actor.pos == origin:
                         count = self.failed_moves.get(key, (0, 0))[0] + 1
                         self.failed_moves[key] = (count, world.round)

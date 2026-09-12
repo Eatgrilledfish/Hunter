@@ -17,6 +17,17 @@ def checker_paths(task):
         # from an execution that happened to succeed.
         work_dirs={posixpath.normpath(posixpath.join(document_dir,m[1]))
                    for m in re.finditer(r'\bWork\s+in\s+[`\"\']?((?:\./)?[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*)(?=[`\"\'\s,;]|\.(?:\s|$)|$)',text,re.I)}
+        root = (getattr(task, 'environment', {}) or {}).get('root')
+        for match in re.finditer(r'\bcd\s+[`\"\']?([A-Za-z0-9_./-]+)(?=[`\"\'\s;]|$)', text):
+            directory = posixpath.normpath(match[1])
+            if directory.startswith('/'):
+                if not root or not directory.startswith(root.rstrip('/') + '/'):
+                    continue
+                directory = posixpath.relpath(directory, root)
+            else:
+                directory = posixpath.normpath(posixpath.join(document_dir, directory))
+            if directory != '..' and not directory.startswith('../'):
+                work_dirs.add(directory)
         command_dir=next(iter(work_dirs)) if len(work_dirs)==1 else document_dir
         for m in re.finditer(r'(\bRun|\bExecute|\bchecker\s+is|运行|执行|检查器为)\s+[`\"\']?(\./[A-Za-z0-9_/-]+(?:\.py|\.sh)?)(?=[`\"\'\s.,;。]|$)',text,re.I):
             if text[m.end():m.end()+1]=='.' and text[m.end()+1:m.end()+2].isalnum():continue

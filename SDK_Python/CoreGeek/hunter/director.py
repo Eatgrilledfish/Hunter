@@ -16,17 +16,18 @@ from .rules import Policy
 from . import lookahead
 from .night_roles import defender_ids, operators, fixed_stands, transit_stands
 from .lookahead import ROBOT_DAMAGE
+from .robot_threats import active as active_threats
 from .firing_lanes import FiringLanes
 from .operator_cycles import OperatorCycles
 from .rocket_rotation import advance as advance_rockets
 
 
 def exposure(world, clock, pos):
-    threats = [r for r in world.robots.values() if r.alive and r.abnormal != "dizzy"]
+    threats = active_threats(world)
     if "night" not in clock.phases:
         threats = []
-    near = [r for r in threats if distance(r.pos, pos) <= 3]
-    upper = sum(ROBOT_DAMAGE.get(r.kind, r.attack_power or 0) for r in near)
+    near = [r for r in threats if r.attack_range is not None and distance(r.pos, pos) <= r.attack_range]
+    upper = sum(r.attack_power or 0 for r in near)
     return {"lower": 0, "upper_per_attack_opportunity": upper,
             "nearest": min((distance(r.pos, pos) for r in threats), default=world.width+world.height),
             "sources": [r.id for r in near],

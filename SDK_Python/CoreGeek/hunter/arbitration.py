@@ -32,6 +32,27 @@ class Selection:
     alternatives: list = field(default_factory=list)
 
 
+def movement_yielders(checked):
+    """Stable single-file priority when actors prefer the same free tile.
+
+    A loser waits instead of choosing a simultaneous sidestep. Only compare
+    actors whose highest-valued action is a move; a stationary worker doing
+    useful work must not reserve a tile it does not intend to enter.
+    """
+    preferred = {}
+    for candidate, _ in checked:
+        old = preferred.get(candidate.actor)
+        if old is None or (-candidate.utility, repr(candidate.command)) < (-old.utility, repr(old.command)):
+            preferred[candidate.actor] = candidate
+    groups = {}
+    for candidate in preferred.values():
+        if candidate.utility > 0 and candidate.command.get('action') == 'move':
+            p = candidate.command['targetPos'][0]
+            groups.setdefault((p['x'],p['y']), []).append(candidate.actor)
+    return {actor for actors in groups.values() if len(actors)>1
+            for actor in sorted(actors)[1:]}
+
+
 def select(world, clock, rules, policy, candidates, deadline, *, task_actor=None, summon_remaining=0,
            weights=None, incumbent=None, task_moves=(), allow_task_control=False, alternatives_limit=0,
            diversity_key=None):
@@ -70,6 +91,15 @@ def select(world, clock, rules, policy, candidates, deadline, *, task_actor=None
                              "verdict": check.verdict.value, "reason": check.reason})
         else:
             checked.append((candidate, check.resources))
+
+    yielding = movement_yielders(checked) | getattr(world, 'move_yielding', set())
+    def admitted(candidate):
+        return candidate.actor not in yielding or candidate.command.get('action') != 'move'
+    for candidate, _ in checked:
+        if not admitted(candidate):
+            rejected.append({'actor':candidate.actor,'action':'move','verdict':'yielding',
+                             'reason':'stable movement priority; wait for one actor to pass'})
+    checked = [(c,r) for c,r in checked if admitted(c)]
 
     if getattr(world, 'forage_contract', None):
         fire_deadline = min(deadline, time.monotonic() + .005)
@@ -120,7 +150,7 @@ def select(world, clock, rules, policy, candidates, deadline, *, task_actor=None
     if incumbent:
         resource, good, damage = Resources(), [], {}
         for candidate in incumbent:
-            if not permits(world, clock, candidate):
+            if not admitted(candidate) or not permits(world, clock, candidate):
                 continue
             check = check_action(world, clock, rules, candidate.actor, candidate.command,
                                  task_actor=task_actor, summon_remaining=summon_remaining,
