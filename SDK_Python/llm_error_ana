@@ -1,0 +1,62 @@
+核心问题：LLM 调用格式过于复杂，平台 LLM 无法正确返回
+
+当前代码 (Hunter-main) 和参考代码 (自进化成功的代码) 在自进化任务上的根本差异在于 LLM 交互格式。
+
+详细对比
+
+1. LLM Prompt 格式
+
+当前代码 (tasks.py:1114-1209)：发送复杂的 JSON payload
+response["prompt"] = instructions + json.dumps(payload)
+其中 payload 包含：request_id、task、evidence（结构化证据数据）、allowed_intents、reply_template、required_response 等字段。指令本身混合了中英文，要求 LLM 返回 version:1, request_id, intent: execute|answer|inspect, command_plan: {operation: list_dir|read_slice|run_tool|run_python, ...} 格式的 JSON。
+
+参考代码 (main3.py:177-294)：发送纯自然语言 prompt
+你在一个沙盒环境中执行任务。你可以通过 executeCmd 执行 shell 命令，每次只能执行一条。
+任务描述: {phase_task}                            Jump to bottom ↓
+任务文件内容: {task_content[:3000]}
+执行历史: ...                                     Jump to bottom ↓
+请决定下一步，只输出一个 JSON:
+- 执行命令: {"cmd": "要执行的 shell 命令"}        Jump to bottom ↓
+- 提交答案: {"submit": <完整JSON答案>}
+                                                  Jump to bottom ↓
+2. LLM 响应解析
+                                                  Jump to bottom ↓
+当前代码 (tasks.py:712-785)：严格的多层验证
+- 必须是合法 JSON（或 code fence 中的 JSON）      Jump to bottom ↓
+- 必须有 version: 1（整数类型检查）
+- 必须有匹配的 request_id 或 context（nonce 哈希  Jump to bottom ↓
+- 必须有 intent ∈ {"execute", "answer", "inspect"}
+- intent == "execute" 时必须有 command_plan，且 o Jump to bottom ↓ st_dir|read_slice|run_tool|run_python 之一
+- intent == "answer" 时必须有 answer_candidate 符合 spec 格式
+- 任何一项不通过 → invalid_llm 或 quarantined →   Jump to bottom ↓
+
+参考代码 (main3.py:157-174)：简单 JSON 提取       Jump to bottom ↓
+obj = extract_json_obj(llm_text)  # 提取第一个 JSON 对象
+if "cmd" in obj: return ("cmd", obj["cmd"])     # Jump to bottom ↓
+if "submit" in obj: return ("submit", obj["submit"])  # 提交答案
+# 不可解析 → 重发 prompt 并强调格式               Jump to bottom ↓
+
+3. Sandbox/executeCmd                             Jump to bottom ↓
+
+当前代码：通过 compile_operation() 将操作编译为复 Jump to bottom ↓ OPERATION_SCRIPT，几百行），包含自己的 JSON协议、nonce 验证、文件安全检查等。先 discovery → locate_task → 然后才能执行操作。
+                                                  Jump to bottom ↓
+参考代码：直接发送 shell 命令
+resp["executeCmd"] = f"find /tmp /app /root /home Jump to bottom ↓ data -name {filename} -exec sh -c 'echo\"FILEPATH:$1\"; cat \"$1\"' _ {{}} \\; 2>/dev/null"
+# 后续命令也是直接 shell: cd /tmp/.../ws_1/ && se Jump to bottom ↓ ck && ./check
+
+4. 日志证据                                       Jump to bottom ↓
+
+从 teamA.log 可以看到：                           Jump to bottom ↓
+
+┌───────────────────┬──────┬───────────────────── Jump to bottom ↓ ─────────────────────────────────┐
+│       任务        │ 类型 │         结果         │                      原因                       │
+├───────────────────┼──────┼───────────────────── Jump to bottom ↓ ─────────────────────────────────┤
+│ task_1_alpha.md   │ fix  │ 成功 (89分)          │ TOKEN 从命令输出中确定性提取，绕过了 LLM        │
+├───────────────────┼──────┼───────────────────── Jump to bottom ↓ ─────────────────────────────────┤
+│ task_1_beijing.md │ api  │ 部分失败 (16分/80分) │ LLM 响应格式不匹配 → 多次重试 → 答案错误/不完整 │
+├───────────────────┼──────┼───────────────────── Jump to bottom ↓ ─────────────────────────────────┤
+│ task_2_beta.md    │ fix  │ 成功 (88分)          │ 同样是 TOKEN 确定性提取                         │
+└───────────────────┴──────┴───────────────────── Jump to bottom ↓ ─────────────────────────────────┘
+
+- fix 类任务成功是因为代码有 TOKEN 提取逻辑，直接 Jump to bottom ↓ 中提取 TOKEN 并提交，完全跳过 LLM
+- api 类任务失败是因为必须依赖 LLM 解析 API 响应数据并提交答案，但 LLM 的返回不符合严格的格式验证
