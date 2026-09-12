@@ -364,7 +364,7 @@ class Policy:
     reserve_gold: int = 20
     telemetry_entries: int = 256
     treasure_enabled: bool = True
-    treasure_gold_limit: int = 45
+    treasure_gold_limit: int = 90
     treasure_attempt_limit: int = 2
     news_hold_enabled: bool = True
     summon_pressure_enabled: bool = True

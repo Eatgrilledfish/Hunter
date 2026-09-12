@@ -9,6 +9,7 @@ SOURCE = r'''
 import atexit as _ha, json as _hj, os as _ho, shlex as _hs, shutil as _hh
 import subprocess as _hsub, sys as _hsys, re as _hre
 _hunter_events = []
+_hunter_json_pending = False
 def _hunter_event(**record):
     if len(_hunter_events) < 4:
         _hunter_events.append(record)
@@ -18,6 +19,31 @@ def _hunter_report():
     if _hunter_events:
         print('\nHUNTER_RUNTIME:' + _hj.dumps(_hunter_events, ensure_ascii=True), file=_hsys.stderr, flush=True)
 _ha.register(_hunter_report)
+_hunter_json_loads = _hj.loads
+def _hunter_shape(value,depth=0):
+    if depth>=2:return type(value).__name__
+    if isinstance(value,dict):return {str(k)[:48]:_hunter_shape(v,depth+1) for k,v in list(value.items())[:6]}
+    if isinstance(value,list):return {'type':'list','length':len(value),'item':_hunter_shape(value[0],depth+1) if value else None}
+    return type(value).__name__
+def _hunter_loads(*args,**kwargs):
+    global _hunter_json_pending
+    value=_hunter_json_loads(*args,**kwargs)
+    if _hunter_json_pending:
+        _hunter_json_pending=False
+        record=dict(kind='json_shape',shape=_hunter_shape(value))
+        prior=next((i for i,e in enumerate(_hunter_events) if e.get('kind')=='json_shape'),None)
+        if prior is not None:_hunter_events[prior]=record
+        else:_hunter_event(**record)
+    return value
+_hj.loads=_hunter_loads
+_hunter_excepthook=_hsys.excepthook
+def _hunter_exception(kind,value,tb):
+    info={'kind':'exception','error':kind.__name__}
+    if isinstance(value,AttributeError):
+        info.update(attribute=str(getattr(value,'name',''))[:48],object_type=type(getattr(value,'obj',None)).__name__)
+    _hunter_event(**info)
+    _hunter_excepthook(kind,value,tb)
+_hsys.excepthook=_hunter_exception
 import urllib.request as _hr, urllib.parse as _hp, urllib.error as _he
 _hunter_http_open = _hr.OpenerDirector.open
 def _hunter_http_detail(url, error=None):
@@ -44,11 +70,14 @@ def _hunter_http_detail(url, error=None):
         except (AttributeError,OSError,ValueError,TypeError):pass
     return info
 def _hunter_observe_http(self, url, data=None, timeout=5):
+    global _hunter_json_pending
     address = url.full_url if isinstance(url, _hr.Request) else url
     local = isinstance(address, str) and _hp.urlsplit(address).hostname in ('localhost', '127.0.0.1')
     try:
         response = _hunter_http_open(self, url, data, timeout)
-        if local:_hunter_event(kind='http',status=response.status,**_hunter_http_detail(url))
+        if local:
+            _hunter_event(kind='http',status=response.status,**_hunter_http_detail(url))
+            _hunter_json_pending=200<=response.status<300
         return response
     except _he.HTTPError as exc:
         if local:_hunter_event(kind='http',status=exc.code,**_hunter_http_detail(url,exc))
@@ -64,6 +93,7 @@ except ImportError:
 else:
     _hunter_requests_send = _hrequests.Session.send
     def _hunter_observe_requests(self, req, **kwargs):
+        global _hunter_json_pending
         local = _hp.urlsplit(req.url).hostname in ('localhost','127.0.0.1')
         if local:
             kwargs['proxies'] = {}
@@ -79,6 +109,7 @@ else:
                     error.fp = _hio.BufferedReader(_hio.BytesIO(response.content[:384]))
                     detail = _hunter_http_detail(view,error)
                 _hunter_event(kind='http',status=response.status_code,**detail)
+                _hunter_json_pending=200<=response.status_code<300
             return response
         except _hrequests.RequestException as exc:
             if local:_hunter_event(kind='http',error=type(exc).__name__)

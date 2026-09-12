@@ -149,6 +149,15 @@ class Diagnostics(logging.Handler):
         commands = obj(response.get('roleCommandMap'))
         point = lambda p: list(p) if isinstance(p, (list, tuple)) and len(p) == 2 else None
         duty = {}
+        rumour = obj(decision.get('rumour_llm'))
+        if rumour.get('status') not in (None,'idle'):
+            duty['rumour'] = rumour
+        treasure = obj(decision.get('treasure'))
+        if treasure.get('stage') not in (None,'inactive'):
+            duty['treasure'] = {k:treasure[k] for k in ('stage','actor','target','items','required','opening','closing') if k in treasure}
+        market = obj(decision.get('sunset_market'))
+        if market.get('stage') not in (None,'inactive'):
+            duty['market'] = {k:market[k] for k in ('stage','buyer','fallback_worker','waiting','item','num','gold') if k in market}
         evasion = obj(decision.get('exterior_evasion'))
         if evasion.get('status') not in (None,'inactive','not an exterior economist','interior transit handled by roster'):
             duty['evasion'] = {key:evasion[key] for key in ('status','nearest','in_range',
@@ -168,7 +177,13 @@ class Diagnostics(logging.Handler):
         gate_point = point(gate.get('gate') or assignment.get('gate') or layout.get('gate'))
         if gate:
             details = {'stage':self._brief(gate.get('stage','unknown'),32)}
+            work=obj(gate.get('exterior_work'))
+            if work:
+                details['work']={k:work[k] for k in ('reason','quoted_stock_value','target','steps') if k in work}
+            if gate.get('work_blocked'):details['work_blocked']=gate['work_blocked']
             if gate_point is not None:
+                details['cell']=gate_point
+                if gate_point!=point(layout.get('gate')):details['planned_cell']=point(layout.get('gate'))
                 details['wall_observed'] = any(u.get('roleType')=='wall' and type(u.get('health')) is int
                     and u['health']>0 and [obj(u.get('pos')).get('x'),obj(u.get('pos')).get('y')]==gate_point
                     for u in units.values())

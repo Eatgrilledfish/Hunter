@@ -54,7 +54,10 @@ def prepare(code, root, cwd, documents, diagnostics=None, feedback=()):
                            auth=('ready' if auth else 'credential_not_uniquely_bound' if len(keys)!=1
                                  else 'origin_not_unique' if len(origins)!=1 else 'header_contract_unrecognized'))
     source=ast.unparse(tree) if changes else code
-    if auth:
+    probe = len(keys)==1 and len(origins)==1 and any(
+        isinstance(n,ast.Import) and any(a.name in ('urllib.request','requests') for a in n.names)
+        or isinstance(n,ast.ImportFrom) and n.module in ('urllib','urllib.request','requests') for n in ast.walk(tree))
+    if auth or probe:
         # Credentials come from BOTH inspected documentation and the generated
         # literal. Limit injection to that documented local origin; never carry
         # authorization through a redirect to a different origin.
@@ -63,6 +66,17 @@ import urllib.request as _hu, urllib.parse as _hp, urllib.error as _he
 _hunter_opener_open = _hu.OpenerDirector.open
 _hunter_redirect = _hu.HTTPRedirectHandler.redirect_request
 _hunter_auth_failed = set()
+def _hunter_auth_challenge(method, hint):
+    global _hunter_bearer_ready
+    if method=='GET' and not _hunter_bearer_ready and __import__('re').search(r'Authorization:\\s*Bearer\\s',hint,__import__('re').I):
+        _hunter_bearer_ready=True
+        return True
+    return False
+def _hunter_recovered(address):
+    for event in globals().get('_hunter_events',[]):
+        if (event.get('kind')=='http' and event.get('status')==401 and event.get('path')==_hp.urlsplit(address).path
+                and event.get('origin') and _hunter_origin(event['origin'])==_hunter_origin(address)):
+            event['recovered']=True
 def _hunter_origin(url):
     p = _hp.urlsplit(url)
     return (p.scheme,p.hostname,p.port or 80)
@@ -78,8 +92,9 @@ def _hunter_open(self,url,data=None,timeout=5):
             raise RuntimeError('HTTP 401: unchanged documented authentication already failed; inspect documentation')
         req = url if isinstance(url,_hu.Request) else _hu.Request(url,data=data)
         req.full_url = _hp.quote(req.full_url, safe=":/?&=%+;,@!$'()*[]#~")
-        req.remove_header('Authorization')
-        req.add_header('Authorization','Bearer '+_hunter_key)
+        if _hunter_bearer_ready:
+            req.remove_header('Authorization')
+            req.add_header('Authorization','Bearer '+_hunter_key)
         status = None
         try:
             direct = getattr(self, '_hunter_direct', None)
@@ -92,6 +107,21 @@ def _hunter_open(self,url,data=None,timeout=5):
             return response
         except _he.HTTPError as exc:
             status = exc.code
+            if status==401:
+                try:hint=exc.fp.peek(1024)[:1024].decode('utf-8','replace')
+                except (AttributeError,OSError,ValueError):hint=''
+                if _hunter_auth_challenge(req.get_method(),hint):
+                    exc.close()
+                    req.remove_header('Authorization')
+                    req.add_header('Authorization','Bearer '+_hunter_key)
+                    try:
+                        response=_hunter_opener_open(direct,req,data=data,timeout=bounded_timeout)
+                    except _he.HTTPError as retry_error:
+                        if retry_error.code!=401:_hunter_recovered(address)
+                        else:_hunter_auth_failed.add(origin)
+                        raise
+                    _hunter_recovered(address)
+                    return response
             if status == 401:_hunter_auth_failed.add(origin)
             raise
     return _hunter_opener_open(self,url,data=data,timeout=timeout)
@@ -105,13 +135,20 @@ else:
     _hunter_auth_requests_send = _hrequests.Session.send
     def _hunter_send(self, req, **kwargs):
         if _hunter_origin(req.url) in _hunter_origins:
-            req.headers['Authorization'] = 'Bearer '+_hunter_key
+            if _hunter_bearer_ready:req.headers['Authorization'] = 'Bearer '+_hunter_key
             kwargs['proxies'] = {}
             kwargs['allow_redirects'] = False
             kwargs['timeout'] = 5
-        return _hunter_auth_requests_send(self, req, **kwargs)
+        response=_hunter_auth_requests_send(self, req, **kwargs)
+        if (_hunter_origin(req.url) in _hunter_origins and response.status_code==401
+                and not kwargs.get('stream') and _hunter_auth_challenge(req.method,response.text[:1024])):
+            response.close()
+            req.headers['Authorization']='Bearer '+_hunter_key
+            response=_hunter_auth_requests_send(self,req,**kwargs)
+            if response.status_code!=401:_hunter_recovered(req.url)
+        return response
     _hrequests.Session.send = _hunter_send
 '''
-        source='_hunter_key = '+repr(next(iter(keys)))+'\n_hunter_origins = '+repr(sorted(origins))+'\n'+bootstrap+'\nexec(compile('+repr(source)+',"<task_program>","exec"))'
-        changes.append('documented_local_bearer')
+        source='_hunter_bearer_ready = '+repr(bool(auth))+'\n_hunter_key = '+repr(next(iter(keys)))+'\n_hunter_origins = '+repr(sorted(origins))+'\n'+bootstrap+'\nexec(compile('+repr(source)+',"<task_program>","exec"))'
+        changes.append('documented_local_bearer' if auth else 'local_auth_challenge')
     return source, sorted(set(changes))

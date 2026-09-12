@@ -37,6 +37,7 @@ def exposure(world, clock, pos):
 @dataclass
 class Directive:
     duty_permit: object = None
+    market_permit: object = None
     candidates: list = field(default_factory=list)
     task_moves: set = field(default_factory=set)
     allow_task_control: bool = False
@@ -47,6 +48,7 @@ class Directive:
     horizon_risk: dict = field(default_factory=dict)
     construction_actions: dict = field(default_factory=dict)
     day_actions: dict = field(default_factory=dict)
+    treasure_actions: dict = field(default_factory=dict)
     funded_actions: dict = field(default_factory=dict)
     repair_supply_actions: dict = field(default_factory=dict)
     seal_builds: dict = field(default_factory=dict)
@@ -68,6 +70,8 @@ class Directive:
         Medical/combat triage may override it. Reaching a stand permits stationary
         work, while ordinary movement cannot spend an already exhausted buffer.
         """
+        if self.market_permit is not None and not self.market_permit(candidate):
+            return False
         if self.duty_permit is not None:
             allowed=self.duty_permit(candidate)
             if allowed is not None:
@@ -91,6 +95,9 @@ class Directive:
         if candidate.actor in self.repair_supply_actions:
             medical = candidate.command['action']=='use' and candidate.command.get('name') in {'Medicine','Bomb','DizzyWeapon'}
             return medical or candidate.command in self.repair_supply_actions[candidate.actor]
+        if candidate.actor in self.treasure_actions:
+            medical = candidate.command['action']=='use' and candidate.command.get('name') in {'Medicine','Bomb','DizzyWeapon'}
+            return medical or candidate.command in self.treasure_actions[candidate.actor]
         if candidate.actor in self.funded_actions:
             medical = candidate.command['action']=='use' and candidate.command.get('name') in {'Medicine','Bomb','DizzyWeapon'}
             return medical or candidate.command in self.funded_actions[candidate.actor]

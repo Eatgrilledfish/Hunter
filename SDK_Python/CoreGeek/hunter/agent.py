@@ -268,6 +268,42 @@ class Agent:
             for c in clearing:
                 guidance.site_clear_actions.setdefault(c.actor,[]).append(c.command)
             guidance.candidates.extend(clearing)
+            world.treasure_actions = {}
+            world.treasure_reserved_gold = 0
+            if not draft.tasks.active and not draft.tasks.accept_pending:
+                world.pioneer_trade_stands = guidance.operator_stands
+                treasure = draft.intelligence.candidates(world,clock,self.policy,min(deadline,time.monotonic()+.15))
+                treasure = [c for c in draft.filter_failures(treasure,world.round) if guidance.permit(c)]
+                report = draft.intelligence.diagnostic
+                identity = report.get('actor')
+                waiting = (report.get('stage')=='wait_open' and identity not in clearing_ids
+                           and identity not in guidance.roster_transit_actions
+                           and identity not in draft.external_gate.commands
+                           and not guidance.return_routes.get(identity,{}).get('due'))
+                if treasure or waiting:
+                    world.treasure_actions[identity] = [c.command for c in treasure]
+                    if report.get("cost",0):
+                        world.treasure_reserved_gold = report["cost"]+self.policy.reserve_gold
+                    guidance.treasure_actions = world.treasure_actions
+                    world.pioneer_trade_ids.discard(identity)
+                    candidates = [c for c in candidates if not (c.actor==identity and c.command.get('action')=='acceptTask')]
+                    if task_choice and task_choice.get('actor')==identity:task_choice=None
+                    candidates.extend(treasure)
+            market_excluded = {task_actor} | clearing_ids | set(draft.external_gate.commands) | set(world.treasure_actions)
+            if draft.external_gate.stage.startswith('BACKUP_'):
+                market_excluded.update(u.id for u in world.movers)
+            if draft.night_roster.traffic:
+                market_excluded.update(draft.night_roster.traffic.get(k) for k in ('traveller','blocker'))
+            market_excluded.update(c.actor for c in candidates if c.command.get('action')=='acceptTask')
+            if draft.tasks.active:
+                market_excluded.add(draft.tasks.active.actor)
+            if draft.tasks.accept_pending:
+                market_excluded.add(draft.tasks.accept_pending.get('actor'))
+            if task_choice and task_choice.get('selected'):
+                market_excluded.add(task_choice['actor'])
+            market = draft.sunset_market.prepare(world,clock,self.rules,self.policy,guidance,build_jobs,
+                market_excluded,min(deadline,time.monotonic()+.15))
+            candidates.extend(draft.filter_failures(market,world.round))
             recovery_targets = draft.recovery.targets(world, self.rules, self.policy)
             urgent_upgrades = draft.filter_failures(economy.procurement.urgent_gatling_upgrades(
                 world,self.policy,self.rules,task_actor,priority_ids=recovery_targets),world.round)
@@ -316,12 +352,12 @@ class Agent:
             funded, funded_budgets = draft.day_schedule.funded_delivery(world,clock,self.policy,build_jobs,
                 guidance.operator_stands,upgrade_plans,min(deadline,time.monotonic()+.08))
             for c in draft.filter_failures(funded,world.round):
-                if c.actor in guidance.recovery_actions or c.actor in guidance.urgent_upgrades:continue
+                if c.actor in guidance.recovery_actions or c.actor in guidance.urgent_upgrades or not guidance.permit(c):continue
                 guidance.funded_actions.setdefault(c.actor,[]).append(c.command)
                 c.utility=90
                 candidates.append(c)
             scheduled = draft.day_schedule.candidates(world,clock,self.policy,build_jobs,guidance.operator_stands,
-                upgrade_plans,{task_actor}|set(guidance.recovery_actions)|set(guidance.urgent_upgrades)|set(guidance.funded_actions)|clearing_ids,
+                upgrade_plans,{task_actor}|set(guidance.recovery_actions)|set(guidance.urgent_upgrades)|set(guidance.funded_actions)|clearing_ids|set(world.sunset_actions),
                 min(deadline,time.monotonic()+.12))
             if getattr(world,'economy_first',False):
                 for c in scheduled:
@@ -363,7 +399,7 @@ class Agent:
             candidates.extend(medical)
             supply = world.duty_budget.run('repair_supply', lambda budget_end: draft.repair_supply.candidates(
                 world, clock, self.rules, self.policy, budget_end, guidance,
-                excluded | set(guidance.medical_actions)), min(deadline,time.monotonic()+.04))
+                excluded | set(guidance.medical_actions) | set(world.sunset_actions)), min(deadline,time.monotonic()+.04))
             supply = draft.filter_failures(supply, world.round)
             for candidate in supply:
                 guidance.repair_supply_actions.setdefault(candidate.actor,[]).append(candidate.command)
@@ -397,7 +433,6 @@ class Agent:
                                   ("defence", lambda: draft.defence.candidates(world, clock, self.policy, deadline, task_actor,
                                                                               incumbent.selected, guidance)),
                                   ("economy", lambda: economy.propose(world, clock, self.rules, self.policy, deadline, task_actor, guidance.operator_stands, upgrade_candidates=upgrade_candidates, build_jobs=build_jobs, task_choice=task_choice)),
-                                  ("treasure", lambda: draft.intelligence.candidates(world, clock, self.policy, deadline)),
                                   ("opponent", lambda: draft.opponent.candidates(world, clock, self.policy, task_actor, deadline))):
                 if time.monotonic() >= deadline:
                     break
@@ -418,7 +453,7 @@ class Agent:
             if self.policy.news_hold_enabled and world.gold is not None and world.gold > self.policy.reserve_gold:
                 for candidate in candidates:
                     if candidate.command["action"] == "sell" and draft.intelligence.hold_ore(candidate.command["name"], clock):
-                        if candidate.actor in world.pioneer_trade_ids:
+                        if candidate.actor in world.pioneer_trade_ids or candidate.actor in world.sunset_actions:
                             continue
                         actor = world.ours[candidate.actor]
                         if actor.capacity and actor.backpack is not None and len(actor.backpack) < actor.capacity*0.8:
@@ -464,6 +499,7 @@ class Agent:
             draft.external_gate.finalize(world,decision.response)
             draft.repair.finalize(world,decision.response)
             draft.repair_supply.finalize(world,decision.response)
+            draft.sunset_market.finalize(world,decision.response)
             draft.risk.finalize(world, clock, decision.response)
             draft.economic_routes.finalize(world, decision.selected, self.policy)
             validate_response(decision.response)
@@ -495,6 +531,10 @@ class Agent:
                           'selected':task_choice['selected']}),
                       "pioneer_trade": {"actors":sorted(world.pioneer_trade_ids), "reason":world.pioneer_trade_reason},
                       "task_lifecycle": world.task_lifecycle.snapshot(world) if hasattr(world, 'task_lifecycle') else {},
+                      "sunset_market": draft.sunset_market.diagnostic,
+                      "treasure": draft.intelligence.diagnostic,
+                      "rumour_llm": {"used":draft.tasks.budget.attempts,"status":draft.intelligence.llm_status,
+                                     "clues":len(draft.intelligence.clues)},
                       "return_routes": guidance.return_routes,
                       "navigation_retry_exclusions": {u.id:sorted(world.navigation_avoided.get(u.pos, set())) for u in world.movers},
                       "movement_retry_windows": draft.move_retry_windows(world.round),

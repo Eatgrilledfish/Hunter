@@ -32,13 +32,15 @@ def valid_seal(world, builds):
         and m.kind=='worker' and w.kind=='worker' and p.kind=='pioneer'
         and not world.phase_task
         and (not m.alive or m.pos not in blue|yellow|world.stations[0].cells)
-        and ((actor == m.id and m.alive and w.pos==plan['w'] and p.pos in plan['c_stands']
+        and ((actor == m.id and m.alive and (w.pos==plan['w'] and p.pos in plan['c_stands']
+                                           or permit.get('exterior_gap') and w.pos in blue and p.pos in blue)
               and distance(m.pos,target)==1 and m.inventory['stone']>=1)
              or (actor == w.id and permit.get('inner') and w.pos in blue and p.pos in blue
                  and distance(w.pos,target)==1 and w.inventory['stone']>=1))
         and target not in world.occupied
         and not any(u.alive and u.pos in blue|world.stations[0].cells for u in world.robots.values())
-        and walls==yellow-{target} and {u.pos for u in world.weapons}=={q for _,q in plan['slots']})
+        and (walls==yellow-{target} or permit.get('exterior_gap') and target in yellow)
+        and {u.pos for u in world.weapons}=={q for _,q in plan['slots']})
 
 
 @dataclass
@@ -113,13 +115,16 @@ class ExternalGate:
             else:
                 self.purchase_receipt={'status':'awaiting personal purchase receipt','name':pending['name'],'actor':pending['actor']}
         world.pending_night_purchase=self.purchase_pending
-        observed=[u.attack_power for u in world.robots.values() if u.alive and u.attack_power is not None]
+        observed=[u.attack_power for u in active_threats(world) if u.attack_power is not None]
         if observed:self.damage_upper=max(observed+[self.damage_upper or 0])
         plan=getattr(world,'task_side_plan',None)
         if not policy.external_gate_enabled or not plan or clock.day is None:
             return []
-        return self._cycle(world,clock,rules,policy,deadline,task_busy,plan,
-                           defer_regular_night=defer_regular_night)
+        candidates=self._cycle(world,clock,rules,policy,deadline,task_busy,plan,
+                               defer_regular_night=defer_regular_night)
+        if clock.phases=={'day'} and not task_busy:
+            return self._independent_work(world,clock,rules,policy,deadline,candidates)
+        return candidates
 
     def resume_night(self, world, clock, rules, policy, deadline, task=None, task_busy=False):
         world.night_economy_active=False
@@ -129,8 +134,43 @@ class ExternalGate:
         self.commands={};self.firearms={}
         world.forage_service_checked=True
         world.forage_task=task
-        return self._cycle(world,clock,rules,policy,deadline,task_busy,world.task_side_plan,
-                           check_emergency=False)
+        cycle_deadline=max(time.monotonic(),deadline-.02) if policy.night_foraging_enabled else deadline
+        candidates=self._cycle(world,clock,rules,policy,cycle_deadline,task_busy,world.task_side_plan,
+                               check_emergency=False)
+        return self._independent_work(world,clock,rules,policy,deadline,candidates)
+
+    def _independent_work(self,world,clock,rules,policy,deadline,candidates):
+        if self.emergency_active:return candidates
+        if clock.phases=={'day'}:
+            _,yellow=station_rings(world.task_side_plan['anchor'])
+            walls={u.pos for u in world.ours.values() if u.alive and u.kind=='wall'}
+            if (yellow-{world.task_side_plan['gate']}<=walls or self.stage=='SEAL_FAILED'
+                    or any(c.actor==world.night_roster.m for c in candidates)):
+                return candidates
+        from .exterior_work import propose
+        try:
+            command,report=propose(world,clock,rules,policy,deadline,
+                keep_economy=self.stage in ('NIGHT_FORAGE','NIGHT_CASHOUT','NIGHT_PURCHASE'))
+        except BudgetExpired:
+            self.diagnostic['work_blocked']='exterior route budget exhausted'
+            return candidates
+        if report:self.diagnostic['exterior_work']=report
+        if report.get('stage')=='DUSK_WAIT_GUARDS' or report.get('hold'):
+            self.commands[report['actor']]=[]
+            return [c for c in candidates if c.actor!=report['actor']]
+        if command:
+            self.m=command.actor;self.w=world.night_roster.w;self.p=world.night_roster.p
+            self.stage=report['stage'];self.day=clock.day;self.return_committed=False
+            self.commands[self.m]=[command.command]
+            world.forage_contract=None
+            world.night_forage_commands={self.m:[command.command]} if command.command['action']=='collect' else {}
+            world.night_economy_active=clock.phases=={'night'}
+            if self.stage=='NIGHT_CASHOUT':
+                self.cashout_committed=True
+                self.cashout_report.update(status=report.get('reason'),quoted_stock_value=report.get('quoted_stock_value'))
+            self.diagnostic.update(stage=self.stage,m=self.m,w=self.w,p=self.p,gate=world.task_side_plan['gate'])
+            candidates=[c for c in candidates if c.actor!=self.m]+[command]
+        return candidates
 
     def _observe_gate_assignment(self, world):
         assignment=self.gate_assignment

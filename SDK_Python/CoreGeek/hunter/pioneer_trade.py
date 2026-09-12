@@ -12,10 +12,10 @@ def prepare(world, clock):
     # A late attachment may have no lifetime history. Current absence can still
     # release useful daytime work, without claiming six confirmed completions.
     listed = world.raw.get('teamOur', {}).get('playerTasks')
-    points = any(world.zones.get(world.side+'TaskPoint'+str(i)) for i in (1, 2))
     exhausted = getattr(world, 'tasks_exhausted', False)
-    absent = isinstance(listed, list) and not world.available_tasks and not points
-    world.pioneer_trade_reason = 'six_task_lifecycles_consumed' if exhausted else 'no_current_task_points' if absent else 'evolution_work_remaining'
+    ready=any(t.get('isValid') is True and type(t.get('coldDownRounds')) is int and t['coldDownRounds']==0 for t in world.available_tasks)
+    absent = isinstance(listed, list) and not ready
+    world.pioneer_trade_reason = 'six_task_lifecycles_consumed' if exhausted else 'no_currently_eligible_task' if absent else 'evolution_work_remaining'
     if clock.phases == {'day'} and world.phase_task_observed and not world.phase_task and (exhausted or absent):
         world.pioneer_trade_ids = {u.id for u in world.movers if u.kind == 'pioneer'}
 

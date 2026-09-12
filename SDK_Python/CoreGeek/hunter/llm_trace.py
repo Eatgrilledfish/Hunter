@@ -44,6 +44,7 @@ def result_shape(data):
     value = data.get('data')
     exceptions = re.findall(r'(?m)^([A-Za-z_][A-Za-z0-9_]*(?:Error|Exception))(?::|$)', text) if isinstance(text,str) else []
     return {'exception':exceptions[-1] if exceptions else None,
+            'api_shape':next((e.get('shape') for e in reversed(data.get('runtime_events',[])) if e.get('kind')=='json_shape'),None),
             'data_type':type(value).__name__ if 'data' in data else 'absent',
             'data_keys':list(value)[:6] if isinstance(value,dict) else [],
             'token_n':len(tokens), 'token_hash':digest(tokens[-1]) if tokens else None,

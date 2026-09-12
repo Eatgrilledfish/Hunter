@@ -249,7 +249,8 @@ def propose(world, policy, deadline, task_actor=None, *, plans=None, priority_id
         targets = {i:t for i,t in targets.items() if purchase_rank is not None and t['rank'] == purchase_rank}
     purchase_reserve = purchase_floor(world, policy, targets, priority_ids)
     gold = max(0, world.gold-purchase_reserve)
-    buyers = {k: u for k, u in actors.items() if k not in jobs and (u.kind == "worker" or k in traders)
+    buyers = {k: u for k, u in actors.items() if not getattr(world,'sunset_buyer',None)
+              and k not in getattr(world,'sunset_actions',{}) and k not in jobs and (u.kind == "worker" or k in traders)
               and u.capacity is not None and u.backpack is not None and len(u.backpack) < u.capacity}
     start_fields = {}
     while targets and buyers and time.monotonic() < deadline:

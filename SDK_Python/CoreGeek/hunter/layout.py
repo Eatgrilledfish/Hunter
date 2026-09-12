@@ -95,6 +95,35 @@ class LayoutGuard:
             self.cache[builds] = allowed, reason
             return allowed, reason
 
+        # Access to *a* gun neighbour is insufficient for the two-gun worker:
+        # its exact shared stand must remain reachable after the whole bundle.
+        plan=getattr(self.world,'task_side_plan',None)
+        roster=getattr(self.world,'night_roster',None)
+        clock=getattr(self.world,'strategy_clock',None)
+        if plan and roster and any(kind=='wall' for _,kind,_ in builds):
+            for identity,goals in ((roster.w,{plan['w']}),(roster.p,set(plan['c_stands']))):
+                actor=self.world.ours.get(identity)
+                if not actor or not actor.alive:continue
+                reachable={q for q in goals if q in after and after.get(actor.pos)==after[q]}
+                if not reachable:
+                    return finish(False,'wall would block defender return to assigned gun stand')
+                if clock and clock.phases=={'day'} and actor.pos not in goals:
+                    # Reserve this build turn; do not rely on a simultaneous
+                    # move or an unobserved arrival to justify closing a route.
+                    limit=max(0,clock.until_night-1)
+                    queue=deque([(actor.pos,0)]);seen={actor.pos};arrives=False
+                    while queue:
+                        if time.monotonic()>=self.deadline:
+                            return finish(False,'defender return verification budget exhausted')
+                        point,length=queue.popleft()
+                        if point in reachable:arrives=True;break
+                        if length>=limit:continue
+                        for q in neighbours(point):
+                            if q in after and q not in seen:
+                                seen.add(q);queue.append((q,length+1))
+                    if not arrives:
+                        return finish(False,'wall leaves insufficient daylight for assigned gun return')
+
         walls = {u.pos for u in self.world.ours.values() if u.alive and u.kind == "wall"}
         seal = (bool(self.world.seal_cells) and all(kind == "wall" for _, kind, _ in builds)
                 and added <= self.world.seal_cells and self.world.seal_cells <= walls | added)

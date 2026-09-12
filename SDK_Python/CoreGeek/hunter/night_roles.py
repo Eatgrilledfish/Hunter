@@ -68,7 +68,13 @@ def operators(world, include_pioneer=True, task_actor=None, allow_task_control=F
 
 
 def permits(world, clock, candidate):
+    from .sunset_market import permits as market_permits
+    if not market_permits(world, candidate):
+        return False
     command = candidate.command
+    treasure = getattr(world,'treasure_actions',{})
+    if candidate.actor in treasure and not (command.get('action')=='use' and command.get('name') in {'Medicine','Bomb','DizzyWeapon'}):
+        if command not in treasure[candidate.actor]:return False
     actor = world.ours.get(candidate.actor)
     if clock.phases != {'day'} and actor and actor.kind == 'pioneer':
         if command.get('action') in {'acceptTask','collect','sell','buy','summonTreasure','drop'}:

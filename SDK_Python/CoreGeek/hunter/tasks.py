@@ -23,6 +23,7 @@ def execution_failure(data):
     """Recognize explicit execution errors; zero records alone are not a failure."""
     for event in data.get('runtime_events', []):
         if isinstance(event, dict) and event.get('kind') == 'http':
+            if event.get('recovered'):continue
             status = event.get('status')
             if status == 401:return 'api_authentication_failed'
             if type(status) is int and status >= 400:return 'api_request_failed'
@@ -1183,10 +1184,13 @@ class TaskEngine:
                            "complete_document_refs":{key:e['data'].get('path') for key,e in task.evidence.items()
                                if e.get('usable') and e.get('data',{}).get('operation')=='read_slice'
                                and e['data'].get('completeness')=='complete'},
-                           "latest_execution_failure":next(({'kind':e.get('failure'),'cwd':e['data'].get('cwd'),
+                           "latest_execution_failure":next((({'kind':e.get('failure'),'cwd':e['data'].get('cwd'),
                                'runtime':e['data'].get('runtime_events',[]),
-                               'entries':e['data'].get('cwd_entries'),'root_entries':e['data'].get('root_entries'),'tail':result_excerpt(e['data'].get('text',''))}
-                               for e in reversed(list(task.evidence.values())) if e.get('failure')),None),
+                               'entries':e['data'].get('cwd_entries'),'root_entries':e['data'].get('root_entries'),'tail':result_excerpt(e['data'].get('text',''))} if e.get('failure') else None)
+                               for e in reversed(list(task.evidence.values())) if e.get('data',{}).get('operation') in ('run_python','run_tool')),None),
+                           "latest_api_observation":next(([v for v in e['data'].get('runtime_events',[])
+                               if v.get('kind') in ('json_shape','exception','http')]
+                               for e in reversed(list(task.evidence.values())) if e.get('data',{}).get('operation') in ('run_python','run_tool')),[]),
                            "rounds_left": None if task.timeout is None else max(0, task.timeout-(world.round-(task.accept_round or task.activation_round))),
                            "omitted_evidence": len(task.evidence)-len(evidence), "events": [{k:v for k,v in e.items() if k not in {"nonce", "received", "expected", "reply"}} for e in task.events[-8:]],
                            "submitted": [{"hash": s["hash"], "text": s["text"][:2048],

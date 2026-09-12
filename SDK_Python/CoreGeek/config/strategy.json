@@ -48,7 +48,7 @@
     "reserve_gold": 20,
     "telemetry_entries": 256,
     "treasure_enabled": true,
-    "treasure_gold_limit": 45,
+    "treasure_gold_limit": 90,
     "treasure_attempt_limit": 2,
     "news_hold_enabled": true,
     "summon_pressure_enabled": true,

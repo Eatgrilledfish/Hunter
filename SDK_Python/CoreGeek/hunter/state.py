@@ -13,6 +13,7 @@ from .defence import DefenceProcurement
 from .medical import MedicalSupply
 from .recovery import BaseRecovery
 from .economic_routes import EconomicRoutes
+from .sunset_market import SunsetMarket
 from .day_schedule import DaySchedule
 from .task_side_layout import TaskSideLayout
 from .external_gate import ExternalGate
@@ -53,6 +54,7 @@ class Session:
     recovery: BaseRecovery = field(default_factory=BaseRecovery)
     economic_routes: EconomicRoutes = field(default_factory=EconomicRoutes)
     day_schedule: DaySchedule = field(default_factory=DaySchedule)
+    sunset_market: SunsetMarket = field(default_factory=SunsetMarket)
     task_layout: TaskSideLayout = field(default_factory=TaskSideLayout)
     external_gate: ExternalGate = field(default_factory=ExternalGate)
     night_roster: NightRoster = field(default_factory=NightRoster)
