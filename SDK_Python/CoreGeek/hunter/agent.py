@@ -143,6 +143,15 @@ class Agent:
                 admit_task_departure(world, clock, task_choice, budget_end), min(deadline,time.monotonic()+.02))
             guidance = director.propose(world, clock, task_actor, draft.tasks.active, min(deadline, time.monotonic()+0.12), self.policy, draft.risk,
                                         failed_steps=draft.failed_move_steps(world) if self.policy.return_detour_enabled else None)
+            from . import return_recovery
+            recovery_moves, return_recovery_report = return_recovery.propose(
+                world,clock,self.policy,min(deadline,time.monotonic()+.04))
+            if recovery_moves:
+                for c in recovery_moves:
+                    guidance.candidates=[old for old in guidance.candidates if old.actor!=c.actor]
+                    guidance.candidates.append(c)
+                    guidance.roster_transit_actions[c.actor]=[c.command]
+                    build_jobs.pop(c.actor,None)
             candidates.extend(draft.tasks.candidates(world, choice=task_choice))
             world.pioneer_trade_stands = guidance.operator_stands
             repairs = world.duty_budget.run('repair', lambda budget_end: draft.repair.prepare(
@@ -177,7 +186,9 @@ class Agent:
                 guidance.duty_permit=draft.external_gate.permit
                 guidance.candidates=[c for c in guidance.candidates if guidance.permit(c)]
                 guidance.return_routes={i:r for i,r in guidance.return_routes.items() if i not in draft.external_gate.commands}
-                guidance.operator_stands={i:world.ours[i].pos for i in draft.external_gate.firearms}
+                # Exterior M work must not erase W/P destinations used by
+                # shopping and return planners. Only actual firearm holds override.
+                guidance.operator_stands.update({i:world.ours[i].pos for i in draft.external_gate.firearms})
                 guidance.candidates.extend(gate_candidates)
                 guidance.operator_plan_status='external_gate_fixed_guards'
             if draft.external_gate.commands:
@@ -261,6 +272,10 @@ class Agent:
                         guidance.candidates.extend(staged[1])
             for actor in world.movers:
                 guidance.blocked_moves.setdefault(actor.id, set()).update(world.navigation_avoided.get(actor.pos, set()))
+            if recovery_moves:
+                prior_duty=guidance.duty_permit
+                guidance.duty_permit=lambda c, previous=prior_duty: (c.command in world.return_recovery_actions[c.actor]
+                    if c.actor in world.return_recovery_actions else previous(c) if previous else None)
             clearing = draft.filter_failures(site_clearance.propose(world,clock,self.rules,guidance,
                 min(deadline,time.monotonic()+.02),task_actor),world.round)
             clearing_ids={c.actor for c in clearing}
@@ -534,7 +549,8 @@ class Agent:
                       "sunset_market": draft.sunset_market.diagnostic,
                       "treasure": draft.intelligence.diagnostic,
                       "rumour_llm": {"used":draft.tasks.budget.attempts,"status":draft.intelligence.llm_status,
-                                     "clues":len(draft.intelligence.clues)},
+                                     "clues":len(draft.intelligence.clues), **draft.intelligence.llm_diagnostic},
+                      "return_recovery": return_recovery_report,
                       "return_routes": guidance.return_routes,
                       "navigation_retry_exclusions": {u.id:sorted(world.navigation_avoided.get(u.pos, set())) for u in world.movers},
                       "movement_retry_windows": draft.move_retry_windows(world.round),

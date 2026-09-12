@@ -106,6 +106,27 @@ class DaySchedule:
             if job.get('economy_first'):
                 if actor.inventory['stone'] < reserve or not job.get('defer_build'):continue
             elif job and (not job.get('gate') or actor.inventory['stone']<reserve and self.active.get(actor.id,'harvest')=='harvest'):continue
+            if (getattr(world,'task_side_plan',None) and actor.id==world.night_roster.m
+                    and clock.until_night<=35 and not (job and not job.get('gate'))
+                    and len(actor.backpack)<actor.capacity):
+                from .rules import station_rings
+                blue,yellow=station_rings(world.task_side_plan['anchor'])
+                interior=blue|yellow|world.stations[0].cells
+                if actor.pos not in interior:
+                    reach=distance_field(world,{actor.pos},actor.pos,deadline,extra_blocked=interior)
+                    options=[(-world.vendor[name]/(reach[q]+1),reach[q],mine,q)
+                             for name in sorted(MINERALS) if world.vendor.get(name,0)>0
+                             for mine in world.zones.get(name,()) for q in neighbours(mine) if q in reach]
+                    if options and time.monotonic()<deadline:
+                        _,travel,mine,stand=min(options)
+                        choices=([Candidate(actor.id,{'action':'collect','targetPos':[pos_json(mine)]},30,
+                                    'exterior miner continues through dusk; cashout at dawn')] if not travel else
+                                 self.moves(actor,distance_field(world,{stand},actor.pos,deadline,extra_blocked=interior),
+                                    'exterior miner continues through dusk; cashout at dawn'))
+                        result.extend(choices)
+                        self.active[actor.id]='harvest'
+                        self.diagnostic[actor.id]={'stage':'harvest','checkout':'next_dawn'}
+                        continue
             endpoint_goals, endpoint = day_endpoints(world, actor, stands)
             home=distance_field(world,endpoint_goals,actor.pos,deadline)
             if actor.pos not in home:continue
@@ -145,6 +166,9 @@ class DaySchedule:
             left=clock.until_night
             slack=left-checkout[actor.pos]-margin
             stage=self.active.get(actor.id,'harvest')
+            if (getattr(world,'task_side_plan',None) and actor.id==world.night_roster.m
+                    and clock.day>1 and clock.until_night>35 and kinds):
+                stage='cashout'
             if stage=='construction' and job.get('defer_build'):stage='harvest'
             if stage=='cashout' and not kinds:stage='shop'
             if stage in ('shop','done') and not upgrades.get(actor.id):

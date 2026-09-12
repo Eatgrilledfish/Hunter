@@ -384,7 +384,7 @@ def compile_operation(context, plan, environment, evidence):
         contract = {'refs': sorted(manifest)}
         runtime, adapters = prepare_program(code, root, path,
             [inspections[p]['text'] for p in manifest], contract,
-            feedback=[event for record in evidence.values()
+            feedback=list(environment.get('api_observations',[]))+[event for record in evidence.values()
                       if record.get('data',{}).get('operation') in ('run_python','run_tool')
                       for event in record['data'].get('runtime_events',[])])
         runtime = runtime_prelude(root) + '\nexec(compile(' + repr(runtime) + ', "<task_program>", "exec"))'

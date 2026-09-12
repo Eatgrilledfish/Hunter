@@ -580,10 +580,16 @@ class TaskEngine:
     budget: LLMBudget = field(default_factory=LLMBudget)
     skills: SkillStore = field(default_factory=SkillStore)
     reuse_enabled: bool = True
+    api_memory: dict = field(default_factory=dict)
 
     def _close(self, reason, world):
         task = self.active
         if task:
+            from .task_payload import api_scope, api_observations
+            scope=api_scope(task)
+            if scope:
+                self.api_memory[scope]=api_observations(task,self.api_memory.get(scope,()))
+                if len(self.api_memory)>8:self.api_memory.pop(next(iter(self.api_memory)))
             self.lifecycle.end(task, reason, world)
             self.timing.close(task, reason, world.round)
             self.closed.append({"key": task.key, "reason": reason, "round": world.round,
@@ -1154,6 +1160,8 @@ class TaskEngine:
                            for e in task.evidence.values()):
                         raise ValueError('identical failed operation: inspect or change the failed inputs before retry')
                     environment = {**task.environment, "receipt_namespace": self.receipt_namespace}
+                    from .task_payload import api_scope
+                    environment['api_observations']=self.api_memory.get(api_scope(task),[])
                     response["executeCmd"] = compile_operation(context, bound, environment, task.evidence)
                     task.sandbox_pending = {"round": world.round, "context": context, "operation": plan["operation"],
                                             "plan": plan, "bound_hash": fingerprint(bound),
@@ -1173,7 +1181,9 @@ class TaskEngine:
                 context = self._context(task, "choose_next_task_step")
                 evidence, document_coverage = pack_evidence(task)
                 instructions = MODEL_INSTRUCTIONS
+                from .task_payload import api_scope, api_observations
                 payload = {"request_id": fingerprint(context["nonce"])[:16], "task": task.text[:16384], "evidence": evidence,
+                           "api_contract_observations":api_observations(task,self.api_memory.get(api_scope(task),())),
                            "allowed_actions":["submit"] if final_answer_only else ["cmd", "submit"],
                            "task_truncated_locally": len(task.text) > 16384,
                            "answer_contract": answer_contract(task),

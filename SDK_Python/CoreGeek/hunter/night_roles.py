@@ -14,6 +14,7 @@ class NightRoster:
     handoff_task: tuple = ()
     traffic: dict = field(default_factory=dict)
     exit_pending: dict = field(default_factory=dict)
+    return_recovery: dict = field(default_factory=dict)
 
     def prepare(self, world):
         workers = sorted((u for u in world.movers if u.kind == 'worker'), key=lambda u: u.id)
@@ -68,6 +69,10 @@ def operators(world, include_pioneer=True, task_actor=None, allow_task_control=F
 
 
 def permits(world, clock, candidate):
+    recovery = getattr(world,'return_recovery_actions',{})
+    if candidate.actor in recovery:
+        return candidate.command in recovery[candidate.actor] or (candidate.command.get('action')=='use'
+            and candidate.command.get('name') in {'Medicine','Bomb','DizzyWeapon'})
     from .sunset_market import permits as market_permits
     if not market_permits(world, candidate):
         return False
@@ -76,6 +81,9 @@ def permits(world, clock, candidate):
     if candidate.actor in treasure and not (command.get('action')=='use' and command.get('name') in {'Medicine','Bomb','DizzyWeapon'}):
         if command not in treasure[candidate.actor]:return False
     actor = world.ours.get(candidate.actor)
+    if (clock.phases == {'night'} and actor and actor.id in getattr(world,'night_economists',())
+            and command.get('action') in {'buy','sell'}):
+        return False  # Night stock is liquidated after the observed dawn.
     if clock.phases != {'day'} and actor and actor.kind == 'pioneer':
         if command.get('action') in {'acceptTask','collect','sell','buy','summonTreasure','drop'}:
             return False
@@ -272,6 +280,7 @@ def _transit_stands(world, clock, deadline):
         result[w.id] = w.pos
         world.fixed_w_transit_actors = (w.id,)
     if (p and p.alive and p.pos not in plan['c_stands'] and not exit_inside
+            and (clock.phases != {'day'} or getattr(world,'task_return_required',False))
             and (not world.phase_task or getattr(world,'task_return_required',False))):
         goals = set(plan['c_stands']) - {plan['w']} - (world.occupied - {p.pos})
         field = distance_field(world, [p.pos], p.pos, deadline)
@@ -363,8 +372,10 @@ def _fixed_w_transit(world, clock, deadline):
     traffic = roster.traffic
     owned = traffic.get('kind') == 'fixed_w_return'
     world.fixed_w_transit_actors = ()
-    if not owned and clock.phases != {'night'}:
+    if not owned and clock.phases != {'night'} and clock.until_night > 20:
         return None  # Ordinary daytime work keeps its existing return budget.
+    if not owned and clock.phases == {'day'} and world.phase_task:
+        return None  # Do not preempt an active daytime task to start a yield.
     if roster.exit_pending or traffic and not owned or len(world.stations) != 1:
         return None
     w = world.ours.get(roster.w)

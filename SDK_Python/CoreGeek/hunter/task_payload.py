@@ -2,6 +2,22 @@
 import json
 
 
+def api_scope(task):
+    manual=next((e['data'].get('file_sha256') for e in reversed(list(task.evidence.values()))
+                 if e.get('usable') and e.get('data',{}).get('path')=='API_DOCS.md'
+                 and e['data'].get('completeness')=='complete'),None)
+    return (task.environment.get('root'),manual) if task.environment and manual else None
+
+
+def api_observations(task, remembered=()):
+    result=[]
+    for event in list(remembered)+[v for e in task.evidence.values()
+            for v in e.get('data',{}).get('runtime_events',[])]:
+        if event.get('kind') not in {'http','json_shape','exception'}:continue
+        if event not in result:result.append(event)
+    return result[-16:]
+
+
 def size(value):
     return len(json.dumps(value, ensure_ascii=False))
 

@@ -150,7 +150,7 @@ class ExternalGate:
         from .exterior_work import propose
         try:
             command,report=propose(world,clock,rules,policy,deadline,
-                keep_economy=self.stage in ('NIGHT_FORAGE','NIGHT_CASHOUT','NIGHT_PURCHASE'))
+                keep_economy=False)
         except BudgetExpired:
             self.diagnostic['work_blocked']='exterior route budget exhausted'
             return candidates

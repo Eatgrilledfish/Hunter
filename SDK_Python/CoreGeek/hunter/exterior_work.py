@@ -73,32 +73,17 @@ def propose(world, clock, rules, policy, deadline, *, keep_economy=False):
         stock['stone']=max(0,stock['stone']-max(len(targets),1 if clock.day<10 else 0))
         if not stock['stone']:stock.pop('stone')
     value=sum(world.vendor[name]*count for name,count in stock.items())
-    vendors={q for v in world.zones.get('vendor',()) for q in neighbours(v) if q in reach}
-    # Ten minerals or fifty quoted gold is a policy batch size, not a game
-    # cost. Sell a small batch at the vendor too; never wait for a full bag.
-    cash=bool(stock and (sum(stock.values())>=10 or value>=50 or world.near_zone(m.pos,'vendor') and not keep_economy
-                        or m.capacity and len(m.backpack)>=m.capacity))
-    if cash and vendors:
-        if world.near_zone(m.pos,'vendor'):
-            name=max(stock,key=lambda n:(stock[n]*world.vendor[n],n))
-            command={'action':'sell','name':name,'num':stock[name]}
-        else:command=step({min(vendors,key=lambda q:(reach[q],q))})
-        if command:return candidate(command,'NIGHT_CASHOUT',quoted_stock_value=value,reason='sell observed personal batch')
-    if keep_economy:return None,report
     if not m.capacity or len(m.backpack)>=m.capacity:
-        return None,dict(report,reason='bag full; no safe vendor route',quoted_stock_value=value)
-    if not vendors:
-        return None,dict(report,reason='no safe reachable vendor',quoted_stock_value=value)
-    checkout=_field(world,vendors,blocked,deadline)
+        return None,dict(report,hold=True,reason='bag full; await dawn cashout',quoted_stock_value=value)
     options=[]
     for name in ('stone','iron','copper'):
         if world.vendor.get(name,0)<=0:continue
         for mine in world.zones.get(name,()):
             for stand in neighbours(mine):
-                if stand in reach and stand in checkout:
-                    actions=reach[stand]+1+checkout[stand]+1
+                if stand in reach:
+                    actions=reach[stand]+1
                     options.append((-world.vendor[name]/actions,reach[stand],mine,stand))
-    if not options:return None,dict(report,reason='no safe mine and vendor route')
+    if not options:return None,dict(report,hold=True,reason='no safe reachable mine')
     _,travel,mine,stand=min(options)
     command=step({stand}) if travel else {'action':'collect','targetPos':[pos_json(mine)]}
-    return candidate(command,'NIGHT_FORAGE',mine=mine,reason='safe mine with reachable vendor') if command else (None,report)
+    return candidate(command,'NIGHT_FORAGE',mine=mine,reason='mine until observed dawn') if command else (None,report)

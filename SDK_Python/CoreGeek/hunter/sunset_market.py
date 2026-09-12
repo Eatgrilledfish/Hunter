@@ -42,7 +42,7 @@ class SunsetMarket:
         if self.day != clock.day:
             self.day = clock.day; self.started = False; self.settled.clear()
         if (not policy.day_schedule_enabled or clock.phases != {'day'} or clock.day is None
-                or time.monotonic()>=deadline):
+                or not world.phase_task_observed or time.monotonic()>=deadline):
             return []
         # Without a live pioneer, retain the workers' existing complete
         # sale/purchase/delivery schedule and emergency replacement duties.
@@ -69,11 +69,15 @@ class SunsetMarket:
             return sorted((start[q]+actions+back[q],start[q],q,back[q])
                           for q in interaction_cells(world,world.zones.get(zone,()),actor.pos)
                           if q in start and q in back)
-        checkout_actions = 4
+        checkout_actions = 1  # Replan each observed purchase; a four-item basket is not mandatory.
         shopping = circuits(buyer,'weaponShop',checkout_actions) if buyer else []
         shopping = [r for r in shopping if r[0]+margin<clock.until_night]
         if not shopping:
             buyer = None
+        if (buyer and buyer.id not in self.pending and not self.order(world,buyer,rules,policy,deadline)
+                and any(a.kind=='worker' and a.id in defender_ids(world) and a.id not in excluded
+                        and self.order(world,a,rules,policy,deadline) for a in world.movers)):
+            buyer=None  # A stocked pioneer must release W's personal upgrade/supply checkout.
         if buyer is None:
             # W may finish a short shop stop on its actual return circuit.
             # Never recruit the exterior miner or interrupt construction,
@@ -81,7 +85,7 @@ class SunsetMarket:
             options=[]
             for worker in world.movers:
                 if (worker.kind!='worker' or worker.id not in defender_ids(world)
-                        or worker.id in excluded or jobs.get(worker.id)
+                        or worker.id in excluded or (jobs.get(worker.id) and not jobs[worker.id].get('gate'))
                         or worker.id not in guidance.operator_stands
                         or guidance.return_routes.get(worker.id,{}).get('due')
                         or worker.backpack is None or worker.capacity is None
@@ -99,6 +103,9 @@ class SunsetMarket:
         for actor in world.movers:
             if actor.id in excluded or actor.backpack is None:
                 continue
+            if (getattr(world,'task_side_plan',None) and actor.id==world.night_roster.m
+                    and clock.until_night<=35):
+                continue  # Exterior miner cashes out after dawn, not before dusk.
             reserve = reserves.get(actor.id,{})
             # External gate preparation removes M's ordinary job. Its personal
             # stones still fund remaining walls and the next daily gate.
@@ -125,12 +132,18 @@ class SunsetMarket:
             _,travel,_,back=shopping[0]
             last_sale=max((paths[0][1]+len(stock) for _,stock,paths in rows.values()),default=0)
             earliest=max(earliest,max(travel,last_sale)+checkout_actions+back+margin)
-        if not self.started and clock.until_night>max(30,earliest):
+        ready_purchase=bool(buyer and self.order(world,buyer,rules,policy,deadline))
+        dawn_sale=bool(getattr(world,'task_side_plan',None) and world.night_roster.m in rows
+                       and clock.day>1 and clock.until_night>35)
+        if not self.started and clock.until_night>max(30,earliest) and not ready_purchase and not dawn_sale:
             return []
         self.started = True
         self.settled.update(empty_workers)
         self.diagnostic={'stage':'cashout','sellers':{},'buyer':buyer.id if buyer else None,
-                         'fallback_worker':bool(buyer and buyer.kind=='worker')}
+                         'fallback_worker':bool(buyer and buyer.kind=='worker'),
+                         'blocked':{a.id:('reserved_duty' if a.id in excluded else
+                             'no_return_stand' if a.id not in guidance.operator_stands else 'route_or_stock')
+                             for a in world.movers if a.id in defender_ids(world)} if not buyer else {}}
         result=[];waiting=[]
         def install(actor, choices, stage):
             choices=[c for c in choices if guidance.permit(c)]
@@ -162,6 +175,7 @@ class SunsetMarket:
         # Once a worker has liquidated, do not restart mining before dusk and
         # strand a fresh batch. Builders can still finish their reserved walls.
         for identity in sorted(self.settled-set(rows)-set(excluded)-({buyer.id} if buyer else set())):
+            if getattr(world,'task_side_plan',None) and identity==world.night_roster.m:continue
             actor=world.ours.get(identity)
             if (actor and actor.alive and actor.kind=='worker'
                     and not any('UpgradeVoucher' in k and n for k,n in actor.inventory.items())):

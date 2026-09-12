@@ -150,6 +150,9 @@ class Diagnostics(logging.Handler):
         point = lambda p: list(p) if isinstance(p, (list, tuple)) and len(p) == 2 else None
         duty = {}
         rumour = obj(decision.get('rumour_llm'))
+        recovery = obj(decision.get('return_recovery'))
+        if recovery.get('stage') not in (None,'inactive'):
+            duty['return_recovery'] = recovery
         if rumour.get('status') not in (None,'idle'):
             duty['rumour'] = rumour
         treasure = obj(decision.get('treasure'))
@@ -157,7 +160,7 @@ class Diagnostics(logging.Handler):
             duty['treasure'] = {k:treasure[k] for k in ('stage','actor','target','items','required','opening','closing') if k in treasure}
         market = obj(decision.get('sunset_market'))
         if market.get('stage') not in (None,'inactive'):
-            duty['market'] = {k:market[k] for k in ('stage','buyer','fallback_worker','waiting','item','num','gold') if k in market}
+            duty['market'] = {k:market[k] for k in ('stage','buyer','fallback_worker','waiting','item','num','gold','blocked') if k in market}
         evasion = obj(decision.get('exterior_evasion'))
         if evasion.get('status') not in (None,'inactive','not an exterior economist','interior transit handled by roster'):
             duty['evasion'] = {key:evasion[key] for key in ('status','nearest','in_range',

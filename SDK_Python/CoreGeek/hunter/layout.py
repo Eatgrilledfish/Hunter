@@ -76,6 +76,8 @@ class LayoutGuard:
                               for c in candidates if c.command["action"] == "build"))
         if not builds:
             return True, "no new structural blockage"
+        if any(p in getattr(self.world,'return_recovery_cells',()) for _,_,p in builds):
+            return False, 'build would close an active defender recovery route'
         if self.world.battery_plan is not None:
             for _,kind,point in builds:
                 if point not in battery.construction_cells(self.world,kind,{point}):

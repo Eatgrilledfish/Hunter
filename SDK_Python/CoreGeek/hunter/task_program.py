@@ -47,6 +47,11 @@ def prepare(code, root, cwd, documents, diagnostics=None, feedback=()):
         for e in feedback if isinstance(e,dict))
     bearer = bearer or observed_bearer
     auth = len(keys)==1 and len(origins)==1 and bearer
+    location_paths = sorted({(e['origin'],e.get('path')) for e in feedback
+        if isinstance(e,dict) and e.get('kind')=='http' and e.get('status')==400
+        and isinstance(e.get('origin'),str) and isinstance(e.get('path'),str)
+        and (lambda p:(p.scheme,p.hostname,p.port or 80) in origins)(urlsplit(e['origin']))
+        and re.search(r'Missing required parameter:\s*location\b',e.get('error_hint',''),re.I)})
     if diagnostics is not None:
         diagnostics.update(documents=len(documents), matched_credentials=len(keys), origins=len(origins),
                            documented_header='Authorization/Bearer' if documented_bearer else None,
@@ -66,6 +71,15 @@ import urllib.request as _hu, urllib.parse as _hp, urllib.error as _he
 _hunter_opener_open = _hu.OpenerDirector.open
 _hunter_redirect = _hu.HTTPRedirectHandler.redirect_request
 _hunter_auth_failed = set()
+def _hunter_parameter_url(address):
+    p=_hp.urlsplit(address)
+    if (p.scheme+'://'+p.netloc,p.path) not in _hunter_location_paths:return address
+    pairs=_hp.parse_qsl(p.query,keep_blank_values=True)
+    cities=[v for k,v in pairs if k=='city']
+    if len(cities)==1 and cities[0] and not any(k=='location' for k,v in pairs):
+        pairs=[('location' if k=='city' else k,v) for k,v in pairs]
+        return _hp.urlunsplit((p.scheme,p.netloc,p.path,_hp.urlencode(pairs),p.fragment))
+    return address
 def _hunter_auth_challenge(method, hint):
     global _hunter_bearer_ready
     if method=='GET' and not _hunter_bearer_ready and __import__('re').search(r'Authorization:\\s*Bearer\\s',hint,__import__('re').I):
@@ -91,6 +105,7 @@ def _hunter_open(self,url,data=None,timeout=5):
         if origin in _hunter_auth_failed:
             raise RuntimeError('HTTP 401: unchanged documented authentication already failed; inspect documentation')
         req = url if isinstance(url,_hu.Request) else _hu.Request(url,data=data)
+        if req.get_method()=='GET':req.full_url=_hunter_parameter_url(req.full_url)
         req.full_url = _hp.quote(req.full_url, safe=":/?&=%+;,@!$'()*[]#~")
         if _hunter_bearer_ready:
             req.remove_header('Authorization')
@@ -135,6 +150,7 @@ else:
     _hunter_auth_requests_send = _hrequests.Session.send
     def _hunter_send(self, req, **kwargs):
         if _hunter_origin(req.url) in _hunter_origins:
+            if req.method=='GET':req.url=_hunter_parameter_url(req.url)
             if _hunter_bearer_ready:req.headers['Authorization'] = 'Bearer '+_hunter_key
             kwargs['proxies'] = {}
             kwargs['allow_redirects'] = False
@@ -149,6 +165,7 @@ else:
         return response
     _hrequests.Session.send = _hunter_send
 '''
-        source='_hunter_bearer_ready = '+repr(bool(auth))+'\n_hunter_key = '+repr(next(iter(keys)))+'\n_hunter_origins = '+repr(sorted(origins))+'\n'+bootstrap+'\nexec(compile('+repr(source)+',"<task_program>","exec"))'
+        source='_hunter_bearer_ready = '+repr(bool(auth))+'\n_hunter_key = '+repr(next(iter(keys)))+'\n_hunter_origins = '+repr(sorted(origins))+'\n_hunter_location_paths = '+repr(location_paths)+'\n'+bootstrap+'\nexec(compile('+repr(source)+',"<task_program>","exec"))'
+        if location_paths:changes.append('observed_location_parameter')
         changes.append('documented_local_bearer' if auth else 'local_auth_challenge')
     return source, sorted(set(changes))
