@@ -584,7 +584,8 @@ class Agent:
                         ("key", "actor", "phase", "seq", "accept_round", "activation_round", "timeout",
                          "llm_pending", "sandbox_pending", "command_plan", "answer", "submitted", "events", "environment",
                          "uncertain_operations", "executions", "workflow_id", "workflow_results",
-                         "statement_names", "statement_path", "statement_ready", "statement_empty", "locate_attempts")} if task else None,
+                         "statement_names", "statement_path", "statement_ready", "statement_empty", "locate_attempts",
+                         "evidence", "diagnostic_events")} if task else None,
                         accept_pending=draft.tasks.accept_pending, closed=draft.tasks.closed,
                         budget=draft.tasks.budget)
 

@@ -7,7 +7,7 @@ def prelude(root):
 
 SOURCE = r'''
 import atexit as _ha, json as _hj, os as _ho, shlex as _hs, shutil as _hh
-import subprocess as _hsub, sys as _hsys
+import subprocess as _hsub, sys as _hsys, re as _hre
 _hunter_events = []
 def _hunter_event(**record):
     if len(_hunter_events) < 4:
@@ -20,15 +20,37 @@ def _hunter_report():
 _ha.register(_hunter_report)
 import urllib.request as _hr, urllib.parse as _hp, urllib.error as _he
 _hunter_http_open = _hr.OpenerDirector.open
+def _hunter_http_detail(url, error=None):
+    """Observe the request passed to urllib; never expose header values."""
+    address=url.full_url if isinstance(url,_hr.Request) else url
+    headers={k.lower():v for k,v in url.header_items()} if isinstance(url,_hr.Request) else {}
+    names=[k for k in headers if _hre.search('authorization|api.?key|token',k)][:4]
+    scheme=headers.get('authorization','').split(' ',1)[0].lower()
+    info={'path':_hp.urlsplit(address).path[:96],'auth_headers':names,
+          'authorization_scheme':scheme if scheme in ('bearer','basic') else 'other' if scheme else 'absent'}
+    if error is not None:
+        # peek does not consume the HTTPError body the generated program may read.
+        # Unsupported streams simply have no body hint; never replace error.fp.
+        try:
+            hint=error.fp.peek(384)[:384].decode('utf-8','replace')
+            for name in names:
+                value=headers[name]
+                for secret in (value,value.split(' ',1)[-1]):
+                    if secret:hint=hint.replace(secret,'<redacted>')
+            hint=_hre.sub(r'(?i)((?:Bearer|Basic)\s+)(?![<{])\S+',r'\1<redacted>',hint)
+            hint=_hre.sub(r"""(?i)((?:api[_-]?key|token|password|secret)["']*\s*[=:]\s*)\S+""",r'\1<redacted>',hint)
+            info['error_hint']=' '.join(hint.split())[:160]
+        except (AttributeError,OSError,ValueError,TypeError):pass
+    return info
 def _hunter_observe_http(self, url, data=None, timeout=5):
     address = url.full_url if isinstance(url, _hr.Request) else url
     local = isinstance(address, str) and _hp.urlsplit(address).hostname in ('localhost', '127.0.0.1')
     try:
         response = _hunter_http_open(self, url, data, timeout)
-        if local:_hunter_event(kind='http',status=response.status)
+        if local:_hunter_event(kind='http',status=response.status,**_hunter_http_detail(url))
         return response
     except _he.HTTPError as exc:
-        if local:_hunter_event(kind='http',status=exc.code)
+        if local:_hunter_event(kind='http',status=exc.code,**_hunter_http_detail(url,exc))
         raise
     except _he.URLError as exc:
         if local:_hunter_event(kind='http',error=type(exc).__name__)

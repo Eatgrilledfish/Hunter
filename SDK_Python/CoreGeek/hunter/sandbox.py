@@ -424,15 +424,18 @@ def task_documents(text):
 
 
 LOCATE_SCRIPT = r'''
-import json, os, time, hashlib, base64, re
-out = {"version":1, "context":P["context"], "operation":"locate_task"}
+import json, os, time, hashlib, base64, re, sys
+P.setdefault('cwd',os.getcwd())
+out = {"version":1, "context":P["context"], "operation":P.get('operation','locate_task')}
+if out['operation']=='bootstrap':
+    out.update(python=sys.executable,environment={'root':P['cwd'],'python':sys.executable})
 started = time.monotonic()
 matches, errors, visited = [], [], 0
 # The second root is observed in the competition trace, not an assumed cwd.
 roots = [P["cwd"]] if P["cwd"] != "/" else []
 roots.append("/tmp/selfEvolutionTask")
 complete = True
-for root in dict.fromkeys(roots):
+for root in dict.fromkeys(roots) if P['names'] else []:
     if not os.path.isdir(root) or os.path.islink(root):
         continue
     def onerror(exc):
@@ -457,15 +460,16 @@ for root in dict.fromkeys(roots):
     if not complete: break
 matches = sorted(set(matches))
 out.update(candidates=matches[:32], scan_complete=complete and not errors, scan_errors=errors[:8])
-if len(matches) == 1:
-    path = matches[0]
-    out.update(status="ok", root=os.path.dirname(path), statement=os.path.basename(path),
-               entries=[{"path":os.path.basename(path), "kind":"file"}], completeness="complete",
+if len(matches) == 1 or not P['names']:
+    path = matches[0] if matches else None
+    folder = os.path.dirname(path) if path else P['cwd']
+    out.update(status="ok", root=folder, statement=os.path.basename(path) if path else None,
+               entries=[{"path":os.path.basename(path), "kind":"file"}] if path else [], completeness="complete",
                selection="unique_observed_candidate; scan completeness recorded separately")
     # Reuse this round trip for a bounded root listing. Larger/changing folders
     # keep the ordinary paginated listing path; no claim of a complete snapshot.
     try:
-        folder = os.path.dirname(path)
+        if folder=='/':raise OSError('unresolved task root')
         before = os.stat(folder)
         listing, listing_complete = [], True
         with os.scandir(folder) as items:
@@ -483,12 +487,15 @@ if len(matches) == 1:
     # Read small, explicitly related documents in the same sandbox round trip.
     # Each byte block is independently hash-verified by DocumentLedger in SDK.
     out['documents'] = []
-    pending = [os.path.basename(path)]
+    pending = [os.path.basename(path)] if path else []
+    if any(e['path']=='API_DOCS.md' and e['kind']=='file' for e in out.get('entries',[])):
+        pending.append('API_DOCS.md')
     used = 0
     for relative in pending:
         location = os.path.realpath(os.path.join(folder, relative))
         if os.path.commonpath([folder, location]) != folder or os.path.islink(os.path.join(folder, relative)):
             continue
+        if not os.path.isfile(location):continue
         try:
             with open(location, 'rb') as source:
                 before = os.fstat(source.fileno())
@@ -505,13 +512,13 @@ if len(matches) == 1:
             if used + size > 16000:continue
             used += size
             out['documents'].append(doc)
-            if relative == os.path.basename(path):
+            if path and relative == os.path.basename(path):
                 names = {e['path']:e['kind'] for e in out.get('entries',[])}
-                if names.get('API_DOCS.md') == 'file':pending.append('API_DOCS.md')
                 if 'spec.md' in text:
+                    if names.get('spec.md')=='file':pending.append('spec.md')
                     tokens = set(re.findall(r'[A-Za-z0-9_][A-Za-z0-9_./-]*', text))
                     workspaces = [name for name,kind in names.items() if kind == 'directory'
-                                  and any(t == name or t.startswith(name+'/') for t in tokens)]
+                                  and any(t == name or t.rstrip('.') == name or t.startswith(name+'/') for t in tokens)]
                     if len(workspaces) == 1:pending.append(workspaces[0]+'/spec.md')
         except (OSError, UnicodeError):
             continue
@@ -530,3 +537,12 @@ def locate_task(context, environment, names):
         raise ValueError("task document names unavailable")
     payload = {"context":context, "cwd":cwd, "names":names}
     return shlex.quote(python) + " -I -c " + shlex.quote("P = " + repr(payload) + "\n" + LOCATE_SCRIPT)
+
+
+def bootstrap(context,names):
+    """One official sandbox call discovers Python/cwd and prepares task evidence."""
+    if any(not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*\.md',name) for name in names):
+        raise ValueError('invalid task document name')
+    payload={'context':context,'names':names,'operation':'bootstrap'}
+    source='P = '+repr(payload)+'\n'+LOCATE_SCRIPT
+    return 'hunter_python=$(command -v python3 || command -v python) && exec "$hunter_python" -I -c '+shlex.quote(source)

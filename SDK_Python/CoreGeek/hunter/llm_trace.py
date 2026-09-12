@@ -4,6 +4,140 @@ import hashlib
 import json
 import re
 from urllib.parse import urlsplit
+from .task_protocol import normalize as normalize_decision
+
+
+def redact(text):
+    """Keep protocol wording, never credential or checker TOKEN values."""
+    text = str(text)
+    text = re.sub(r'(?i)(\b(?:Bearer|Basic)\s+)(?![<{])[A-Za-z0-9_./+=-]+', r'\1<redacted>', text)
+    text = re.sub(r'''(?ix)((?:api[_-]?key|access[_-]?token|password|secret|credential|x-api-key|token|密钥|令牌)
+        [`"']*\s*(?:[:=]|为|是)\s*)[^\s,;|]+''', r'\1<redacted>', text)
+    return text
+
+
+def rejection_stage(reason):
+    reason = str(reason).lower()
+    if 'checker' in reason:return 'checker_completion'
+    if 'selector' in reason or 'composition' in reason or 'extract' in reason:return 'answer_extraction'
+    if 'evidence' in reason or 'documentation' in reason:return 'evidence_binding'
+    if 'answer' in reason or 'task requires' in reason:return 'answer_contract'
+    if 'request' in reason or 'nonce' in reason or 'version' in reason:return 'reply_identity'
+    if 'json' in reason or 'expecting' in reason or 'delimiter' in reason:return 'reply_json'
+    return 'command_plan'
+
+
+def short_ref(value):
+    # Keep the complete ordinary evidence ID; exceptional lengths are explicit.
+    return str(value)[:96]
+
+
+def result_shape(data):
+    text = data.get('text') or ''
+    tokens = re.findall(r'(?m)^\s*TOKEN:\s*(\S+)\s*$', text) if isinstance(text,str) else []
+    exits = {}
+    for event in data.get('runtime_events',[]):
+        if not isinstance(event,dict):continue
+        if event.get('kind') == 'checker_exits':exits.update(event.get('results',{}))
+        elif event.get('kind') == 'checker_exit':exits[event.get('path')]=event.get('returncode')
+    if data.get('operation') == 'run_tool':exits[data.get('path')]=data.get('tool_exit_code')
+    value = data.get('data')
+    return {'data_type':type(value).__name__ if 'data' in data else 'absent',
+            'data_keys':list(value)[:6] if isinstance(value,dict) else [],
+            'token_n':len(tokens), 'token_hash':digest(tokens[-1]) if tokens else None,
+            'checker_exits':dict(list(exits.items())[:4])}
+
+
+def decision(raw):
+    if not isinstance(raw,str) or len(raw)>32768:return {}
+    try:
+        try:value=json.loads(raw)
+        except ValueError:
+            blocks=re.findall(r'```(?:json)?[ \t]*\n(.*?)\n```',raw,re.S)
+            if len(blocks)!=1:return {}
+            value=json.loads(blocks[0])
+        return value if isinstance(value,dict) else {}
+    except (ValueError,TypeError,RecursionError):return {}
+
+
+def rejection_detail(data, evidence, required=()):
+    """Resolve the requested references against SDK evidence, not model claims."""
+    try:data=normalize_decision(data,evidence)
+    except ValueError:pass
+    spec=data.get('answer_candidate') or data.get('command_plan') or data
+    if not isinstance(spec,dict):return {}
+    result={}
+    refs=spec.get('evidence_refs',[])
+    if isinstance(refs,list):
+        result['refs_n']=len(refs);result['refs']=[]
+        for ref in refs[:2]:
+            record=evidence.get(ref,{}) if isinstance(ref,str) else {}
+            item=record.get('data',{})
+            entry={'id':short_ref(ref),'op':item.get('operation'),'path':item.get('path'),
+                   'usable':record.get('usable'),'answer_usable':record.get('answer_usable'),
+                   'complete':item.get('completeness')}
+            if not record:entry={'id':short_ref(ref),'missing':True}
+            elif item.get('operation') in ('run_python','run_tool'):
+                entry.update(result_shape(item))
+            result['refs'].append(entry)
+    extract=spec.get('extract')
+    if isinstance(extract,dict):
+        result['extract']={'evidence':short_ref(extract.get('evidence')),
+                           'selector':extract.get('selector')}
+    if 'value' in spec:
+        value=spec['value'];result['value_type']=type(value).__name__
+        result['value_keys']=list(value)[:6] if isinstance(value,dict) else []
+        result['value_hash']=digest(json.dumps(value,ensure_ascii=False,sort_keys=True))
+        if isinstance(value,dict) and isinstance(value.get('token'),str):
+            result['value_token_hash']=digest(value['token'])
+    if required:
+        result['required_checkers']=list(required)[:4]
+        if len(required)>4:result['required_checkers_n']=len(required)
+    return result
+
+
+def document_context(evidence):
+    """A few wording lines explain path/auth detection; no full manuals."""
+    docs=[]
+    for record in evidence.values():
+        data=record.get('data',{});text=data.get('text');path=str(data.get('path',''))
+        if not (record.get('usable') and data.get('operation')=='read_slice' and isinstance(text,str)):continue
+        lines=[]
+        for number,line in enumerate(text.splitlines(),1):
+            if re.search(r'Authorization|Bearer|认证|鉴权|工作目录|工作区|Work\s+in|cwd|\./check|检查器',line,re.I):
+                excerpt=redact(line)
+                lines.append({'line':number,'text':excerpt[:150]})
+                if len(excerpt)>150:lines[-1]['cut']=True
+            if len(lines)==3:break
+        if lines:docs.append({'path':path[:80],'hash':digest(text),'lines':lines})
+        if len(docs)==2:break
+    return docs
+
+
+def bounded(value, width=96, items=4, depth=0):
+    if depth>8:return '<depth limit>'
+    if isinstance(value,str):
+        value=redact(value);encoded=value.encode('utf-8')
+        return value if len(encoded)<=width else encoded[:width].decode('utf-8','ignore')+'…'
+    if isinstance(value,list):return [bounded(v,width,items,depth+1) for v in value[:items]]
+    if isinstance(value,dict):return {str(k)[:96]:bounded(v,width,items,depth+1) for k,v in list(value.items())[:24]}
+    return value
+
+
+def fit(record, budget=1200):
+    record=bounded(record,240,8)
+    for width,items in ((160,4),(96,3),(64,2),(40,1)):
+        if len(json.dumps(record,ensure_ascii=False,separators=(',',':')).encode())<=budget:break
+        record=bounded(record,width,items);record['cut']=True
+    # Pathological nested selectors/keys must not turn one diagnostic into a
+    # full transcript. Keep the rejection identity even when details won't fit.
+    essential={'task','rid','reason','stage','verdict','kind','left','cut'}
+    while len(json.dumps(record,ensure_ascii=False,separators=(',',':')).encode())>budget:
+        optional=[k for k in record if k not in essential]
+        if not optional:break
+        key=max(optional,key=lambda k:len(json.dumps(record[k],ensure_ascii=False).encode()))
+        record.pop(key);record['cut']=True
+    return record
 
 
 def digest(text):
@@ -32,6 +166,10 @@ def sent(prompt):
                      'hash':digest(text) if isinstance(text,str) else None})
         if isinstance(text,str):texts.append(text)
     return {'rid':data.get('request_id'), 'left':data.get('rounds_left'),
+            'allowed':data.get('allowed_actions',data.get('allowed_intents')),
+            'template_intent':('cmd' if 'cmd' in (data.get('reply_template') or {}) else
+                               'submit' if 'submit' in (data.get('reply_template') or {}) else
+                               (data.get('reply_template') or {}).get('intent')),
             'prompt_chars':len(prompt),'prompt_hash':digest(prompt),
             'docs':docs[:3],'docs_n':len(docs),'omitted':data.get('omitted_evidence'),
             '_documents':'\n'.join(texts)}
@@ -89,6 +227,10 @@ def received(raw,documents=''):
             data=json.loads(blocks[0]);result['fenced']=True
         if not isinstance(data,dict):return {**result,'parse':'not_object'}
     except (ValueError,TypeError,RecursionError):return {**result,'parse':'not_json'}
+    if 'cmd' in data or 'submit' in data:
+        result['protocol']='simple'
+        try:data=normalize_decision(data,{})
+        except ValueError:result['protocol']='invalid_simple'
     result.update(parse='json',rid=str(data.get('request_id',''))[:40],version=data.get('version') if type(data.get('version')) is int else None,intent=str(data.get('intent',''))[:16])
     plan=data.get('command_plan') or (data if 'operation' in data else {})
     if isinstance(plan,dict):

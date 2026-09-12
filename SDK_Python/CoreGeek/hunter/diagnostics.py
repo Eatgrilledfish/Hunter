@@ -1,6 +1,7 @@
 """Copyable stdout summaries by default; full event capture is opt-in."""
 from collections import Counter, OrderedDict
 from dataclasses import asdict, is_dataclass
+from types import SimpleNamespace
 import hashlib
 import json
 import logging
@@ -14,6 +15,7 @@ import uuid
 
 from .protocol import obj, array
 from . import llm_trace
+from .checker_contract import checker_paths
 
 
 class Diagnostics(logging.Handler):
@@ -47,7 +49,10 @@ class Diagnostics(logging.Handler):
             detail += ":" + str(command["name"]) + "*" + str(command.get("num",1))
         if "taskAnswer" in command:
             answer = command["taskAnswer"]
-            detail += ":" + self._brief(answer,72) + "#" + hashlib.sha256(answer.encode()).hexdigest()[:8]
+            try:structured=json.loads(answer)
+            except ValueError:structured=None
+            preview=llm_trace.redact(answer) if isinstance(structured,dict) else 'text'
+            detail += ":" + self._brief(preview,72) + "#" + hashlib.sha256(answer.encode()).hexdigest()[:8]
         return self._brief(action + detail,120)
 
     def _write_compact(self, event, **data):
@@ -57,6 +62,7 @@ class Diagnostics(logging.Handler):
         for optional in ("reasons", "channels", "work", "commands", "units", "task", "defence", "docs", "root_entries", "entries"):
             if len(json.dumps(record,ensure_ascii=False,separators=(",", ":")).encode()) <= 1400:
                 break
+            if optional=='task' and isinstance(record.get('task'),str):continue
             record.pop(optional,None)
             record["context_cut"] = True
         if len(json.dumps(record,ensure_ascii=False,separators=(",", ":")).encode()) > 1400:
@@ -89,12 +95,16 @@ class Diagnostics(logging.Handler):
             active = data.get("active") or {}
             pending = active.get("sandbox_pending") or {}
             closed = data.get("closed") or []
+            self.local.task_active = active
+            self.local.task_evidence = active.get('evidence') or {}
+            self.local.task_required = checker_paths(SimpleNamespace(
+                evidence=self.local.task_evidence,statement_path=active.get('statement_path')))
             faults = [e for e in active.get("events",[]) if e.get("kind") in
-                      {"quarantined_llm", "invalid_llm", "invalid_command_plan", "missing_llm", "missing_command_effect_unknown"}]
+                      {"quarantined_llm", "invalid_llm", "invalid_command_plan", "missing_llm", "oversized_llm", "missing_command_effect_unknown"}]
             self.local.task_fault = faults[-1] if faults else None
             self.local.llm_verdict = next((e for e in reversed(active.get('events',[]))
                 if e.get('round')==getattr(self.local,'round',None) and e.get('kind') in
-                {'llm_consumed','invalid_llm','quarantined_llm','invalid_command_plan'}),{})
+                {'llm_consumed','invalid_llm','quarantined_llm','invalid_command_plan','oversized_llm','missing_llm'}),{})
             executed = [e for e in active.get("events",[]) if e.get("kind") == "sandbox_result"
                         and e.get("op") in {"run_python", "run_tool"}]
             self.local.task_tool = executed[-1] if executed else None
@@ -106,7 +116,8 @@ class Diagnostics(logging.Handler):
                 "llm":bool(active.get("llm_pending")),
                 "left":max(0,active["timeout"]-(getattr(self.local,"round",0)-(active.get("accept_round") or active.get("activation_round") or 0))) if active.get("timeout") is not None else None,
                 "submitted":len(active.get("submitted",[])),
-                "last": self._brief(active.get("events",[])[-1:],180),
+                "last": self._brief([{k:llm_trace.redact(v) if isinstance(v,str) else v for k,v in e.items()
+                    if k in ('kind','round','op','status','reason')} for e in active.get('events',[])[-1:]],180),
                 "end":self._brief(closed[-1].get("reason"),120) if not active and closed else None}
             self.local.task = {k:v for k,v in self.local.task.items() if v is not None and v not in ("null","[]")}
             if not active and not closed:
@@ -220,6 +231,27 @@ class Diagnostics(logging.Handler):
             obj(duty.get('forage')).get('issued'))
         return duty, marker
 
+    def _notice(self,state,identity,category,signature):
+        """Six novel diagnostic transitions per category/task, then count only."""
+        seen=state.setdefault('task_notices',OrderedDict())
+        key=(identity,category,str(signature))
+        if key in seen or sum(k[:2]==key[:2] for k in seen)>=6:
+            state['stats']['task_diag_repeated_or_omitted']+=1
+            return False
+        seen[key]=True
+        while len(seen)>192:seen.popitem(last=False)
+        return True
+
+    def _task_context(self,state,task):
+        seen=state.setdefault('task_context_seen',OrderedDict())
+        for document in llm_trace.document_context(getattr(self.local,'task_evidence',{})):
+            key=(document['path'],document['hash'])
+            if key in seen:continue
+            seen[key]=True
+            self._write_compact('task_context',**llm_trace.fit(dict(task=task.get('id'),diag=2,
+                document=document,required_checkers=getattr(self.local,'task_required',[]))))
+        while len(seen)>32:seen.popitem(last=False)
+
     def _llm_turn(self,state,raw,response,task,number):
         pending=state.get('llm_trace_pending');logged=False
         counts=state.setdefault('llm_trace_counts',OrderedDict())
@@ -233,14 +265,34 @@ class Diagnostics(logging.Handler):
                     mappings=state.setdefault('program_rids',{})
                     mappings[output['code_hash']]=pending['input'].get('rid')
                     if len(mappings)>16:del mappings[next(iter(mappings))]
-                if counts[identity]<3:
-                    verdict=getattr(self.local,'llm_verdict',{})
+                verdict=getattr(self.local,'llm_verdict',{})
+                reason=verdict.get('reason','') if not ended else ''
+                next_steps=[k for k in ('prompt','executeCmd') if response.get(k)]
+                if any(c.get('action')=='submitAnswer' for c in response.get('roleCommandMap',{}).values()):
+                    next_steps.append('submitAnswer')
+                important=bool(reason) or output.get('intent')=='answer' or (
+                    verdict.get('kind') and verdict['kind']!='llm_consumed') or not reply or (
+                    output.get('intent')=='execute' and not response.get('executeCmd'))
+                signature=(verdict.get('kind'),llm_trace.rejection_stage(reason),reason,output.get('intent'),next_steps)
+                extra=important and self._notice(state,identity,'llm',signature)
+                if counts[identity]<3 or extra:
                     record={'task':identity,'rid':pending['input'].get('rid'),'sent_round':pending['round'],
-                            'wait_rounds':number-pending['round'],
+                            'wait_rounds':number-pending['round'],'left':task.get('left'),'next':next_steps,
                             'verdict':('task_changed' if ended else verdict.get('kind','received') if reply else 'missing'),
                             'input':{k:v for k,v in pending['input'].items() if not k.startswith('_') and k!='rid'},
                             'output':output}
-                    if verdict.get('reason'):record['reason']=str(verdict['reason'])[:100]
+                    if reason:
+                        record['reason']=llm_trace.redact(reason)[:240]
+                        record['stage']=llm_trace.rejection_stage(reason)
+                    if important and not ended:
+                        record['diagnostic']=llm_trace.rejection_detail(llm_trace.decision(reply),
+                            getattr(self.local,'task_evidence',{}),getattr(self.local,'task_required',[]))
+                        record['input']={k:v for k,v in record['input'].items() if k in ('left','prompt_chars','prompt_hash','allowed','template_intent')}
+                        record['output']={k:v for k,v in output.items() if k in ('parse','rid','version','intent','op','cwd')}
+                        self._task_context(state,task)
+                        if reason or not reply:
+                            state['last_task_diagnostic']={'stage':record.get('stage'),'reason':record.get('reason'),
+                                                          'round':number,'rid':record['rid']}
                     # Keep valid one-line JSON and a strict extra-line byte budget.
                     for group,key in [('input','docs'),('output','imports'),('output','endpoints'),('output','auth'),('output','launch')]:
                         if len(json.dumps(record,ensure_ascii=False).encode())<=1000:break
@@ -248,13 +300,42 @@ class Diagnostics(logging.Handler):
                     if len(json.dumps(record,ensure_ascii=False).encode())>1100:
                         record['output']={k:v for k,v in output.items() if k in {'reply_hash','reply_chars','parse','code_hash','intent','op'}}
                         record['cut']=True
-                    self._write_compact('llm',**record);counts[identity]+=1;logged=True
+                    self._write_compact('llm',**llm_trace.fit(record));counts[identity]+=1;logged=True
                 else:state['stats']['llm_trace_omitted']+=1
                 state['llm_trace_pending']=None
         if response.get('prompt') and task.get('id'):
             state['llm_trace_pending']={'task':task['id'],'round':number,'input':llm_trace.sent(response['prompt'])}
         while len(counts)>32:counts.popitem(last=False)
         return logged
+
+    def _task_lifecycle(self,state,raw,response,task,number):
+        previous=state.get('task_totals')
+        identity=task.get('id')
+        if previous and previous['task']!=identity:
+            self._write_compact('task_end',**llm_trace.fit({**previous,
+                'end':task.get('end') or 'task_changed', 'last_diagnostic':state.get('last_task_diagnostic'),
+                'judge_errors':[{k:e.get(k) for k in ('errorCode','description')}
+                    for e in array(raw.get('errors'))[:2] if isinstance(e,dict)]}))
+            state['task_totals']=None;state['last_task_diagnostic']=None
+        if not identity:return
+        totals=state.get('task_totals')
+        if totals is None:
+            active=getattr(self.local,'task_active',{})
+            totals=state['task_totals']={'task':identity,'start':number,'accept':active.get('accept_round'),
+                'timeout':active.get('timeout'),'llm_calls':0,'cmd_calls':0,'submitted':0}
+        totals['file']=task.get('file') or totals.get('file')
+        totals['llm_calls']+=bool(response.get('prompt'))
+        totals['cmd_calls']+=bool(response.get('executeCmd'))
+        totals['submitted']=task.get('submitted',0)
+        for command in response.get('roleCommandMap',{}).values():
+            if command.get('action')=='submitAnswer':
+                answer=command.get('taskAnswer','')
+                try:value=json.loads(answer)
+                except ValueError:value=answer
+                self._write_compact('task_submit',**llm_trace.fit(dict(task=identity,left=task.get('left'),
+                    answer_hash=llm_trace.digest(answer),fields=list(value)[:8] if isinstance(value,dict) else [],
+                    token_hash=llm_trace.digest(value['token']) if isinstance(value,dict) and isinstance(value.get('token'),str) else None,
+                    answer_type=type(value).__name__)))
 
     def _compact_turn(self, raw, response, elapsed):
         raw = obj(raw)
@@ -322,40 +403,70 @@ class Diagnostics(logging.Handler):
                             detail += f" after={actor} ack={feedback.get(actor)} {action}"
                     issues.append(self._brief(detail,320))
             task = getattr(self.local,"task",{})
+            self._task_lifecycle(state,raw,response,task,number)
             llm_logged = self._llm_turn(state,raw,response,task,number)
             tool = getattr(self.local,"task_tool",None)
             tool_key = (task.get("id"),(tool or {}).get("round"))
             if tool and task.get("id") and tool_key not in state["task_tools"]:
-                if sum(k[0]==task["id"] for k in state["task_tools"]) < 2:
-                    self._write_compact("task_exec",task=task["id"],left=task.get("left"),
+                evidence=getattr(self.local,'task_evidence',{})
+                eid,record=next(((k,e) for k,e in reversed(list(evidence.items()))
+                    if e.get('round')==tool.get('round') and e.get('data',{}).get('operation')==tool.get('op')),('',{}))
+                shape=llm_trace.result_shape(record.get('data',{}))
+                runtime=[e for e in tool.get('runtime',[]) if isinstance(e,dict) and e.get('kind')!='checker_exits']
+                failed=lambda e:bool(e.get('error') or isinstance(e.get('status'),int) and e['status']>=400)
+                runtime.sort(key=lambda e:not failed(e))  # A late failed page survives the two-entry display cap.
+                important=bool(tool.get('failure') or tool.get('status')!='ok' or shape['token_n'] or shape['checker_exits']
+                               or any(failed(e) for e in runtime))
+                signature=json.dumps([tool.get('status'),tool.get('failure'),shape,
+                    [e for e in runtime if e.get('kind')=='http']],sort_keys=True)
+                extra=important and self._notice(state,task['id'],'execution',signature)
+                if sum(k[0]==task["id"] for k in state["task_tools"]) < 2 or extra:
+                    self._write_compact("task_exec",**llm_trace.fit(dict(task=task["id"],left=task.get("left"),
                         rid=state.get('program_rids',{}).get(str(tool.get('program') or '')[:12]),
                         op=tool.get("op"),path=self._brief(tool.get("path"),100),status=tool.get("status"),
                         exit=tool.get("exit"),usable=tool.get("usable"),answer_usable=tool.get('answer_usable'),
-                        failure=tool.get('failure'),cwd=tool.get('cwd'),entries=(tool.get('entries') or [])[:8],
+                        failure=tool.get('failure'),cwd=tool.get('cwd'),evidence=eid,shape=shape,
                         adapters=tool.get('adapters',[]),
-                        contract=tool.get('contract',{}),runtime=(tool.get('runtime',[])[:1] + tool.get('runtime',[])[-1:]
-                            if len(tool.get('runtime',[])) > 1 else tool.get('runtime',[])),
-                        root_entries=(tool.get('root_entries') or [])[:8],
-                        program=str(tool.get('program') or '')[:12],docs=tool.get('docs'),result=self._brief(tool.get("result",""),480),
-                        result_round=tool.get("round"))
+                        auth=tool.get('contract',{}).get('auth'),
+                        runtime=runtime[:2],
+                        program=str(tool.get('program') or '')[:12],
+                        result_hash=llm_trace.digest(str(record.get('data',{}).get('text',tool.get('result','')))),
+                        result_round=tool.get("round"))))
+                    if important:self._task_context(state,task)
+                else:state['stats']['task_exec_omitted']+=1
                 state["task_tools"].add(tool_key)
                 if len(state["task_tools"]) > 32:state["task_tools"]={tool_key}
             fault = getattr(self.local,"task_fault",None)
-            fault_key = (task.get("id"),(fault or {}).get("kind"))
+            fault_key = (task.get("id"),(fault or {}).get("kind"),(fault or {}).get('reason',''))
             if fault and llm_logged and fault.get('round')==number:
                 state['task_faults'].add(fault_key)
             if fault and fault_key not in state["task_faults"] and not (llm_logged and fault.get("round")==number):
-                # One diagnostic per failure kind per task, capped to two per
-                # task. Never let discovery events consume this allowance.
-                if sum(k[0]==task.get("id") for k in state["task_faults"]) < 2:
-                    self._write_compact("task_fault",task=task.get("id"),left=task.get("left"),
-                        kind=fault.get("kind"),reason=self._brief(fault.get("reason",""),120),
+                # Different validation reasons retain separate slots, even if
+                # the state machine calls both of them invalid_llm.
+                if self._notice(state,task.get('id'),'fault',fault_key[1:]):
+                    detail=llm_trace.rejection_detail(llm_trace.decision(raw.get('llmResp','')),
+                        getattr(self.local,'task_evidence',{}),getattr(self.local,'task_required',[]))
+                    self._write_compact("task_fault",**llm_trace.fit(dict(task=task.get("id"),left=task.get("left"),
+                        kind=fault.get("kind"),reason=llm_trace.redact(fault.get("reason",""))[:240],
+                        stage=llm_trace.rejection_stage(fault.get('reason','')),diagnostic=detail,
                         op=fault.get("op"),path=self._brief(fault.get("path"),100),
                         expected=fault.get("expected"),received=self._brief(fault.get("received",""),120),
-                        reply=self._brief(fault.get("reply",""),240),fault_round=fault.get("round"))
+                        fault_round=fault.get("round"))))
+                    self._task_context(state,task)
+                    state['last_task_diagnostic']={'stage':llm_trace.rejection_stage(fault.get('reason','')),
+                        'reason':llm_trace.redact(fault.get('reason',''))[:240],'round':fault.get('round')}
                 state["task_faults"].add(fault_key)
                 if len(state["task_faults"]) > 32:
                     state["task_faults"] = {fault_key}
+            for failure in getattr(self.local,'task_active',{}).get('diagnostic_events',[]) or []:
+                if failure.get('round')==number and self._notice(state,task.get('id'),'auto_answer',failure.get('reason')):
+                    self._write_compact('task_fault',**llm_trace.fit(dict(task=task.get('id'),left=task.get('left'),
+                        kind=failure['kind'],reason=failure['reason'],stage=llm_trace.rejection_stage(failure['reason']),
+                        diagnostic=llm_trace.rejection_detail(failure,getattr(self.local,'task_evidence',{}),
+                            getattr(self.local,'task_required',[])))))
+                    self._task_context(state,task)
+                    state['last_task_diagnostic']={'stage':llm_trace.rejection_stage(failure['reason']),
+                        'reason':llm_trace.redact(failure['reason'])[:240],'round':number}
             task_marker = (task.get("id"),task.get("phase"),task.get("file"),task.get("read"),task.get("end"))
             task_changed = task_marker != state["task"] and bool(task.get("id") or task.get("end"))
             decision = getattr(self.local,'decision',{})
@@ -389,7 +500,8 @@ class Diagnostics(logging.Handler):
                          for u in units.values() if u.get("roleType")=="station"][:2]
                 decision = getattr(self.local,"decision",{})
                 reasons = [self._brief(f"{c.get('actor')}:{c.get('reason')}",90) for c in decision.get("selected",[])][:3]
-                channels = {k:self._brief(raw.get(k),140) for k in ("lastCmdResult","llmResp") if raw.get(k)} if issues else {}
+                channels = {k:{'chars':len(raw[k]),'hash':llm_trace.digest(raw[k])}
+                            for k in ('lastCmdResult','llmResp') if isinstance(raw.get(k),str) and raw[k]} if issues else {}
                 if decision and (periodic or state["calls"]==1):
                     self._write_compact("defence",supply=decision.get("wall_supply"),guns=decision.get("gun_status"),
                         returns={i:{k:r.get(k) for k in ("due","length")} for i,r in decision.get("return_routes",{}).items()},
@@ -478,7 +590,7 @@ class Diagnostics(logging.Handler):
                   if p.is_file() and p.suffix in {".py", ".json"}}
         hashes["run.sh"] = hashlib.sha256((root / "run.sh").read_bytes()).hexdigest()
         if self.mode == "compact":
-            self._write_compact("startup",mode="compact",every=self.interval,python=sys.version.split()[0],
+            self._write_compact("startup",mode="compact",every=self.interval,task_diag=2,python=sys.version.split()[0],
                 sdk=hashlib.sha256(json.dumps(hashes,sort_keys=True).encode()).hexdigest()[:12],
                 config=hashlib.sha256(repr((agent.rules,agent.policy)).encode()).hexdigest()[:12],bind="0.0.0.0",
                 strategy={'staged_walls':agent.policy.staged_walls_enabled,
