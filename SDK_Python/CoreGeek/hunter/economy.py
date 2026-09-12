@@ -9,6 +9,8 @@ from . import procurement
 from .layout import LayoutGuard
 from .weapon_portfolio import WeaponPortfolio
 from . import battery
+from .wall_policy import planned_gate
+from .night_roles import defender_ids, economic_endpoints
 
 
 def movement(actor, steps, value, reason, *, route_goal=None):
@@ -17,12 +19,13 @@ def movement(actor, steps, value, reason, *, route_goal=None):
 
 
 def prepare_wall_cycle(world, clock, rules, policy=None):
-    """Allow a verified ring seal only after every living role is back inside.
+    """Prepare construction; the external gate planner owns seal admission.
 
     Daytime access is restored by removing one owned wall; no refund assumed.
     """
     from .rules import station_rings
     world.seal_cells = frozenset()
+    world.strategy_day = clock.day
     rule = rules.build_rule(world, "wall")
     if not rule or len(world.stations) != 1:
         return
@@ -35,10 +38,30 @@ def prepare_wall_cycle(world, clock, rules, policy=None):
                               and len(battery.missing_walls(world,rules))<=1)
     if rules.wall_count(world) >= 10:
         world.defence_cells = blue
-    if (clock.phases == {"day"} and clock.until_night <= 10 and len(world.movers) == 3
-            and all(u.pos in blue for u in world.movers)
-            and not any(u.pos in blue or u.pos in world.stations[0].cells for u in world.robots.values())):
-        world.seal_cells = world.wall_targets if world.wall_targets is not None else yellow
+    # Sealing requires the gate planner's observed two-inside/one-outside
+    # permission. The former all-three-inside seal is not a fallback strategy.
+    builders = [u for u in world.movers if u.kind=='worker' and u.backpack is not None
+                and all(u.inventory[k]>=n for k,n in rule.items.items())]
+    # Reserve only imminent, actually funded work. Reserving the whole future
+    # ring changes long-distance return budgets before any wall can be built.
+    missing = set(battery.missing_walls(world,rules))
+    if (len(missing)==1 and getattr(world,"wall_stage",None)!="front10" and not world.seal_cells
+            and (planned_gate(world) is None or planned_gate(world) in missing)):
+        missing.clear()  # The deliberately open daytime gate is not ready for construction.
+    if planned_gate(world) not in world.seal_cells and getattr(world, 'wall_stage', None) != 'front10':
+        missing.discard(planned_gate(world))
+    world.operator_excluded_cells = ({p for p in missing
+                                      if any(distance(u.pos,p)<=1 for u in builders)}
+        if policy and policy.construction_site_coordination_enabled and clock.phases == {'day'}
+           and world.gold is not None and world.gold>=rule.gold else set())
+    builder_ids={u.id for u in builders}
+    for actor in world.movers:
+        if actor.id not in builder_ids:
+            # A role that just yielded must not immediately path back through
+            # the imminent build cell and beat the build in joint arbitration.
+            # This is a temporary planning reservation, not an observed wall.
+            world.navigation_avoided.setdefault(actor.pos,set()).update(
+                world.operator_excluded_cells-{actor.pos})
 
 
 def open_day_gate(world, clock, rules, deadline):
@@ -59,7 +82,16 @@ def open_day_gate(world, clock, rules, deadline):
     topology.occupied = world.occupied-{u.pos for u in world.movers}
     trapped = [u for u in world.movers if u.pos in blue and
                u.pos not in distance_field(topology, outside, u.pos, deadline)]
-    if world.firing_ports:
+    fixed_gate = planned_gate(world)
+    if fixed_gate is not None and getattr(world, 'wall_stage', None) != 'front10':
+        if clock.until_night <= 10 or fixed_gate not in walls:
+            return []
+        if any(u.alive and u.kind == 'wall' and u.pos == fixed_gate and u.level != 1
+               for u in world.ours.values()):
+            return []  # Preserve an unexpectedly upgraded/unknown-level old gate.
+        gates = {fixed_gate}
+        reason = "open planned task-side gate for daytime access; stone is not refunded"
+    elif world.firing_ports:
         gates = walls & world.firing_ports
         reason = "clear reserved Gatling firing port; do not rebuild this wall"
         if not gates and clock.until_night > 10 and not battery.has_exit(world):
@@ -128,7 +160,7 @@ def _construction_jobs(world, rules, portfolio=False, repair_saturation=False, r
     planned = []
     layout = LayoutGuard(world, time.monotonic()+0.04)
     workers = {u.id: u for u in world.movers if u.kind == "worker"}
-    available = {name: (rule, {p for p in battery.cells(world,name,rule.cells) if world.inside(p) and p not in world.occupied})
+    available = {name: (rule, {p for p in battery.construction_cells(world,name,rule.cells) if world.inside(p) and p not in world.occupied})
                  for name in sorted(WEAPONS | {"wall"}) if (rule := rules.build_rule(world, name)) is not None}
     if prefer_closed_ring and world.build_interior and world.battery_plan is None:
         xs, ys = zip(*world.build_interior)
@@ -195,8 +227,10 @@ def _construction_jobs(world, rules, portfolio=False, repair_saturation=False, r
     # policy correctly refuses to close it before the pioneer returns.
     wall_rule = rules.build_rule(world, "wall")
     missing = battery.missing_walls(world,rules)
-    enclosing = not world.firing_ports or bool(world.battery_plan and world.battery_plan['enclosure'])
-    if len(missing)==1 and enclosing and world.build_interior and len(world.weapons)>=rules.weapon_limit:
+    enclosing = (getattr(world, "wall_stage", None) != "front10" and
+                 (not world.firing_ports or bool(world.battery_plan and world.battery_plan['enclosure'])))
+    if (len(missing)==1 and enclosing and world.build_interior and len(world.weapons)>=rules.weapon_limit
+            and (planned_gate(world) is None or planned_gate(world) in missing)):
         target = next(iter(missing))
         free_workers = [u for u in world.movers if u.kind=="worker" and (u.id not in result or result[u.id]["name"]=="wall")]
         if free_workers:
@@ -250,6 +284,32 @@ def ready_construction(world, clock, rules, policy, deadline, *, jobs=None):
         actor = world.ours[identity]
         if time.monotonic() >= deadline or actor.backpack is None:
             continue
+        if job.get("economy_first"):
+            # A collection/build commitment cannot spend the final return
+            # window. The gate actor is already inside when it seals.
+            return_goals=interaction_cells(world,[u.pos for u in world.weapons],actor.pos) & world.build_interior
+            return_field=distance_field(world,return_goals,actor.pos,deadline)
+            if not (job.get('gate') and world.seal_cells) and return_field.get(actor.pos,0)>0 and clock.until_night<=return_field[actor.pos]+2:
+                job['return_only']=True
+                continue
+            deficit = max(0,job['stock_target']-actor.inventory['stone'])
+            if deficit and (clock.until_night > deficit+5 or not actor.inventory['stone']):
+                options=[]
+                for mine in world.zones.get('stone',()):
+                    length,steps=route(world,actor,[mine],deadline)
+                    back=min((return_field[p] for p in neighbours(mine) if p in return_field),default=None)
+                    if length is not None and back is not None and length+1+back+2 < clock.until_night:
+                        options.append((length,mine,steps))
+                if options:
+                    length,mine,steps=min(options)
+                    if length==0:
+                        result.append(Candidate(identity,{'action':'collect','targetPos':[pos_json(mine)]},40,
+                                                'designated supplier: collect only remaining wall quota'))
+                    else:
+                        result.extend(movement(actor,steps,40,'designated supplier: nearest reachable stone for wall quota'))
+                    continue
+            if job.get('defer_build'):
+                continue
         if job.get("gate") and actor.inventory["stone"] and not world.seal_cells:
             continue
         rule = rules.build_rule(world, job["name"])
@@ -259,7 +319,7 @@ def ready_construction(world, clock, rules, policy, deadline, *, jobs=None):
             mineral = next((k for k, n in rule.items.items() if actor.inventory[k] < n), None)
             # Fill the personal project quota while at the mine, then build.
             # This is a policy stock target, not a change to the one-stone cost.
-            if mineral is None and actor.inventory["stone"] < min(job.get("stock_target", 4), max(1, (clock.until_night-policy.return_buffer)//2)):
+            if not job.get('economy_first') and mineral is None and actor.inventory["stone"] < min(job.get("stock_target", 4), max(1, (clock.until_night-policy.return_buffer)//2)):
                 if world.near_zone(actor.pos, "stone"):
                     mineral = "stone"
             if mineral is not None:
@@ -319,11 +379,24 @@ def harvest_jobs(world, reserves):
     return chosen
 
 
-def immediate(world, rules, task_actor=None, *, jobs=None, policy=None):
+def immediate(world, rules, task_actor=None, *, jobs=None, policy=None, local_only=False):
     """Cheap, current-snapshot incumbent available before advanced planning."""
     result = []
-    reserves = construction_reservations(world, rules, jobs=jobs)
-    ore_jobs = harvest_jobs(world, reserves)
+    planned_repairs = policy and policy.repair_plan_enabled and getattr(world, "task_side_plan", None)
+    if local_only:
+        # Early error recovery must not depend on construction or path search.
+        # Only assign mines that an observed worker can already interact with.
+        reserves, ore_jobs, claimed = {}, {}, set()
+        for actor in sorted((u for u in world.movers if u.kind == 'worker'), key=lambda u: u.id):
+            adjacent = [(name, point) for name in sorted(MINERALS) if world.vendor.get(name, 0) > 0
+                        for point in sorted(world.zones.get(name, ())) if distance(actor.pos, point) <= 1]
+            if adjacent:
+                mine = min(adjacent, key=lambda item: (item in claimed, -world.vendor[item[0]], item))
+                ore_jobs[actor.id] = mine
+                claimed.add(mine)
+    else:
+        reserves = construction_reservations(world, rules, jobs=jobs)
+        ore_jobs = harvest_jobs(world, reserves)
     for actor in world.movers:
         if actor.id == task_actor:
             continue
@@ -351,6 +424,8 @@ def immediate(world, rules, task_actor=None, *, jobs=None, policy=None):
                         result.append(Candidate(actor.id, {"action": "collect", "targetPos": [pos_json(pos)]},
                                                 world.vendor.get(mineral, 0)*0.4 + (8 if actor.inventory[mineral] < materials[mineral] else 0),
                                                 "collect current adjacent ore, including verified construction need"))
+        if local_only:
+            continue  # Building investment/repair needs the prepared layout and duties.
         for building in world.ours.values():
             if not building.alive or distance(actor.pos, building.pos) > 1:
                 continue
@@ -361,9 +436,9 @@ def immediate(world, rules, task_actor=None, *, jobs=None, policy=None):
                     result.append(Candidate(actor.id, {"action": "use", "name": name, "targetPos": [pos_json(building.pos)]},
                                             30 if prefix != "Wall" else 12, "use carried level-matched voucher"))
             max_hp = rules.max_health.get(building.kind, {}).get(building.level)
-            if building.kind == "wall" and actor.inventory["WallFixer"] and max_hp and building.health < max_hp:
+            if not planned_repairs and building.kind == "wall" and actor.inventory["WallFixer"] and max_hp and building.health is not None and building.health < max_hp * (policy.wall_repair_health_fraction if policy else .30):
                 result.append(Candidate(actor.id, {"action": "use", "name": "WallFixer", "targetPos": [pos_json(building.pos)]},
-                                        (max_hp-building.health)*0.05, "repair against verified maximum HP"))
+                                        (max_hp-building.health)*0.05, "repair wall only below 30% verified maximum HP"))
     return result
 
 
@@ -371,6 +446,7 @@ def operator_goals(world, actor):
     """Prefer stands adjacent to multiple weapons, preserving future rotations."""
     weapons = world.weapons
     cells = interaction_cells(world, [u.pos for u in weapons], actor.pos)
+    cells -= getattr(world,'operator_excluded_cells',set())
     return sorted(cells, key=lambda p: (-sum(distance(p, w.pos) <= 1 for w in weapons),
                                       distance(actor.pos, p), p))
 
@@ -390,7 +466,7 @@ def construction(world, clock, rules, actor, deadline, *, names=None, target_cel
             continue
         if name == "wall" and rules.wall_count(world) >= rules.wall_limit:
             continue
-        for target in sorted(battery.cells(world,name,rule.cells)):
+        for target in sorted(battery.construction_cells(world,name,rule.cells)):
             if target_cell is not None and target != target_cell:
                 continue
             if world.inside(target) and target not in world.occupied:
@@ -418,7 +494,7 @@ def construction(world, clock, rules, actor, deadline, *, names=None, target_cel
     return result
 
 
-def propose(world, clock, rules, policy, deadline, task_actor=None, operator_stands=None, *, upgrade_candidates=None, build_jobs=None):
+def propose(world, clock, rules, policy, deadline, task_actor=None, operator_stands=None, *, upgrade_candidates=None, build_jobs=None, task_choice=None):
     result = (procurement.propose(world, policy, deadline, task_actor, rules=rules)
               if upgrade_candidates is None else list(upgrade_candidates))
     if build_jobs is None:
@@ -429,6 +505,9 @@ def propose(world, clock, rules, policy, deadline, task_actor=None, operator_sta
         if actor.id == task_actor or time.monotonic() >= deadline:
             continue
         if actor.kind == "pioneer":
+            if task_choice is not None and actor.id == task_choice['actor']:
+                result.extend(task_choice['candidates'])
+                continue
             # Navigation toward tasks is useful before task eligibility; accepting
             # and holding tasks belongs exclusively to the task engine.
             if not world.phase_task:
@@ -443,10 +522,15 @@ def propose(world, clock, rules, policy, deadline, task_actor=None, operator_sta
                         result.extend(movement(actor, steps, 8/(1+length*0.1), "approach available own task"))
             continue
         # Return using actual route length, not a fixed last-day-round trigger.
-        defence = ([operator_stands[actor.id]] if operator_stands and actor.id in operator_stands else operator_goals(world, actor))
+        is_defender = actor.id in defender_ids(world)
+        if not is_defender and clock.phases != {"day"}:
+            # Night mining is admitted by the external economy state machine.
+            # No fallback gun route or unguarded speculative mining.
+            continue
+        defence = ([operator_stands[actor.id]] if operator_stands and actor.id in operator_stands else operator_goals(world, actor)) if is_defender else economic_endpoints(world, actor)
         defence_field = distance_field(world, defence, actor.pos, deadline) if defence else {}
         return_length = defence_field.get(actor.pos)
-        must_return = return_length is not None and (clock.phases != {"day"} or clock.until_night <= return_length+policy.return_buffer)
+        must_return = is_defender and return_length is not None and (clock.phases != {"day"} or clock.until_night <= return_length+policy.return_buffer)
         if must_return:
             if return_length:
                 steps = sorted(p for p in neighbours(actor.pos) if p in defence_field and defence_field[p] < return_length)
@@ -512,11 +596,11 @@ def propose(world, clock, rules, policy, deadline, task_actor=None, operator_sta
                                                route_goal={"purpose":"collect", "zone":mineral, "targets":(pos,)}))
         if policy.weapon_portfolio_enabled:
             job = build_jobs.get(actor.id)
-            if job:
+            if job and not job.get('defer_build') and not job.get('return_only'):
                 result.extend(construction(world, clock, rules, actor, deadline, names={job['name']}, target_cell=job['target'], reserve_gold=construction_cash_reserve(world, policy)))
         else:
             job = build_jobs.get(actor.id)
-            if job:
+            if job and not job.get('defer_build') and not job.get('return_only'):
                 result.extend(construction(world, clock, rules, actor, deadline, names={job["name"]},
                                            target_cell=job["target"], reserve_gold=construction_cash_reserve(world, policy)))
     return result

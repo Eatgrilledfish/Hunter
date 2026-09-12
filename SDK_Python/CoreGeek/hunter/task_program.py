@@ -8,7 +8,7 @@ import re
 from urllib.parse import urlsplit
 
 
-def prepare(code, root, cwd, documents):
+def prepare(code, root, cwd, documents, diagnostics=None):
     tree = ast.parse(code)
     changes = []
     # The wrapper already chdir's to cwd. Resolve a repeated root-relative cwd
@@ -37,33 +37,58 @@ def prepare(code, root, cwd, documents):
     for url in re.findall(r'http://(?:localhost|127\.0\.0\.1)(?::\d+)?(?![A-Za-z0-9_.:-])(?:/[^\s`<>\"\']*)?',texts):
         parsed=urlsplit(url)
         origins.add((parsed.scheme,parsed.hostname,parsed.port or 80))
-    auth = len(keys)==1 and len(origins)==1 and re.search(
-        r'Authorization[`\"\']?\s*[:：=]?\s*f?[`\"\']?\s*Bearer\b',texts,re.I)
+    bearer = bool(re.search(
+        r'Authorization[\s`\"\'|:：=*]{0,32}f?[`\"\']?\s*Bearer\b',texts,re.I))
+    auth = len(keys)==1 and len(origins)==1 and bearer
+    if diagnostics is not None:
+        diagnostics.update(documents=len(documents), matched_credentials=len(keys), origins=len(origins),
+                           documented_header='Authorization/Bearer' if bearer else None,
+                           auth=('ready' if auth else 'credential_not_uniquely_bound' if len(keys)!=1
+                                 else 'origin_not_unique' if len(origins)!=1 else 'header_contract_unrecognized'))
     source=ast.unparse(tree) if changes else code
     if auth:
         # Credentials come from BOTH inspected documentation and the generated
         # literal. Limit injection to that documented local origin; never carry
         # authorization through a redirect to a different origin.
         bootstrap = '''
-import urllib.request as _hu, urllib.parse as _hp
-_hunter_urlopen = _hu.urlopen
+import urllib.request as _hu, urllib.parse as _hp, urllib.error as _he
+_hunter_opener_open = _hu.OpenerDirector.open
+_hunter_redirect = _hu.HTTPRedirectHandler.redirect_request
+_hunter_auth_failed = set()
 def _hunter_origin(url):
     p = _hp.urlsplit(url)
     return (p.scheme,p.hostname,p.port or 80)
-class _HunterRedirect(_hu.HTTPRedirectHandler):
-    def redirect_request(self,req,fp,code,msg,headers,newurl):
-        if _hunter_origin(newurl) != _hunter_origin(req.full_url):
-            raise ValueError('cross-origin authenticated redirect refused')
-        return super().redirect_request(req,fp,code,msg,headers,newurl)
-def _hunter_open(url,data=None,timeout=5,**kwargs):
+def _hunter_redirect_request(self,req,fp,code,msg,headers,newurl):
+    if _hunter_origin(req.full_url) in _hunter_origins and _hunter_origin(newurl) != _hunter_origin(req.full_url):
+        raise ValueError('cross-origin authenticated redirect refused')
+    return _hunter_redirect(self,req,fp,code,msg,headers,newurl)
+def _hunter_open(self,url,data=None,timeout=5):
     address = url.full_url if isinstance(url,_hu.Request) else url
-    if isinstance(address,str) and _hunter_origin(address) in _hunter_origins and not kwargs:
+    if isinstance(address,str) and _hunter_origin(address) in _hunter_origins:
+        origin = _hunter_origin(address)
+        if origin in _hunter_auth_failed:
+            raise RuntimeError('HTTP 401: unchanged documented authentication already failed; inspect documentation')
         req = url if isinstance(url,_hu.Request) else _hu.Request(url,data=data)
-        if not req.has_header('Authorization'):
-            req.add_header('Authorization','Bearer '+_hunter_key)
-        return _hu.build_opener(_hu.ProxyHandler({}),_HunterRedirect()).open(req,data=data,timeout=timeout)
-    return _hunter_urlopen(url,data=data,timeout=timeout,**kwargs)
-_hu.urlopen = _hunter_open
+        req.full_url = _hp.quote(req.full_url, safe=":/?&=%+;,@!$'()*[]#~")
+        req.remove_header('Authorization')
+        req.add_header('Authorization','Bearer '+_hunter_key)
+        status = None
+        try:
+            direct = getattr(self, '_hunter_direct', None)
+            if direct is None:
+                direct = _hu.build_opener(_hu.ProxyHandler({}), *[h for h in self.handlers if not isinstance(h,_hu.ProxyHandler)])
+                self._hunter_direct = direct
+            bounded_timeout = min(timeout, 5) if isinstance(timeout, (int,float)) else 5
+            response = _hunter_opener_open(direct,req,data=data,timeout=bounded_timeout)
+            status = response.status
+            return response
+        except _he.HTTPError as exc:
+            status = exc.code
+            if status == 401:_hunter_auth_failed.add(origin)
+            raise
+    return _hunter_opener_open(self,url,data=data,timeout=timeout)
+_hu.OpenerDirector.open = _hunter_open
+_hu.HTTPRedirectHandler.redirect_request = _hunter_redirect_request
 '''
         source='_hunter_key = '+repr(next(iter(keys)))+'\n_hunter_origins = '+repr(sorted(origins))+'\n'+bootstrap+'\nexec(compile('+repr(source)+',"<task_program>","exec"))'
         changes.append('documented_local_bearer')

@@ -61,9 +61,18 @@ def _slots(anchor, direction, existing, blocked):
 
 
 def prepare(world, rules, policy):
+    _prepare_battery(world, rules, policy)
+    from .wall_policy import prepare as prepare_walls
+    prepare_walls(world, rules, policy)
+
+
+def _prepare_battery(world, rules, policy):
     world.battery_plan = None
     world.wall_targets = None
     world.firing_ports = frozenset()
+    from .task_side_layout import apply as apply_task_layout
+    if apply_task_layout(world, rules, policy):
+        return
     if policy is None or not policy.forward_battery_enabled or len(world.stations) != 1 or rules.weapon_limit != 3:
         return
     base = world.stations[0]
@@ -125,6 +134,20 @@ def missing_walls(world, rules):
         return set()
     return cells(world,'wall',rule.cells)-{u.pos for u in world.ours.values()
                                          if u.kind=='wall' and u.health != 0}
+
+
+def construction_cells(world, name, legal):
+    """Keep G in material demand but build it only in the sealing window.
+
+    First-day front10 is deliberately unchanged, including a front-facing G.
+    """
+    result = cells(world, name, legal)
+    if name == 'wall' and getattr(world, 'wall_stage', None) != 'front10':
+        from .wall_policy import planned_gate
+        gate = planned_gate(world)
+        if gate not in world.seal_cells:
+            result.discard(gate)
+    return result
 
 
 def has_exit(world):

@@ -14,9 +14,11 @@ from .navigation import neighbours, interaction_cells, distance_field
 from .protocol import distance, pos_json
 from .rules import Policy
 from . import lookahead
+from .night_roles import defender_ids, operators, fixed_stands, transit_stands
 from .lookahead import ROBOT_DAMAGE
 from .firing_lanes import FiringLanes
 from .operator_cycles import OperatorCycles
+from .rocket_rotation import advance as advance_rockets
 
 
 def exposure(world, clock, pos):
@@ -33,6 +35,7 @@ def exposure(world, clock, pos):
 
 @dataclass
 class Directive:
+    duty_permit: object = None
     candidates: list = field(default_factory=list)
     task_moves: set = field(default_factory=set)
     allow_task_control: bool = False
@@ -44,6 +47,7 @@ class Directive:
     construction_actions: dict = field(default_factory=dict)
     day_actions: dict = field(default_factory=dict)
     funded_actions: dict = field(default_factory=dict)
+    repair_supply_actions: dict = field(default_factory=dict)
     seal_builds: dict = field(default_factory=dict)
     upgrade_actions: dict = field(default_factory=dict)
     recovery_actions: dict = field(default_factory=dict)
@@ -54,6 +58,8 @@ class Directive:
     blocked_moves: dict = field(default_factory=dict)
     urgent_upgrades: dict = field(default_factory=dict)
     upgrading_guns: set = field(default_factory=set)
+    site_clear_actions: dict = field(default_factory=dict)
+    roster_transit_actions: dict = field(default_factory=dict)
 
     def permit(self, candidate):
         """A due return is a macro commitment, not a price-dependent bid.
@@ -61,15 +67,29 @@ class Directive:
         Medical/combat triage may override it. Reaching a stand permits stationary
         work, while ordinary movement cannot spend an already exhausted buffer.
         """
+        if self.duty_permit is not None:
+            allowed=self.duty_permit(candidate)
+            if allowed is not None:
+                return allowed
         if candidate.command.get("action") == "move":
             targets = candidate.command.get("targetPos", [])
             if len(targets) == 1 and (targets[0].get("x"), targets[0].get("y")) in self.blocked_moves.get(candidate.actor, set()):
                 return False
+        if candidate.actor in self.roster_transit_actions:
+            return candidate.command in self.roster_transit_actions[candidate.actor] or (
+                candidate.command.get('action') == 'use'
+                and candidate.command.get('name') in {'Medicine', 'Bomb', 'DizzyWeapon'})
         if candidate.command.get('action') == 'attack' and (
                 candidate.actor in self.upgrading_guns or candidate.command.get('controllerId') in self.urgent_upgrades):
             return False
         if candidate.actor in self.urgent_upgrades:
             return candidate.command == self.urgent_upgrades[candidate.actor]
+        if candidate.actor in self.site_clear_actions:
+            return candidate.command in self.site_clear_actions[candidate.actor] or (
+                candidate.command['action']=='use' and candidate.command.get('name') in {'Medicine','Bomb','DizzyWeapon'})
+        if candidate.actor in self.repair_supply_actions:
+            medical = candidate.command['action']=='use' and candidate.command.get('name') in {'Medicine','Bomb','DizzyWeapon'}
+            return medical or candidate.command in self.repair_supply_actions[candidate.actor]
         if candidate.actor in self.funded_actions:
             medical = candidate.command['action']=='use' and candidate.command.get('name') in {'Medicine','Bomb','DizzyWeapon'}
             return medical or candidate.command in self.funded_actions[candidate.actor]
@@ -115,15 +135,8 @@ def matching_size(masks):
 
 
 def defence_roles(world, include_pioneer, task_actor, allow_task_control):
-    operators = [u for u in world.movers if u.kind == "worker"][:2]
-    fixed = set()
-    if include_pioneer and len(world.weapons[:3]) > len(operators):
-        pioneer = next((u for u in world.movers if u.kind == "pioneer"), None)
-        if pioneer is not None and (pioneer.id != task_actor or allow_task_control):
-            operators.append(pioneer)
-            if pioneer.id == task_actor:
-                fixed.add(pioneer.id)
-    return operators, fixed
+    roles = operators(world, include_pioneer, task_actor, allow_task_control)
+    return roles, {u.id for u in roles if u.id == task_actor}
 
 
 def cooling_handoff_gaps(weapons, operators, stands, fields):
@@ -161,6 +174,9 @@ def fallback_stands(world, *, include_pioneer, task_actor, allow_task_control, h
     """
     if world.width * world.height > 41 * 32:
         return {}
+    planned = fixed_stands(world, float("inf"), include_pioneer, task_actor, allow_task_control)
+    if planned is not None:
+        return planned
     weapons = world.weapons[:3]
     operators, fixed = defence_roles(world, include_pioneer, task_actor, allow_task_control)
     if not weapons or not operators:
@@ -176,10 +192,11 @@ def fallback_stands(world, *, include_pioneer, task_actor, allow_task_control, h
         else:
             for gun in weapons:
                 reachable = interaction_cells(world, [gun.pos], actor.pos) & distances.keys()
+                reachable -= getattr(world,'operator_excluded_cells',set())
                 if world.defence_cells:
                     reachable &= world.defence_cells
                 cells.update(sorted(reachable, key=lambda p: (distances[p], p))[:3])
-            if (not world.defence_cells or actor.pos in world.defence_cells) and any(distance(actor.pos, gun.pos) <= 1 for gun in weapons):
+            if actor.pos not in getattr(world,'operator_excluded_cells',set()) and (not world.defence_cells or actor.pos in world.defence_cells) and any(distance(actor.pos, gun.pos) <= 1 for gun in weapons):
                 cells.add(actor.pos)
         choices.append(sorted(cells) + [None])
     masks = {p: sum(1 << i for i, gun in enumerate(weapons) if distance(p, gun.pos) <= 1)
@@ -206,7 +223,7 @@ def fallback_stands(world, *, include_pioneer, task_actor, allow_task_control, h
     return {u.id: p for u, p in zip(operators, best[1]) if p is not None}
 
 
-def return_plan(world, clock, stands, policy, deadline=float("inf"), *, failed_steps=None):
+def return_plan(world, clock, stands, policy, deadline=float("inf"), *, failed_steps=None, force_due=False):
     """Publish all routes together; an interrupted refinement returns None."""
     routes, candidates = {}, []
     for actor in world.movers:
@@ -240,7 +257,7 @@ def return_plan(world, clock, stands, policy, deadline=float("inf"), *, failed_s
         # Near-complete walls require time for gate traffic and sealing after arrival.
         seal_buffer = 8 if world.defence_cells else 0
         slack = clock.until_night-length-policy.return_buffer-seal_buffer
-        due = clock.phases != {"day"} or slack <= 0
+        due = force_due or clock.phases != {"day"} or slack <= 0
         routes[actor.id] = {"stand": stand, "length": length, "steps": steps,
                            "slack_before_buffer": slack, "due": due}
         if avoided:
@@ -255,11 +272,14 @@ def return_plan(world, clock, stands, policy, deadline=float("inf"), *, failed_s
 def assign_operator_stands(world, clock, deadline, *, include_pioneer=True,
                            task_actor=None, allow_task_control=False, safety_enabled=True,
                            firing_lanes_enabled=False, handoff_enabled=False, cycle_enabled=False):
-    """Joint placement for two workers and an eligible third operator.
+    """Joint placement for the two admitted defenders.
 
     Active task actors are fixed at their observed cell. Current occupancy is
     never treated as vacated, even when another unit is assigned a future stand.
     """
+    planned = fixed_stands(world, deadline, include_pioneer, task_actor, allow_task_control)
+    if planned is not None:
+        return planned
     weapons = world.weapons[:3]  # The supplied rules cap the team at three guns.
     cycle_enabled = cycle_enabled and clock.phases == {'night'} and all(
         w.cooldown is not None and w.attack_range is not None for w in weapons)
@@ -293,6 +313,8 @@ def assign_operator_stands(world, clock, deadline, *, include_pioneer=True,
         cells = (set([operator.pos]) if operator.id in fixed else
                  interaction_cells(world, [w.pos for w in weapons], operator.pos))
         cells = [p for p in cells if p in distances and (operator.id in fixed or not world.defence_cells or p in world.defence_cells)]
+        if operator.id not in fixed:
+            cells = [p for p in cells if p not in getattr(world,'operator_excluded_cells',set())]
         for p in cells:
             if p not in features:
                 adjacent = [w for w in weapons if distance(p, w.pos) <= 1]
@@ -492,6 +514,7 @@ def triage(world, clock, task_actor, task, policy=None, risk_memory=None):
 def propose(world, clock, task_actor, task, deadline, policy=None, risk_memory=None, *, failed_steps=None):
     policy = policy or Policy()
     result = triage(world, clock, task_actor, task, policy, risk_memory)
+    triage_candidates = list(result.candidates)
     # Reserve a complete current-state route bundle before optional placement
     # optimization can exhaust its time budget. Keep triage candidates separate.
     if policy.return_commitment_enabled:
@@ -508,12 +531,18 @@ def propose(world, clock, task_actor, task, deadline, policy=None, risk_memory=N
                                                     firing_lanes_enabled=policy.firing_lanes_enabled,
                                                     handoff_enabled=policy.operator_handoff_enabled,
                                                     cycle_enabled=policy.operator_cycle_enabled)
+    before_rotation = refined_stands
+    if policy.rocket_rotation_enabled and not getattr(world, "task_side_plan", None):
+        refined_stands = advance_rockets(world, clock, refined_stands, deadline,
+            lambda p: exposure(world,clock,p), task_actor=task_actor,
+            allow_task_control=result.allow_task_control,
+            unavailable={c.actor for c in result.candidates}, failed_steps=failed_steps)
     refined = (return_plan(world, clock, refined_stands, policy, deadline, failed_steps=failed_steps)
                if policy.return_commitment_enabled else ({}, []))
     if refined is not None and result.operator_stands.keys() <= refined_stands.keys():
         result.operator_stands = refined_stands
         baseline = refined
-        result.operator_plan_status = "optimized"
+        result.operator_plan_status = "optimized_cooldown_advance" if refined_stands != before_rotation else "optimized"
     result.return_routes = baseline[0]
     result.candidates.extend(baseline[1])
     # If the gun stand is unreachable, enter an available interior cell first.
@@ -522,7 +551,7 @@ def propose(world, clock, task_actor, task, deadline, policy=None, risk_memory=N
     # role back to its previous position forever instead of reaching the gun.
     if world.defence_cells:
         for actor in world.movers:
-            if actor.id == task_actor or actor.pos in world.defence_cells or actor.id in result.return_routes:
+            if actor.id not in defender_ids(world) or actor.id == task_actor or actor.pos in world.defence_cells or actor.id in result.return_routes:
                 continue
             goals = set(world.defence_cells)-world.occupied
             field = distance_field(world, [actor.pos], actor.pos, deadline)
@@ -540,9 +569,9 @@ def propose(world, clock, task_actor, task, deadline, policy=None, risk_memory=N
     # destination. The base is a landmark, not assumed invulnerability.
     if world.stations and policy.pioneer_defence_enabled:
         for actor in world.movers:
-            if (actor.kind != "pioneer" and not world.defence_cells) or actor.id == task_actor or actor.id in result.return_routes:
+            if actor.id not in defender_ids(world) or (actor.kind != "pioneer" and not world.defence_cells) or actor.id == task_actor or actor.id in result.return_routes:
                 continue
-            goals = (set(world.defence_cells)-world.occupied if world.defence_cells else interaction_cells(world, [p for station in world.stations for p in station.cells], actor.pos))
+            goals = (set(world.defence_cells)-(world.occupied-{actor.pos}) if world.defence_cells else interaction_cells(world, [p for station in world.stations for p in station.cells], actor.pos))
             field = distance_field(world, [actor.pos], actor.pos, deadline)
             reachable = goals & field.keys()
             if not reachable:
@@ -559,7 +588,7 @@ def propose(world, clock, task_actor, task, deadline, policy=None, risk_memory=N
         relaxed = copy(world)
         relaxed.occupied = world.occupied-{u.pos for u in world.movers}
         for actor in world.movers:
-            if actor.id == task_actor or actor.pos in world.defence_cells or actor.id in result.return_routes:
+            if actor.id not in defender_ids(world) or actor.id == task_actor or actor.pos in world.defence_cells or actor.id in result.return_routes:
                 continue
             field = distance_field(relaxed,world.defence_cells,actor.pos,deadline)
             if actor.pos not in field:
@@ -576,7 +605,11 @@ def propose(world, clock, task_actor, task, deadline, policy=None, risk_memory=N
                 if blocker.id == task_actor or blocker.pos not in path or not prior:
                     continue
                 stand = prior["stand"]
-                if not prior["length"]:
+                from .gate_traffic import outward_clearance
+                outward = outward_clearance(world, clock, blocker, path, policy, deadline)
+                if outward is not None:
+                    stand = outward
+                elif not prior["length"]:
                     # The only inner landing may itself be a gun's current
                     # stand. Vacate it, including diagonal movement permitted
                     # by the rules; holding there cannot clear gate traffic.
@@ -588,7 +621,9 @@ def propose(world, clock, task_actor, task, deadline, policy=None, risk_memory=N
                 yielding = return_plan(world,clock,{blocker.id:stand},replace(policy,return_buffer=130),deadline)
                 if yielding is not None:
                     yielding[0][blocker.id]["yield_for"] = actor.id
-                    for candidate in yielding[1]:candidate.reason="clear teammate's blocked gate return route"
+                    for candidate in yielding[1]:
+                        candidate.reason = ("clear gate outward before returning teammate arrives" if outward is not None
+                                            else "clear teammate's blocked gate return route")
                     result.return_routes.update(yielding[0]);result.candidates.extend(yielding[1])
     # Daytime outbound traffic needs the same cooperation as night return.
     # Use a relaxed path only to identify a blocker, then issue a real legal
@@ -634,6 +669,33 @@ def propose(world, clock, task_actor, task, deadline, policy=None, risk_memory=N
             else:
                 continue
             break  # One controlled yield, recompute from next observed positions.
+    transit = transit_stands(world, clock, deadline)
+    transit_candidates = []
+    if transit:
+        ongoing_fixed = getattr(world,'night_roster',None) and world.night_roster.traffic.get('kind')=='fixed_w_return'
+        routed = return_plan(world, clock, transit, policy, deadline, failed_steps=failed_steps,
+                             force_due=bool(ongoing_fixed))
+        if routed is not None:
+            result.return_routes.update(routed[0])
+            for candidate in routed[1]:
+                candidate.reason = 'observed roster handoff or exterior economic endpoint'
+            result.candidates.extend(routed[1])
+            transit_candidates = routed[1]
+    roster = getattr(world, 'night_roster', None)
+    traffic = roster.traffic if roster else {}
+    for identity in getattr(world,'fixed_w_transit_actors',()):
+        result.roster_transit_actions[identity] = [c.command for c in
+            transit_candidates + triage_candidates if c.actor == identity]
+    if (clock.phases == {'night'} and roster and roster.handoff_requested
+            and traffic and not traffic.get('gate_owned')
+            and traffic.get('traveller') == roster.m and traffic.get('blocker') == roster.p):
+        # The replacement may have no route until P actually yields. That is
+        # still an active handoff, not spare time for an unrelated delivery.
+        # Keep its real moves and immediate rescue options; observation clears
+        # the traffic only after the traveller reaches its actual destination.
+        for identity in (roster.m, roster.p):
+            result.roster_transit_actions[identity] = [c.command for c in
+                transit_candidates + triage_candidates if c.actor == identity]
     for actor in world.movers:
         actor_task = task if actor.id == task_actor else None
         proposed, observation = lookahead.propose(world, clock, actor, actor_task, risk_memory,

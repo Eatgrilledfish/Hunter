@@ -27,6 +27,7 @@ class Diagnostics(logging.Handler):
         self.sequence = 0
         self.sessions = OrderedDict()
         self.external_counts = Counter()
+        self.max_health = {}
 
     @staticmethod
     def _brief(value, limit=160):
@@ -68,6 +69,14 @@ class Diagnostics(logging.Handler):
                 json.dumps(record,ensure_ascii=False,separators=(",", ":")).encode()) > 1400:
             value = record['result'];keep = len(value)//3
             record['result'] = value[:keep]+" … "+value[-keep:]
+            record['context_cut'] = True
+        # Keep current observations and actual receipts ahead of optional plan
+        # commentary when a duty event coincides with an existing issue line.
+        for section, key in (('gate','reason'),('gate','planned_worker'),
+                             ('gate','gate_confirmed_round'),('forage','mine')):
+            if len(json.dumps(record,ensure_ascii=False,separators=(",", ":")).encode()) <= 1400:
+                break
+            obj(obj(record.get('duty')).get(section)).pop(key,None)
             record['context_cut'] = True
         print("HUNTER " + json.dumps(record,ensure_ascii=False,separators=(",", ":")),flush=True)
 
@@ -116,6 +125,100 @@ class Diagnostics(logging.Handler):
                     count = self.external_counts[event]
                     if count == 1 or count % self.interval == 0:
                         self._write_compact(event,count=count,detail=issue)
+
+    def _duty_summary(self, raw, response, decision, units):
+        """Bounded observations and selected actions, never predicted receipts."""
+        layout = obj(decision.get('task_side_layout'))
+        roster = obj(decision.get('night_roster'))
+        gate = obj(decision.get('external_gate'))
+        if not layout.get('c') and not roster and not gate:
+            return {}, None
+        number = raw.get('roundNo')
+        commands = obj(response.get('roleCommandMap'))
+        point = lambda p: list(p) if isinstance(p, (list, tuple)) and len(p) == 2 else None
+        duty = {}
+        if layout.get('c'):
+            duty['layout'] = {k:point(layout.get(k)) for k in ('c','w','gate')}
+        if roster:
+            duty['roster'] = {
+                k:self._brief(str(roster[k]),32)+'@'+self._pos(obj(units.get(str(roster[k]))).get('pos'))
+                for k in ('w','p','m') if roster.get(k) is not None}
+            duty['roster'].update(defenders=[str(i)[:32] for i in roster.get('defenders',[])[:3]],
+                defender_count=len(roster.get('defenders',[])),
+                handoff=bool(roster.get('handoff_requested')),yielding=[str(i)[:32] for i in roster.get('yielding',[])[:3]])
+            if roster.get('exit_pending'):
+                duty['roster']['exit_pending'] = True
+        assignment = obj(gate.get('assignment_state'))
+        gate_point = point(gate.get('gate') or assignment.get('gate') or layout.get('gate'))
+        if gate:
+            details = {'stage':self._brief(gate.get('stage','unknown'),32)}
+            if gate_point is not None:
+                details['wall_observed'] = any(u.get('roleType')=='wall' and type(u.get('health')) is int
+                    and u['health']>0 and [obj(u.get('pos')).get('x'),obj(u.get('pos')).get('y')]==gate_point
+                    for u in units.values())
+            offer = obj(gate.get('assignment'))
+            worker = assignment.get('worker') or offer.get('worker') or gate.get('builder') or gate.get('opener')
+            if worker is not None:
+                details['planned_worker'] = str(worker)[:32]
+            pending = obj(assignment.get('pending'))
+            issued = obj(commands.get(str(pending.get('actor'))))
+            if pending.get('round')==number and issued and issued==pending.get('command'):
+                details['issued'] = [str(pending['actor'])[:32],issued.get('action')]
+            else:
+                for identity, command in commands.items():
+                    targets = command.get('targetPos',[])
+                    if command.get('action') in ('build','remove') and targets and gate_point is not None and (
+                            [targets[0].get('x'),targets[0].get('y')]==gate_point):
+                        details['issued'] = [str(identity)[:32],command['action']]
+                        break
+            receipts = assignment.get('observed',[])
+            if receipts:
+                receipt = receipts[-1]
+                details['receipt'] = {k:receipt.get(k) for k in ('round','actor','action','confirmed','feedback')}
+                details['receipt']['actor'] = str(receipt.get('actor'))[:32]
+            if assignment.get('gate_confirmed_round') is not None:
+                details['gate_confirmed_round'] = assignment['gate_confirmed_round']
+            if gate.get('reason'):
+                details['reason'] = self._brief(gate['reason'],64)
+            duty['gate'] = details
+        repairs = {}
+        for identity, repair in obj(decision.get('repair')).items():
+            if not isinstance(repair,dict) or len(repairs)>=2:
+                continue
+            wall = obj(units.get(str(repair.get('wall'))))
+            actor = obj(units.get(str(identity)))
+            bag = actor.get('backpack')
+            repairs[str(identity)[:32]] = dict(phase=self._brief(repair.get('phase'),24),wall=str(repair.get('wall'))[:32],
+                hp=[wall.get('health'),self.max_health.get('wall',{}).get(wall.get('level'))],
+                stock=bag.count('WallFixer') if isinstance(bag,list) else None,
+                remaining=repair.get('remaining_actions'),cd=repair.get('observed_cooldown'),
+                selected=bool(repair.get('selected')),delayed=repair.get('delayed_fire'))
+        if repairs:
+            duty['repair'] = repairs
+        origin = decision.get('origin')
+        if type(number) is int and type(origin) is int and origin in (0,1) and (number-origin)%130>=70:
+            remaining = 130-(number-origin)%130
+            mining = obj(gate.get('mining'));cashout=obj(gate.get('cashout'));purchase=obj(gate.get('purchase'))
+            trade = cashout if cashout.get('required') is not None else purchase
+            action = (obj(commands.get(str(roster.get('m')))).get('action')
+                      if roster.get('m') not in roster.get('defenders',()) else None)
+            duty['forage'] = dict(dawn_round=number+remaining if (number-origin)//130+1<10 else None,
+                                  night_end_round=number+remaining-1,remaining=remaining,
+                                  issued=action if action in ('move','collect','sell','buy','remove') else None)
+            if trade.get('required') is not None:
+                duty['forage']['planned_checkout_actions'] = trade['required']
+            if mining.get('mine'):
+                duty['forage']['mine'] = point(mining['mine'])
+        # Progress coordinates/countdowns do not consume a new change event on
+        # every move. They are retained in the next periodic observed snapshot.
+        marker = (tuple(tuple(layout.get(k) or ()) for k in ('c','w','gate')),
+            tuple(roster.get('defenders',())),bool(roster.get('handoff_requested')),
+            tuple(roster.get('yielding',())),bool(roster.get('exit_pending')),
+            gate.get('stage'),obj(duty.get('gate')).get('wall_observed'),
+            assignment.get('gate_confirmed_round'),
+            tuple((i,r['phase'],r['wall'],r['selected']) for i,r in repairs.items()),
+            obj(duty.get('forage')).get('issued'))
+        return duty, marker
 
     def _llm_turn(self,state,raw,response,task,number):
         pending=state.get('llm_trace_pending');logged=False
@@ -230,6 +333,8 @@ class Diagnostics(logging.Handler):
                         exit=tool.get("exit"),usable=tool.get("usable"),answer_usable=tool.get('answer_usable'),
                         failure=tool.get('failure'),cwd=tool.get('cwd'),entries=(tool.get('entries') or [])[:8],
                         adapters=tool.get('adapters',[]),
+                        contract=tool.get('contract',{}),runtime=(tool.get('runtime',[])[:1] + tool.get('runtime',[])[-1:]
+                            if len(tool.get('runtime',[])) > 1 else tool.get('runtime',[])),
                         root_entries=(tool.get('root_entries') or [])[:8],
                         program=str(tool.get('program') or '')[:12],docs=tool.get('docs'),result=self._brief(tool.get("result",""),480),
                         result_round=tool.get("round"))
@@ -253,6 +358,9 @@ class Diagnostics(logging.Handler):
                     state["task_faults"] = {fault_key}
             task_marker = (task.get("id"),task.get("phase"),task.get("file"),task.get("read"),task.get("end"))
             task_changed = task_marker != state["task"] and bool(task.get("id") or task.get("end"))
+            decision = getattr(self.local,'decision',{})
+            duty, duty_marker = self._duty_summary(raw,response,decision,units)
+            duty_changed = duty_marker is not None and duty_marker != state.get('duty_marker')
             # Keep the latest issue sample in periodic summaries even when
             # repeated individual reports are suppressed.
             if issues or failures:
@@ -263,7 +371,7 @@ class Diagnostics(logging.Handler):
             if len(state["seen"])>32:
                 state["seen"] = set(issues)
             periodic = state["calls"] % self.interval == 0
-            trigger = new_failure or fresh_issue or task_changed
+            trigger = new_failure or fresh_issue or task_changed or duty_changed
             # At most two extra lines per twenty accepted observations. The
             # periodic summary retains counters and the latest suppressed issue.
             urgent = critical and fresh_issue and not state["critical_reported"]
@@ -298,7 +406,7 @@ class Diagnostics(logging.Handler):
                           if u.get("roleType") in {"gatling","railgun","rocket"}][:3],
                     commands=commands,task=task,reasons=reasons,channels=channels,
                     work=decision.get("work_status"),
-
+                    **({'duty':duty} if duty else {}),
                     issue=state["issues"] if periodic else (issues+failures)[:3],
                     issue_round=state["issue_round"] if periodic else number if issues or failures else None,
                     stats=dict(state["stats"]),ms=round(elapsed,1),outcome=self.local.outcome)
@@ -319,7 +427,8 @@ class Diagnostics(logging.Handler):
             targets = {str(actor):self._brief(','.join(occupied.get(self._pos(p),'') for p in array(cmd.get('targetPos'))[:3]),100)
                        for actor,cmd in response.get('roleCommandMap',{}).items() if cmd.get('action')=='move'}
             state.update(round=number,commands=commands,units={i:{"pos":u.get("pos")} for i,u in units.items()},targets=targets,
-                         attacks={c.get("weapon"):c for c in getattr(self.local,"attacks",[])},task=task_marker)
+                         attacks={c.get("weapon"):c for c in getattr(self.local,"attacks",[])},task=task_marker,
+                         duty_marker=duty_marker)
             if periodic:
                 state["stats"].clear()
                 state["details"] = 0
@@ -362,6 +471,7 @@ class Diagnostics(logging.Handler):
                    if record.exc_info else None)
 
     def startup(self, agent):
+        self.max_health = {kind:dict(levels) for kind,levels in agent.rules.max_health.items()}
         root = Path(__file__).resolve().parents[2]
         hashes = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
                   for p in sorted((root / "CoreGeek").rglob("*"))
@@ -370,7 +480,9 @@ class Diagnostics(logging.Handler):
         if self.mode == "compact":
             self._write_compact("startup",mode="compact",every=self.interval,python=sys.version.split()[0],
                 sdk=hashlib.sha256(json.dumps(hashes,sort_keys=True).encode()).hexdigest()[:12],
-                config=hashlib.sha256(repr((agent.rules,agent.policy)).encode()).hexdigest()[:12],bind="0.0.0.0")
+                config=hashlib.sha256(repr((agent.rules,agent.policy)).encode()).hexdigest()[:12],bind="0.0.0.0",
+                strategy={'staged_walls':agent.policy.staged_walls_enabled,
+                          'economy_first':agent.policy.economy_first_enabled})
             return
         self.event("startup", python=sys.version, pid=os.getpid(), files=hashes,
                    entrypoint=str(root / "CoreGeek/main3.py"), cwd=os.getcwd(),

@@ -78,7 +78,7 @@ class LayoutGuard:
             return True, "no new structural blockage"
         if self.world.battery_plan is not None:
             for _,kind,point in builds:
-                if point not in battery.cells(self.world,kind,{point}):
+                if point not in battery.construction_cells(self.world,kind,{point}):
                     return False, "build conflicts with reserved battery site or firing port"
         if builds in self.cache:
             return self.cache[builds]
@@ -98,15 +98,22 @@ class LayoutGuard:
         walls = {u.pos for u in self.world.ours.values() if u.alive and u.kind == "wall"}
         seal = (bool(self.world.seal_cells) and all(kind == "wall" for _, kind, _ in builds)
                 and added <= self.world.seal_cells and self.world.seal_cells <= walls | added)
+        from .external_gate import valid_seal
+        external = seal and valid_seal(self.world, builds)
+        outside_id = self.world.external_gate_permit['m'] if external else None
         facilities = self.internal_facilities if seal else self.facilities
         for identity, source in self.sources.items():
             old, new = self.before.get(source), after.get(source)
             if old is None or new is None:
                 return finish(False, "layout cannot establish mobile access")
-            for other in self.sources.values():
+            for other_id, other in self.sources.items():
                 if self.before.get(other) == old and after.get(other) != new:
+                    if external and ((identity==outside_id)!=(other_id==outside_id)):
+                        continue
                     return finish(False, "build bundle separates previously connected teammates")
-            for goals in facilities:
+            required = ([g for g in self.facilities if g not in self.internal_facilities]
+                        if external and identity==outside_id else facilities)
+            for goals in required:
                 if any(self.before.get(p) == old for p in goals) and not any(after.get(p) == new for p in goals):
                     return finish(False, "build bundle cuts access to a current facility")
             if any(self.before.get(p) == old for p in neighbours(source)) and not any(after.get(p) == new for p in neighbours(source)):

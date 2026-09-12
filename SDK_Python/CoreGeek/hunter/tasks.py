@@ -9,14 +9,25 @@ from .protocol import distance, fingerprint, obj, array, integer, strict_json
 from .sandbox import parse_result, discovery, compile_operation, task_documents, locate_task
 from .documents import DocumentLedger
 from .answer_contract import contract as answer_contract, validate as validate_answer
+from .task_payload import pack_evidence
+from .program_recipes import ProgramRecipes, arguments as program_arguments
+from .task_timing import TaskTiming, descriptor as timing_descriptor
+from .task_checkpoints import remember as remember_checkpoint, checkpoint as task_checkpoint
 
 
 def execution_failure(data):
     """Recognize explicit execution errors; zero records alone are not a failure."""
+    for event in data.get('runtime_events', []):
+        if isinstance(event, dict) and event.get('kind') == 'http':
+            status = event.get('status')
+            if status == 401:return 'api_authentication_failed'
+            if type(status) is int and status >= 400:return 'api_request_failed'
+            if event.get('error'):return 'api_request_failed'
     text = data.get('text', '')
     if not isinstance(text, str):return None
     if re.search(r'HTTP(?: Error)?\s*401\b|401[: ]+Unauthorized', text, re.I):
         return 'api_authentication_failed'
+    if re.search(r'HTTP(?: Error)?\s*[45][0-9]{2}\b', text, re.I):return 'api_request_failed'
     if 'FileNotFoundError' in text and 'No such file or directory' in text:
         return 'file_or_interpreter_missing'
     return None
@@ -37,24 +48,59 @@ class LLMBudget:
     history_known: bool = False
     attempts: int = 0
     blocked: bool = False
+    calendars: dict = field(default_factory=dict)
+    active_origins: tuple = ()
+    last_round: int = -1
+    refundable: bool = False
+
+    def _sync(self):
+        states = [self.calendars[o] for o in self.active_origins]
+        self.history_known = bool(states) and all(s['known'] for s in states)
+        self.attempts = max((s['attempts'] for s in states), default=0)
+        self.blocked = any(s['blocked'] for s in states)
 
     def reconcile(self, world, clock):
-        # Mid-day process startup cannot establish earlier usage. An observed
-        # certain day boundary does; a later day than a known history also does.
-        boundary = clock.origin is not None and (world.round-clock.origin) % 130 == 0
-        new_day = clock.day is not None and self.history_known and clock.day != self.day
-        if (boundary or new_day) and clock.day != self.day:
-            self.day, self.history_known, self.attempts, self.blocked = clock.day, True, 0, False
+        # Unknown origin is two possible ledgers, not permanently unknown usage.
+        # A request consumes one slot in EVERY possible current day. Resets are
+        # independent, so using the 0-origin reset cannot spend a fourth slot
+        # in the still-current 1-origin day (and vice versa).
+        if clock.round < self.last_round:
+            return
+        if clock.round > self.last_round:
+            self.refundable = False
+        self.last_round = clock.round
+        self.active_origins = clock.offsets
+        self.day = clock.day
+        for origin in self.active_origins:
+            day = (clock.round-origin)//130 + 1
+            old = self.calendars.get(origin)
+            if old is None or day > old['day']:
+                known = old is not None or (clock.round-origin) % 130 == 0
+                self.calendars[origin] = dict(day=day, known=known, attempts=0, blocked=False)
         if any(obj(e).get("errorCode") == 5 for e in array(world.raw.get("errors"))):
-            self.blocked = True
+            for origin in self.active_origins:
+                self.calendars[origin]['blocked'] = True
+        self._sync()
 
     def reserve(self, active_task=False):
         if active_task:
             return True
         if not self.history_known or self.blocked or self.attempts >= 3:
             return False
-        self.attempts += 1
+        for origin in self.active_origins:
+            self.calendars[origin]['attempts'] += 1
+        self.refundable = True
+        self._sync()
         return True
+
+    def cancel_unissued(self):
+        """Cancel only this turn's last tentative reservation, before emission."""
+        if not self.refundable:
+            return
+        for origin in self.active_origins:
+            self.calendars[origin]['attempts'] -= 1
+        self.refundable = False
+        self._sync()
 
 
 @dataclass
@@ -88,6 +134,8 @@ class TaskInstance:
     statement_empty: bool = False
     locate_attempts: int = 0
     locate_round: int = -1
+    timing_descriptor: tuple | None = None
+    checkpoints: list = field(default_factory=list)
 
 
 def binding_value(task_text, argument):
@@ -131,6 +179,8 @@ def recipe_family(text, plan):
 
 def bind_plan(text, plan, evidence=None):
     bound = dict(plan)
+    if plan.get('operation') == 'run_python':
+        bound['args'] = program_arguments(text, plan, evidence or {})
     if plan.get("operation") == "run_tool":
         plan_values(plan)  # Validate arrays before iterating a model-provided value.
         if len(plan.get("args", [])) > 32 or len(plan.get("inputs", [])) > 7:
@@ -329,6 +379,8 @@ class SkillStore:
                         needed.add(dependency)
                         pending.append(dependency)
         ordered = [e for e in task.executions if e["evidence"] in needed]
+        if any(e['plan'].get('operation') != 'run_tool' for e in ordered):
+            return  # Generated programs have their own document-bound recipes.
         if not 2 <= len(ordered) <= 8:
             return
         indices = {e["evidence"]: i for i, e in enumerate(ordered)}
@@ -507,6 +559,8 @@ def evidence_answer(task, spec):
 
 @dataclass
 class TaskEngine:
+    timing: TaskTiming = field(default_factory=TaskTiming)
+    programs: ProgramRecipes = field(default_factory=ProgramRecipes)
     receipt_namespace: str = field(default_factory=lambda: uuid.uuid4().hex)
     active: TaskInstance | None = None
     accept_pending: dict | None = None
@@ -520,6 +574,7 @@ class TaskEngine:
     def _close(self, reason, world):
         task = self.active
         if task:
+            self.timing.close(task, reason, world.round)
             self.closed.append({"key": task.key, "reason": reason, "round": world.round,
                                 "outcome": "UNKNOWN", "submitted": task.submitted[-16:],
                                 "events": task.events[-16:],
@@ -535,7 +590,8 @@ class TaskEngine:
         submitted = task.submitted[-1] if task.submitted else None
         # These signals have no task/command identity. A skipped round cannot
         # prove which submission they describe, even when the task text agrees.
-        if submitted is None or submitted["round"] != world.round-1:
+        if (submitted is None or submitted["round"] != world.round-1
+                or submitted.get("task_key", task.key) != task.key):
             task.events.append({"kind": "submission_feedback_unattributed", "round": world.round})
             return
         errors = []
@@ -562,6 +618,13 @@ class TaskEngine:
                             **submitted["feedback"]})
         if not errors:
             return
+        # Only programs contributing to this actual submission are affected.
+        # Accepted action != correct answer; description is optional. Reconcile
+        # invokes this before closing an empty phaseTask, but never across a
+        # replaced task text or a skipped submission-feedback round.
+        for identity in submitted.get("program_recipe_ids", ()):
+            self.programs.reject(identity)
+        task.checkpoints.clear()
         record = self.skills.match(task, check_inputs=False)
         if record and record.get("extractor"):
             record["validation_level"] = "SUSPECT"
@@ -617,6 +680,7 @@ class TaskEngine:
             self.generation += 1
             key = f"{epoch}:{self.generation}:{accepted_round}:{fingerprint(text)[:16]}"
             self.active = TaskInstance(key, pioneer.id, text, cells, accepted_round, world.round, timeout)
+            self.active.timing_descriptor = timing_descriptor(task_info, cells)
             self.active.statement_names = task_documents(text)
             self.active.evidence["task"] = {"source": "task", "round": world.round,
                                              "usable": True, "data": {"text": text, "completeness": "complete"}}
@@ -770,6 +834,17 @@ class TaskEngine:
                 task.environment["root"] = root
                 task.statement_path = statement
                 task.command_plan = {"operation": "read_slice", "path": statement, "limit": 8192}
+                for index, document in enumerate(data.pop('documents', [])[:3]):
+                    try:
+                        doc_id = evidence_id + ':doc' + str(index)
+                        inspected = task.documents.ingest(document, doc_id)
+                        task.evidence[doc_id] = {'source':'sandbox', 'round':world.round, 'usable':True, 'data':inspected}
+                        if inspected.get('path') == statement and inspected.get('completeness') == 'complete':
+                            task.statement_ready = bool((inspected.get('text') or '').strip())
+                            task.statement_empty = not task.statement_ready
+                            task.command_plan = None
+                    except (ValueError, TypeError, KeyError):
+                        task.events.append({'kind':'bundled_document_invalid','round':world.round})
         if usable and pending["operation"] == "read_slice":
             try:
                 data = task.documents.ingest(data, evidence_id)
@@ -798,7 +873,10 @@ class TaskEngine:
             else:
                 self.skills.invalidate_pending(pending)
         failure = execution_failure(data) if pending['operation'] in {'run_tool','run_python'} else None
+        if not usable or failure:
+            self.programs.reject(pending.get('program_id'))
         task.evidence[evidence_id] = {"answer_usable": usable and not failure, "failure": failure, "source": "sandbox", "round": world.round, "usable": usable,
+                                      "bound_hash":pending.get('bound_hash'),
                                       "nonce": pending["context"]["nonce"], "data": data or parsed}
         task.events.append({"kind": "sandbox_result", "status": data.get("status", parsed["status"]),
                             "op":pending["operation"], "round": world.round,
@@ -808,13 +886,30 @@ class TaskEngine:
                             "cwd":data.get('cwd'), "entries":data.get('cwd_entries'), "root_entries":data.get('root_entries'),
                             "program":data.get('file_sha256'),
                             "adapters":data.get('program_adapters',[]),
+                            "contract":data.get('program_contract',{}),
+                            "runtime":data.get('runtime_events',[]),
                             "docs":[{'path':e.get('data',{}).get('path'), 'complete':e.get('data',{}).get('completeness')=='complete'}
                                     for e in task.evidence.values() if e.get('data',{}).get('operation')=='read_slice'][-6:],
                             "result":result_excerpt(data.get("data", data.get("text", data.get("error", ""))))
                                       if pending["operation"] in {"run_tool", "run_python"} else ""})
         if usable and not failure and pending.get("plan"):
-            if pending["operation"] == "run_tool" and data.get("completeness") == "complete":
+            output = pending['plan'].get('answer_output')
+            if isinstance(output, dict) and data.get('completeness') == 'complete':
+                try:
+                    task.answer = evidence_answer(task, {'format':output.get('format'),
+                        'evidence_refs':[evidence_id], 'partial':output.get('partial') is True,
+                        'extract':{'evidence':evidence_id,'selector':output.get('selector')}})
+                    if any(s['hash'] == task.answer['hash'] for s in task.submitted):task.answer = None
+                except (ValueError, KeyError, TypeError):
+                    task.events.append({'kind':'answer_output_rejected','round':world.round})
+                    self.programs.reject(pending.get('program_id'))
+                    remember_checkpoint(task, {'format':output.get('format'),
+                        'evidence_refs':[evidence_id],
+                        'extract':{'evidence':evidence_id,'selector':output.get('selector')}})
+            if pending["operation"] in {"run_tool", "run_python"} and data.get("completeness") == "complete":
                 task.executions.append({"plan": pending["plan"], "evidence": evidence_id,
+                                        "program_id": pending.get("program_id"),
+                                        "bound_hash": pending.get("bound_hash"),
                                         "file_sha256": data.get("file_sha256"), "manifest": data.get("manifest"), "round": world.round})
                 task.executions = task.executions[-32:]
             self.skills.observe_tool(task, pending["plan"], data, world.round)
@@ -841,9 +936,12 @@ class TaskEngine:
                 del task.evidence[key]
         task.sandbox_pending = None
 
-    def candidates(self, world):
+    def candidates(self, world, *, choice=None):
         if self.active:
             task = self.active
+            if (task.answer is None and task.accept_round is not None and task.timeout is not None
+                    and world.round >= task.accept_round + task.timeout - 2):
+                task.answer = task_checkpoint(task)
             if task.answer and task.answer["hash"] not in {s["hash"] for s in task.submitted}:
                 return [Candidate(task.actor, {"action": "submitAnswer", "taskAnswer": task.answer["text"]},
                                   200, "submit current-task evidence candidate; correctness unconfirmed")]
@@ -854,6 +952,12 @@ class TaskEngine:
         for actor in world.movers:
             if actor.kind != "pioneer":
                 continue
+            if choice is not None and actor.id == choice['actor']:
+                selected = choice['selected']
+                if selected is None or selected['goal'] != actor.pos:
+                    continue
+                if selected['task'].get('isValid') is not True or selected['task'].get('coldDownRounds') != 0:
+                    continue
             if any(t.get("isValid") is True and type(t.get("coldDownRounds")) is int and t["coldDownRounds"] == 0
                    and any(distance(actor.pos, p) <= 1 for p in world.task_cells(t)) for t in world.tasks):
                 result.append(Candidate(actor.id, {"action": "acceptTask"}, 20, "accept available adjacent own task"))
@@ -887,7 +991,18 @@ class TaskEngine:
             return  # Tool eligibility is rechecked after observing actual movement.
         if action.get("action") == "submitAnswer":
             task.phase = "SUBMIT_PENDING"
-            task.submitted.append({**task.answer, "round": world.round, "observed_pass_rate": None})
+            sources = [e for e in task.executions
+                       if e["evidence"] in task.answer.get("evidence_refs", ())]
+            recipe_ids = {e["program_id"] for e in sources if e.get("program_id")}
+            submission = {**task.answer, "round": world.round, "task_key": task.key,
+                          "observed_pass_rate": None,
+                          "program_sources": [{"evidence": e["evidence"],
+                                               "program_id": e.get("program_id"),
+                                               "file_sha256": e.get("file_sha256"),
+                                               "bound_hash": e.get("bound_hash")}
+                                              for e in sources]}
+            task.submitted.append(submission)
+            task.checkpoints.clear()  # Never later fall back to an older, weaker answer.
             task.submitted = task.submitted[-16:]
             if task.answer["basis"] == "deterministic_extraction":
                 reference = task.answer["spec"]["extract"]["evidence"]
@@ -896,6 +1011,11 @@ class TaskEngine:
                 source = task.evidence.get(reference, {}).get("data", {})
                 if record and source.get("operation") == "run_tool" and source.get("path") == record["plan"]["path"] and source.get("file_sha256") == record["file_sha256"]:
                     record["extractor"] = task.answer["spec"]
+                if execution:
+                    learned_id = self.programs.learn(task, execution, task.answer)
+                    if learned_id:
+                        recipe_ids.add(learned_id)
+            submission["program_recipe_ids"] = sorted(recipe_ids)
             self.skills.observe_workflow(task, task.answer)
             task.answer = None
             return  # Never rely on exemption/sandbox surviving submission.
@@ -930,6 +1050,7 @@ class TaskEngine:
             plan = task.command_plan
             skill = None
             workflow = None
+            program_id = None
             if plan is None:
                 if not any(e["data"].get("operation") == "list_dir" or e["data"].get("root_listing_complete") is True
                            for e in task.evidence.values() if e.get("usable")):
@@ -953,6 +1074,11 @@ class TaskEngine:
                                  and 'spec.md' in documents and p+'/spec.md' not in read]
                         if len(specs)==1:
                             plan = {'operation':'read_slice','path':specs[0],'limit':8192}
+                    if plan is None and self.reuse_enabled and not task.executions:
+                        plan, program_id = self.programs.next(task)
+                        if program_id:
+                            task.events.append({'kind':'program_recipe_reuse', 'round':world.round,
+                                                'recipe':program_id[:12]})
                     if plan is None and self.reuse_enabled and (task.workflow_id or not task.executions):
                         plan, workflow = self.skills.workflow_next(task)
                     if plan is None and not task.workflow_id:
@@ -967,13 +1093,20 @@ class TaskEngine:
                     bound = bind_plan(task.text, plan, task.evidence)
                     if fingerprint(bound) in task.uncertain_operations:
                         raise ValueError("operation may already have executed; inspect state first")
+                    if any(e.get('failure') and e.get('bound_hash') == fingerprint(bound)
+                           for e in task.evidence.values()):
+                        raise ValueError('identical failed operation: inspect or change the failed inputs before retry')
                     environment = {**task.environment, "receipt_namespace": self.receipt_namespace}
                     response["executeCmd"] = compile_operation(context, bound, environment, task.evidence)
                     task.sandbox_pending = {"round": world.round, "context": context, "operation": plan["operation"],
                                             "plan": plan, "bound_hash": fingerprint(bound),
                                             "skill_id": skill["id"] if skill else None,
+                                            "program_id": program_id,
                                             "workflow_id": workflow["id"] if workflow else None}
+                    if plan['operation'] in {'run_python','run_tool'} and plan.get('effect') != 'read_only':
+                        task.checkpoints.clear()
                 except (ValueError, TypeError, KeyError) as exc:
+                    self.programs.reject(program_id)
                     task.events.append({"kind": "invalid_command_plan", "round": world.round, "reason": str(exc)[:512],
                                         "op":plan.get("operation"), "path":str(plan.get("path", "."))[:160]})
                     task.plan_failures += 1
@@ -981,29 +1114,7 @@ class TaskEngine:
         if task.llm_pending is None and not response["executeCmd"] and task.sandbox_pending is None:
             if self.budget.reserve(active_task=True):
                 context = self._context(task, "choose_next_task_step")
-                evidence = []
-                used = 0
-                for key, record in reversed(list(task.evidence.items())):
-                    # Transport identities belong to the wrapper, not task evidence.
-                    # Showing older sandbox contexts beside the current request
-                    # encourages accidental copying of the wrong nonce.
-                    clean = dict(record.get("data", {}))
-                    clean.pop("context", None)
-                    if isinstance(clean.get("text"), str):
-                        clean.pop("bytes_base64", None)
-                    item = {"id": key, **record, "data":clean}
-                    item.pop("nonce", None)
-                    size = len(json.dumps(item, ensure_ascii=False))
-                    if size > 16000 and record.get("source") == "sandbox":
-                        data = dict(item["data"])
-                        if isinstance(data.get("text"), str):
-                            data["text_chars_in_evidence"] = len(data.pop("text"))
-                            data["text_omitted_from_prompt"] = True
-                            item = {**item, "data": data}
-                            size = len(json.dumps(item, ensure_ascii=False))
-                    if used + size <= 24000:
-                        evidence.append(item)
-                        used += size
+                evidence, document_coverage = pack_evidence(task)
                 instructions = (
                     "完成当前任务的实际工作，不能把题目概述、操作计划或错误信息当成答案。读题后直接执行必要步骤，最后提交结果。 "
                     "API题必须实际调用题面接口并计算；工程题必须在题目工作区修复并运行检查获取结果，不能仅复述说明。 "
@@ -1013,10 +1124,17 @@ class TaskEngine:
                     "Use task-documented local APIs/commands; do not assume that API means an internet endpoint. "
                     "execute requires command_plan: {operation:list_dir|read_slice|run_tool|run_python,path:relative path discovered in listings or explicitly named in current read documentation}. "
                     "run_python executes your code in the competition sandbox, never in the HTTP callback. "
+                    "For reusable programs, pass args:[strings or {task_prefix,task_suffix} bindings from task text, "
+                    "or {document_path,task_prefix,task_suffix} bindings from a completely read current document]. "
+                    "Read these values from sys.argv[1:] in Python; do not embed the old city, credential or task parameter in code. "
+                    "Bindings require unique nonempty delimiters; unchanged document content is checked before reuse. "
                     "Use {operation:run_python,path:discovered or documented working directory,code:Python source,effect:read_only|mutation, "
                     "evidence_refs:[ids of fully read task/API/spec documents]}. "
                     "Use it for documented local API calls, computing statistics, editing task workspace files, and invoking the actual documented checker. "
                     "Before any API request, read its actual API documentation including authentication, pagination and response schema. "
+                    "prompt_document_coverage distinguishes verified files from content actually sent to you. "
+                    "For partial documents text_segments contains exact character ranges; omitted gaps remain unknown. "
+                    "Read missing relevant sections before using their authentication, schema or checker requirements; read_slice offsets are bytes, not characters. "
                     "Encode Chinese query values with urllib.parse.urlencode; never concatenate raw Chinese into a URL. "
                     "On 401 or any failed page, stop and fix documented authentication; do not compute an answer from empty/partial records. "
                     "Never invent a plausible API key. Copy the documented header name, prefix and credential source exactly. "
@@ -1029,6 +1147,9 @@ class TaskEngine:
                     "Batch related reads/calculations/checks in one run_python to save rounds. Print necessary documents when more information is needed. "
                     "Read the spec before changing files; restrict all work to the authorized task. "
                     "Print a compact JSON result with actual values/check token. Runtime is bounded to 11 seconds; "
+                    'When this execution prints the FINAL answer as JSON, add "answer_output":{"format":"json","selector":["data"],"partial":false} '
+                    "to command_plan (use JSON strings for json/data). SDK extracts and submits only a complete successful result; "
+                    "omit answer_output for inspection or intermediate API pages. This saves a model round. "
                     "code runs with cwd=path and standard Python environment, with no implicit local import path. "
                     "If path is ws_1, open('spec.md') and subprocess.run(['./check']) are already inside ws_1; do NOT set cwd='ws_1' again. "
                     "Do not use fictitious example data, endpoints, fields, or tokens. "
@@ -1063,6 +1184,9 @@ class TaskEngine:
                            "allowed_intents":["answer"] if final_answer_only else ["execute", "answer", "inspect"],
                            "task_truncated_locally": len(task.text) > 16384,
                            "answer_contract": answer_contract(task),
+                           "saved_partial_checkpoints":[{'fields':r['fields'],'hash':r['candidate']['hash']}
+                                                        for r in task.checkpoints],
+                           "prompt_document_coverage": document_coverage,
                            "task_root":task.environment.get('root'),
                            "complete_document_refs":{key:e['data'].get('path') for key,e in task.evidence.items()
                                if e.get('usable') and e.get('data',{}).get('operation')=='read_slice'

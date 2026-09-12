@@ -1,0 +1,130 @@
+"""Source for diagnostics/preflight INSIDE the competition task subprocess."""
+
+
+def prelude(root):
+    return '_hunter_task_root = ' + repr(root) + '\n' + SOURCE
+
+
+SOURCE = r'''
+import atexit as _ha, json as _hj, os as _ho, shlex as _hs, shutil as _hh
+import subprocess as _hsub, sys as _hsys
+_hunter_events = []
+def _hunter_event(**record):
+    if len(_hunter_events) < 4:
+        _hunter_events.append(record)
+    elif record.get('error') or isinstance(record.get('status'), int) and record['status'] >= 400:
+        _hunter_events[-1] = record  # A late failed page must survive the log cap.
+def _hunter_report():
+    if _hunter_events:
+        print('\nHUNTER_RUNTIME:' + _hj.dumps(_hunter_events, ensure_ascii=True), file=_hsys.stderr, flush=True)
+_ha.register(_hunter_report)
+import urllib.request as _hr, urllib.parse as _hp, urllib.error as _he
+_hunter_http_open = _hr.OpenerDirector.open
+def _hunter_observe_http(self, url, data=None, timeout=5):
+    address = url.full_url if isinstance(url, _hr.Request) else url
+    local = isinstance(address, str) and _hp.urlsplit(address).hostname in ('localhost', '127.0.0.1')
+    try:
+        response = _hunter_http_open(self, url, data, timeout)
+        if local:_hunter_event(kind='http',status=response.status)
+        return response
+    except _he.HTTPError as exc:
+        if local:_hunter_event(kind='http',status=exc.code)
+        raise
+    except _he.URLError as exc:
+        if local:_hunter_event(kind='http',error=type(exc).__name__)
+        raise
+_hr.OpenerDirector.open = _hunter_observe_http
+_hunter_popen = _hsub.Popen
+class _HunterPopen(_hunter_popen):
+    def __init__(self, args, *positional, **kwargs):
+        # Only argv calls with keyword options can be inspected unambiguously.
+        # Never reinterpret a shell string, opaque executable override or flags.
+        if not positional and not kwargs.get('shell') and not kwargs.get('executable') and isinstance(args, (list, tuple)) and args:
+            executable = args[0]
+            cwd = _ho.path.abspath(kwargs.get('cwd') or _ho.getcwd())
+            if isinstance(executable, str) and '/' in executable:
+                path = _ho.path.abspath(_ho.path.join(cwd, executable))
+                real = _ho.path.realpath(path)
+                root = _ho.path.realpath(_hunter_task_root)
+                if _ho.path.commonpath([root, real]) == root:
+                    info = dict(kind='launch', cwd=_ho.path.relpath(cwd, root),
+                                path=_ho.path.relpath(path, root), exists=_ho.path.isfile(path),
+                                symlink=_ho.path.islink(path), executable=_ho.access(path, _ho.X_OK))
+                    if info['exists']:
+                        try:
+                            with open(path, 'rb') as source:
+                                line = source.readline(512)
+                            if line.startswith(b'#!') and len(line) < 512:
+                                parts = _hs.split(line[2:].decode('utf-8').strip())
+                                interpreter = parts[0] if parts else ''
+                                info.update(interpreter=interpreter[:100], crlf=line.endswith(b'\r\n'))
+                                available = _ho.path.isfile(interpreter) and _ho.access(interpreter, _ho.X_OK)
+                                info['interpreter_exists'] = available
+                                # Preserve the script bytes. Use only its declared
+                                # interpreter; don't substitute sh for bash or
+                                # Python 3 for an unknown Python version.
+                                replacement = interpreter if available else None
+                                if not replacement and _ho.path.basename(interpreter) == 'python3':
+                                    replacement = _hsys.executable
+                                if not replacement and _ho.path.basename(interpreter) in ('bash', 'sh'):
+                                    replacement = _hh.which(_ho.path.basename(interpreter))
+                                if replacement and (not available or info['crlf'] or not info['executable']):
+                                    args = [replacement, *parts[1:], path, *args[1:]]
+                                    info['repair'] = 'declared_interpreter'
+                        except (OSError, UnicodeError, ValueError) as exc:
+                            info['inspection_error'] = type(exc).__name__
+                    self._hunter_local_program = info.get("path")
+                    _hunter_event(**info)
+
+        # Recognize a direct script argument to an observed standard
+        # interpreter. Do not parse shell strings, -m/-c forms or argv flags.
+        if (not getattr(self,'_hunter_local_program',None) and not positional
+                and not kwargs.get('shell') and not kwargs.get('executable')
+                and isinstance(args,(list,tuple)) and len(args)>=2
+                and isinstance(args[0],str) and isinstance(args[1],str)
+                and not args[1].startswith('-')):
+            executable=_hh.which(args[0])
+            known={_ho.path.realpath(p) for p in [_hsys.executable,*[_hh.which(n) for n in ('python3','python','bash','sh')]] if p}
+            cwd=_ho.path.abspath(kwargs.get('cwd') or _ho.getcwd())
+            script_path=_ho.path.abspath(_ho.path.join(cwd,args[1]))
+            script=_ho.path.realpath(script_path)
+            root=_ho.path.realpath(_hunter_task_root)
+            if (executable and _ho.path.realpath(executable) in known
+                    and _ho.path.commonpath([root,script])==root and _ho.path.isfile(script)):
+                self._hunter_local_program=_ho.path.relpath(script_path,root)
+                _hunter_event(kind='launch',path=self._hunter_local_program,exists=True,
+                              interpreter=_ho.path.basename(executable))
+        super().__init__(args, *positional, **kwargs)
+_hsub.Popen = _HunterPopen
+
+_hunter_wait = _HunterPopen.wait
+_hunter_original_event = _hunter_event
+def _hunter_event(**record):
+    if record.get('kind') != 'checker_exit':
+        return _hunter_original_event(**record)
+    # One bounded completion map avoids evicting one checker's proof for the
+    # next checker. Keep the latest completion per path, up to sixteen paths.
+    for event in _hunter_events:
+        if event.get('kind')=='checker_exits':
+            results=event['results'];results.pop(record['path'],None)
+            results[record['path']]=record['returncode']
+            if len(results)>16:
+                results.pop(next(iter(results)));event['truncated']=True
+            return
+    record={'kind':'checker_exits','results':{record['path']:record['returncode']}}
+    if len(_hunter_events)<4:
+        _hunter_events.append(record);return
+    for i,event in enumerate(_hunter_events):
+        if not (event.get('kind')=='http' and (event.get('error') or event.get('status',0)>=400)):
+            _hunter_events[i]=record;return
+    # All slots are failures; omitting completion leaves checker proof unknown.
+def _hunter_checked_wait(self,*args,**kwargs):
+    result=_hunter_wait(self,*args,**kwargs)
+    path=getattr(self,'_hunter_local_program',None)
+    if path and not getattr(self,'_hunter_completion_reported',False):
+        self._hunter_completion_reported=True
+        _hunter_event(kind='checker_exit',path=path,returncode=result)
+    return result
+_HunterPopen.wait=_hunter_checked_wait
+
+'''

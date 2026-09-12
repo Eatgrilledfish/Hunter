@@ -9,6 +9,7 @@ from .protocol import strict_json, integer
 from .dependencies import execution_manifest, input_manifest
 from .receipts import guarded_script
 from .task_program import prepare as prepare_program
+from .task_runtime import prelude as runtime_prelude
 
 
 def parse_result(text):
@@ -166,7 +167,9 @@ runpy.run_path(entry, run_name="__main__")
         argv.extend(P["args"])
         if op == "run_python":
             argv = [P["python"], "-I", "-B", "-c", P.get("runtime_code", P["code"])]
+            argv.extend(P['args'])
             out['program_adapters'] = P.get('program_adapters', [])
+            out['program_contract'] = P.get('program_contract', {})
         execution_cwd = path if op == "run_python" else root
         out['cwd'] = os.path.relpath(execution_cwd, root)
         # Bounded names only: no credential contents, judge internals or external reads.
@@ -232,6 +235,16 @@ runpy.run_path(entry, run_name="__main__")
             text = None
             if status == "ok":
                 status = "invalid_encoding"
+        if isinstance(text, str):
+            lines = []
+            for line in text.splitlines(keepends=True):
+                if line.startswith('HUNTER_RUNTIME:'):
+                    try:
+                        events = json.loads(line[len('HUNTER_RUNTIME:'):])
+                        if isinstance(events, list):out['runtime_events'] = events[:4]
+                    except ValueError:pass
+                else:lines.append(line)
+            text = ''.join(lines)
         out.update(status=status, path=P["path"], file_sha256=sha, text=text,
                    tool_exit_code=child.returncode, completeness="complete" if status == "ok" else "partial")
         if status == "ok":
@@ -354,13 +367,26 @@ def compile_operation(context, plan, environment, evidence):
                 raise ValueError("program documentation must be completely read")
             manifest[data["path"]] = data["file_sha256"]
         import hashlib
+        args = plan.get('args', [])
+        if not isinstance(args, list) or len(args) > 32 or any(not isinstance(x,str) or not x or len(x)>1024 or '\x00' in x for x in args):
+            raise ValueError('invalid generated-program argv')
         payload.update(code=code, code_sha256=hashlib.sha256(code.encode()).hexdigest(),
-                       args=[], manifest=manifest, input_manifest={}, import_candidates=[])
+                       args=args, manifest=manifest, input_manifest={}, import_candidates=[])
+        # Include complete task-local API documentation already inspected,
+        # even if the model omitted that ID from evidence_refs. Hash it in
+        # the runtime manifest too; no stale or uninspected document is used.
+        for record in evidence.values():
+            data = record.get('data', {})
+            if (record.get('usable') and data.get('operation') == 'read_slice'
+                    and data.get('path') == 'API_DOCS.md' and data.get('completeness') == 'complete'
+                    and data.get('file_sha256') and isinstance(data.get('text'), str)):
+                manifest['API_DOCS.md'] = data['file_sha256']
+        contract = {'refs': sorted(manifest)}
         runtime, adapters = prepare_program(code, root, path,
-            [inspections[p]['text'] for p in manifest])
-        if adapters:
-            payload.update(runtime_code=runtime, program_adapters=adapters,
-                           runtime_sha256=hashlib.sha256(runtime.encode()).hexdigest())
+            [inspections[p]['text'] for p in manifest], contract)
+        runtime = runtime_prelude(root) + '\nexec(compile(' + repr(runtime) + ', "<task_program>", "exec"))'
+        payload.update(runtime_code=runtime, program_adapters=adapters, program_contract=contract,
+                       runtime_sha256=hashlib.sha256(runtime.encode()).hexdigest())
     else:
         inspection = inspections.get(path)
         if inspection is None or inspection.get("completeness") != "complete":
@@ -398,7 +424,7 @@ def task_documents(text):
 
 
 LOCATE_SCRIPT = r'''
-import json, os, time
+import json, os, time, hashlib, base64, re
 out = {"version":1, "context":P["context"], "operation":"locate_task"}
 started = time.monotonic()
 matches, errors, visited = [], [], 0
@@ -454,6 +480,41 @@ if len(matches) == 1:
             out.update(entries=sorted(listing,key=lambda e:e["path"]),root_listing_complete=True)
     except OSError:
         pass
+    # Read small, explicitly related documents in the same sandbox round trip.
+    # Each byte block is independently hash-verified by DocumentLedger in SDK.
+    out['documents'] = []
+    pending = [os.path.basename(path)]
+    used = 0
+    for relative in pending:
+        location = os.path.realpath(os.path.join(folder, relative))
+        if os.path.commonpath([folder, location]) != folder or os.path.islink(os.path.join(folder, relative)):
+            continue
+        try:
+            with open(location, 'rb') as source:
+                before = os.fstat(source.fileno())
+                if before.st_size > 8192:continue
+                block = source.read(8193)
+                after = os.fstat(source.fileno())
+            if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):continue
+            text = block.decode('utf-8')
+            sha = hashlib.sha256(block).hexdigest()
+            doc = dict(status='ok', operation='read_slice', path=relative, file_size=len(block),
+                       offset=0, next_byte=len(block), has_more=False, completeness='complete',
+                       bytes_base64=base64.b64encode(block).decode('ascii'), file_sha256=sha, chunk_sha256=sha)
+            size = len(json.dumps(doc).encode())
+            if used + size > 16000:continue
+            used += size
+            out['documents'].append(doc)
+            if relative == os.path.basename(path):
+                names = {e['path']:e['kind'] for e in out.get('entries',[])}
+                if names.get('API_DOCS.md') == 'file':pending.append('API_DOCS.md')
+                if 'spec.md' in text:
+                    tokens = set(re.findall(r'[A-Za-z0-9_][A-Za-z0-9_./-]*', text))
+                    workspaces = [name for name,kind in names.items() if kind == 'directory'
+                                  and any(t == name or t.startswith(name+'/') for t in tokens)]
+                    if len(workspaces) == 1:pending.append(workspaces[0]+'/spec.md')
+        except (OSError, UnicodeError):
+            continue
 else:
     out.update(status="ambiguous" if len(matches)>1 else "incomplete" if not complete or errors else "not_found",
                completeness="unknown")

@@ -33,6 +33,12 @@ def gatling_upgrade_status(world, unit, policy, rules):
 
 
 def upgrade_allowed(world, unit, policy, rules):
+    from .wall_policy import planned_gate, upgrade_targets
+    if unit.kind == 'wall' and unit.pos == planned_gate(world):
+        return False
+    if unit.kind == 'wall' and getattr(world, 'staged_walls', False):
+        if unit.pos not in upgrade_targets(world):
+            return False
     if (world.battery_plan is not None and unit.kind == 'rocket' and unit.level == 1
             and any(g.kind == 'gatling' and g.level == 1 for g in world.weapons)):
         # WeaponUpgradeVoucher1 is shared. An incidental stop beside the rear
@@ -93,10 +99,13 @@ def urgent_gatling_upgrades(world, policy, rules, task_actor=None, *, priority_i
             for gun,identity in zip(guns,best[1]) if identity is not None]
 
 
-def propose(world, policy, deadline, task_actor=None, *, plans=None, priority_ids=(), rules=None):
-    plans = {} if plans is None else plans
-    plans.clear()
-    actors = {u.id: u for u in world.movers if u.id != task_actor}
+def upgrade_demand(world, policy, *, priority_ids=(), rules=None):
+    """Read observed targets and the purchasing tier before matching inventory."""
+    staged = getattr(world, "staged_walls", False)
+    if staged:
+        from .wall_policy import priority_units
+        leading = {u.id for u in priority_units(world)}
+        priority_ids = ()  # User order supersedes the old critical-base exception.
     targets = {}
     for unit in sorted(world.ours.values(), key=lambda u: (u.kind == "wall", u.id)):
         if not unit.alive or unit.level not in {1, 2}:
@@ -112,16 +121,14 @@ def propose(world, policy, deadline, task_actor=None, *, plans=None, priority_id
                                         else .75 if gatling_state == 'range_priority'
                                         else 1 if prefix == "Weapon" and (unit.kind == "rocket" or not world.build_interior)
                                         else 2 if prefix == "Weapon" else 3 if prefix == "Station" else 4}
-        if len(targets) == 16:
-            break
-    if not actors or not targets:
-        return []
+        if staged and unit.id in targets:
+            targets[unit.id]["rank"] = (1 if unit.kind in WEAPONS else 2 if unit.kind == "wall" else 3)
     # Fix the purchasing tier before assigning held stock. Held Gatling range
     # vouchers and rocket vouchers are not observed upgrades yet; their pending
     # deliveries must not release this tier's budget to lower-priority work.
     critical = {i:t for i,t in targets.items() if i in priority_ids and t['name'] in world.shop}
     purchase_rank = min((t['rank'] for t in critical.values()), default=None)
-    restrict_purchases = bool(critical) or world.battery_plan is not None or bool(world.build_interior and policy.closed_ring_rockets_enabled)
+    restrict_purchases = staged or bool(critical) or world.battery_plan is not None or bool(world.build_interior and policy.closed_ring_rockets_enabled)
     if restrict_purchases and purchase_rank is None:
         # A missing listing is not permission to spend the leading upgrade fund
         # on cheaper walls. Wait for a current price/listing instead of inventing
@@ -135,17 +142,23 @@ def propose(world, policy, deadline, task_actor=None, *, plans=None, priority_id
         if (not rockets or any(u.level not in (1,2,3) for u in rockets)) and (
                 purchase_rank is None or purchase_rank >= 1):
             purchase_rank = None
-    fields = {}
+    if staged:
+        purchase_rank = min((t["rank"] for i,t in targets.items() if i in leading), default=None)
+        if len(world.weapons) < (rules.weapon_limit if rules else 3):
+            purchase_rank = None
+    return targets, purchase_rank, restrict_purchases, priority_ids
 
-    def field(actor, target):
-        key = (actor.id, target["unit"].id)
-        if key not in fields:
-            fields[key] = distance_field(world, interaction_cells(world, [target["unit"].pos], actor.pos),
-                                         actor.pos, deadline)
-        return fields[key]
 
+def match_carried_supply(targets, actors, deadline, field):
+    """Match each personal voucher once; expose every reservation, not just first jobs.
+
+    ``field(actor, target)`` is a caller-owned route view. Night planning may
+    provide a conditional dawn view for M, without changing actors or inventory.
+    Neither the target mapping nor observed units are mutated.
+    """
     supply = {identity: actor.inventory.copy() for identity, actor in actors.items()}
-    jobs, result = {}, []
+    targets = dict(targets)
+    jobs, allocations = {}, []
     # Reserve even a carrier's second matching voucher for a second target. Only
     # its first delivery is emitted this turn; another worker must not rebuy it.
     while targets and time.monotonic() < deadline:
@@ -163,6 +176,45 @@ def propose(world, policy, deadline, task_actor=None, *, plans=None, priority_id
         target = targets.pop(target_id)
         supply[identity][target["name"]] -= 1
         jobs.setdefault(identity, (target, length))
+        allocations.append((identity, target, length))
+    return targets, jobs, allocations
+
+
+def purchase_floor(world, policy, targets, priority_ids=()):
+    """Cash floor for the same observed purchasing tier used by propose."""
+    purchase_reserve = policy.reserve_gold
+    if ((world.battery_plan is not None or world.build_interior and policy.closed_ring_rockets_enabled) and targets and all(
+            identity in priority_ids or target['unit'].kind in WEAPONS and target['rank'] <= 1
+            for identity,target in targets.items())):
+        # The current first-range/emergency/rocket priority IS the defensive
+        # purpose of this cash. Requiring another generic 20 gold would make
+        # exactly 100 fail to buy its 100-gold voucher indefinitely. Ordinary
+        # wall/base spending and independent medical stock retain their floor.
+        purchase_reserve = 0
+    if getattr(world, "staged_walls", False):
+        purchase_reserve = 0
+    return purchase_reserve
+
+
+def propose(world, policy, deadline, task_actor=None, *, plans=None, priority_ids=(), rules=None):
+    plans = {} if plans is None else plans
+    plans.clear()
+    actors = {u.id: u for u in world.movers if u.id != task_actor}
+    targets, purchase_rank, restrict_purchases, priority_ids = upgrade_demand(
+        world, policy, priority_ids=priority_ids, rules=rules)
+    if not actors or not targets:
+        return []
+    fields = {}
+
+    def field(actor, target):
+        key = (actor.id, target["unit"].id)
+        if key not in fields:
+            fields[key] = distance_field(world, interaction_cells(world, [target["unit"].pos], actor.pos),
+                                         actor.pos, deadline)
+        return fields[key]
+
+    targets, jobs, _ = match_carried_supply(targets, actors, deadline, field)
+    result = []
     for identity, (target, length) in jobs.items():
         begin = len(result)
         actor = actors[identity]
@@ -185,15 +237,7 @@ def propose(world, policy, deadline, task_actor=None, *, plans=None, priority_id
     # saving for a damaged base. Carried vouchers above are still delivered.
     if restrict_purchases:
         targets = {i:t for i,t in targets.items() if purchase_rank is not None and t['rank'] == purchase_rank}
-    purchase_reserve = policy.reserve_gold
-    if ((world.battery_plan is not None or world.build_interior and policy.closed_ring_rockets_enabled) and targets and all(
-            identity in priority_ids or target['unit'].kind in WEAPONS and target['rank'] <= 1
-            for identity,target in targets.items())):
-        # The current first-range/emergency/rocket priority IS the defensive
-        # purpose of this cash. Requiring another generic 20 gold would make
-        # exactly 100 fail to buy its 100-gold voucher indefinitely. Ordinary
-        # wall/base spending and independent medical stock retain their floor.
-        purchase_reserve = 0
+    purchase_reserve = purchase_floor(world, policy, targets, priority_ids)
     gold = max(0, world.gold-purchase_reserve)
     buyers = {k: u for k, u in actors.items() if k not in jobs and u.kind == "worker"
               and u.capacity is not None and u.backpack is not None and len(u.backpack) < u.capacity}

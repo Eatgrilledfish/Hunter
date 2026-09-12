@@ -14,6 +14,11 @@ from .medical import MedicalSupply
 from .recovery import BaseRecovery
 from .economic_routes import EconomicRoutes
 from .day_schedule import DaySchedule
+from .task_side_layout import TaskSideLayout
+from .external_gate import ExternalGate
+from .night_roles import NightRoster
+from .repair_plan import RepairPlan
+from .repair_supply import RepairSupply
 from .navigation import neighbours
 from .protocol import pos_json
 
@@ -48,6 +53,11 @@ class Session:
     recovery: BaseRecovery = field(default_factory=BaseRecovery)
     economic_routes: EconomicRoutes = field(default_factory=EconomicRoutes)
     day_schedule: DaySchedule = field(default_factory=DaySchedule)
+    task_layout: TaskSideLayout = field(default_factory=TaskSideLayout)
+    external_gate: ExternalGate = field(default_factory=ExternalGate)
+    night_roster: NightRoster = field(default_factory=NightRoster)
+    repair: RepairPlan = field(default_factory=RepairPlan)
+    repair_supply: RepairSupply = field(default_factory=RepairSupply)
 
     def task_actor(self, world):
         if not world.phase_task:
@@ -126,6 +136,7 @@ class Session:
         self.opponent.reconcile(world, clock)
         self.defence.reconcile(world, clock)
         self.medical.reconcile(world, clock)
+        self.repair_supply.reconcile(world, clock)
         self.enemy_memory = self.opponent.belief.sightings
         return clock
 

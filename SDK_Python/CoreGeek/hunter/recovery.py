@@ -41,6 +41,12 @@ class BaseRecovery:
             threshold = .65 if weapon_demand else .2
             self.diagnostic['bases'][base.id].update(priority_loss_fraction=threshold,
                 weapon_demand=weapon_demand)
+            if getattr(world, "staged_walls", False):
+                from .wall_policy import priority_units
+                leading = priority_units(world)
+                if not leading or any(u.kind != "station" for u in leading):
+                    self.diagnostic["bases"][base.id]["deferred_for_upgrade_order"] = True
+                    continue
             if policy.base_recovery_enabled and loss > 0 and loss >= reference*threshold:
                 result.add(base.id)
         return result

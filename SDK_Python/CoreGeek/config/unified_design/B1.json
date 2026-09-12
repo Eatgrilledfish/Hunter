@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "version": "unified-design-local-release-2026-09-12",
-  "basis": "B0 release selection: at most two night defenders; optional B1-B3 layouts, gate/repair and night economy are implemented but not promoted without consistent measured benefit. See docs/UNIFIED_DESIGN_RELEASE_2026-09-12.md.",
+  "name": "B1",
+  "description": "Task-side fixed operator layout; economic worker remains outside without night economy.",
   "parameters": {
     "planning_seconds": 2.8,
     "lock_seconds": 0.15,
@@ -19,7 +19,7 @@
     "construction_commitment_enabled": true,
     "closed_ring_rockets_enabled": true,
     "forward_battery_enabled": false,
-    "task_side_layout_enabled": false,
+    "task_side_layout_enabled": true,
     "external_gate_enabled": false,
     "gate_seal_choice": "auto",
     "gate_dawn_choice": "auto",

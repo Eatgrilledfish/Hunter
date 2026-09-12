@@ -254,7 +254,7 @@ class Intelligence:
                 used += len(entry["text"])
         if not sources or not set(sources).intersection(fresh):
             # Reserve was only tentative; no response was issued.
-            session.tasks.budget.attempts -= 1
+            session.tasks.budget.cancel_unissued()
             return
         self.seq += 1
         context = {"task_instance": None, "nonce": f"news:{session.epoch}:{self.seq}", "purpose": "news_and_treasure"}

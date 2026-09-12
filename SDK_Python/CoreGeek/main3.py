@@ -3,6 +3,7 @@ import base64
 import argparse
 import logging
 import os
+from pathlib import Path
 
 from flask import Flask, request, jsonify
 
@@ -25,7 +26,7 @@ logging.getLogger("hunter").addHandler(diagnostics)
 logging.getLogger("hunter").propagate = False  # Avoid a second unbounded traceback via the root handler.
 logging.getLogger("werkzeug").setLevel(logging.WARNING)  # Successful POST access lines are redundant.
 agent = Agent(diagnostics=diagnostics, rules=Rules.load(os.environ["HUNTER_RULES_PATH"]) if os.environ.get("HUNTER_RULES_PATH") else None,
-              policy=Policy.load(os.environ["HUNTER_POLICY_PATH"]) if os.environ.get("HUNTER_POLICY_PATH") else None)
+              policy=Policy.load(os.environ.get("HUNTER_POLICY_PATH") or Path(__file__).resolve().parent/'config/strategy.json'))
 
 try:
     diagnostics.startup(agent)

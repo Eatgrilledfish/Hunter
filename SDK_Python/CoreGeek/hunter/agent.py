@@ -7,11 +7,12 @@ from pathlib import Path
 import threading
 import time
 
-from . import combat, economy, director, joint_lookahead
+from . import combat, economy, director, joint_lookahead, task_schedule, site_clearance, exterior_evasion, forage_admission
 from .arbitration import select
 from .protocol import parse_request, fingerprint, empty_response, validate_response, distance, position
 from .rules import Rules, Policy, Clock
 from .state import Session
+from .duty_budget import DutyBudget
 
 LOG = logging.getLogger("hunter")
 
@@ -36,6 +37,9 @@ class Agent:
 
     def _base(self, world, clock, task_actor, candidates=None):
         # Independent short selection budget also works if main planning expires.
+        world.night_foraging_enabled=self.policy.night_foraging_enabled
+        from .night_roles import defender_ids
+        defender_ids(world)
         if candidates is None:
             candidates = economy.immediate(world, self.rules, task_actor, jobs=economy.construction_jobs(world, self.rules, self.policy), policy=self.policy)
         return select(world, clock, self.rules, self.policy, candidates, time.monotonic()+0.03,
@@ -44,6 +48,18 @@ class Agent:
     def _isolated_response(self, world):
         task_actor = next((u.id for u in world.movers if u.kind == "pioneer" and world.phase_task), None)
         return self._base(world, Clock(world.round, self.rules.round_origin), task_actor).response
+
+    def _early_base(self, world, clock, task_actor, draft):
+        # No layout, construction, gate or service promise has been established
+        # yet. Keep only current personal healing and daytime ore actions; do
+        # not spend gate stone, upgrade a not-yet-identified G, or authorize a
+        # night excursion/repair before its actual duty checks exist.
+        choices = economy.immediate(world, self.rules, task_actor, jobs={}, policy=self.policy, local_only=True)
+        simple = [c for c in choices if
+                  (c.command.get('action') == 'use' and c.command.get('name') == 'Medicine') or
+                  (clock.phases == {'day'} and (c.command.get('action') == 'collect' or
+                   c.command.get('action') == 'sell' and c.command.get('name') != 'stone'))]
+        return self._base(world, clock, task_actor, draft.filter_failures(simple, world.round))
 
     def _diagnostic(self, event, **data):
         if self.diagnostics is not None:
@@ -89,16 +105,73 @@ class Agent:
             draft.tasks.reuse_enabled = self.policy.skill_reuse_enabled
             clock = draft.reconcile(world)
             task_actor = draft.task_actor(world)
+            fallback = self._early_base(world, clock, task_actor, draft).response
+            draft.task_layout.prepare(world, self.rules, self.policy,
+                                      min(start + self.policy.planning_seconds, time.monotonic() + .04))
+            world.duty_budget = DutyBudget(start+self.policy.planning_seconds)
+            draft.night_roster.prepare(world)
+            world.night_foraging_enabled=self.policy.night_foraging_enabled
             economy.prepare_wall_cycle(world, clock, self.rules, self.policy)
+            gate_candidates=world.duty_budget.run('gate', lambda budget_end: draft.external_gate.prepare(
+                world,clock,self.rules,self.policy,budget_end,
+                task_busy=bool(task_actor or draft.tasks.active or draft.tasks.accept_pending),defer_regular_night=True),
+                min(start+self.policy.planning_seconds,time.monotonic()+.06))
+            evasion_report={'status':'emergency gate plan active'}
+            if not draft.external_gate.emergency_active and not draft.external_gate.deferred_night:
+                evasion,evasion_report=world.duty_budget.run('exterior_evasion', lambda budget_end:
+                    exterior_evasion.propose(world,clock,budget_end), min(start+self.policy.planning_seconds,time.monotonic()+.01))
+                if evasion:
+                    identity=evasion[0].actor
+                    gate_candidates=[c for c in gate_candidates if c.actor!=identity]+evasion
+                    draft.external_gate.commands[identity]=[c.command for c in evasion]
+                    world.night_forage_commands.pop(identity,None)
             build_jobs = economy.construction_jobs(world, self.rules, self.policy)
+            build_jobs = draft.day_schedule.division.assign(world,clock,self.rules,self.policy,build_jobs,time.monotonic()+.25)
+            if draft.external_gate.commands:
+                build_jobs={i:j for i,j in build_jobs.items() if i not in draft.external_gate.commands}
             immediate = draft.filter_failures(economy.immediate(world, self.rules, task_actor, jobs=build_jobs, policy=self.policy), world.round)
             incumbent = self._base(world, clock, task_actor, immediate)
             fallback = incumbent.response
             candidates = list(immediate)
-            candidates.extend(draft.tasks.candidates(world))
             deadline = start + self.policy.planning_seconds
+            task_choice = task_schedule.choose(world,clock,self.policy,min(deadline,time.monotonic()+.04),draft.tasks.timing)
+            from .night_roles import admit_task_departure
+            task_choice = world.duty_budget.run('task_handoff', lambda budget_end:
+                admit_task_departure(world, clock, task_choice, budget_end), min(deadline,time.monotonic()+.02))
+            candidates.extend(draft.tasks.candidates(world, choice=task_choice))
             guidance = director.propose(world, clock, task_actor, draft.tasks.active, min(deadline, time.monotonic()+0.12), self.policy, draft.risk,
                                         failed_steps=draft.failed_move_steps(world) if self.policy.return_detour_enabled else None)
+            repairs = world.duty_budget.run('repair', lambda budget_end: draft.repair.prepare(
+                world, clock, self.rules, self.policy, budget_end, draft.tasks.active),
+                min(deadline,time.monotonic()+.04))
+            world.forage_task_commands=[c.command for c in draft.filter_failures(candidates,world.round)
+                                        if c.actor==draft.night_roster.p and c.command.get('action')=='submitAnswer']
+            if draft.external_gate.deferred_night:
+                gate_candidates=world.duty_budget.run('night_service', lambda budget_end:
+                    draft.external_gate.resume_night(world,clock,self.rules,self.policy,budget_end,
+                        draft.tasks.active, bool(task_actor or draft.tasks.active or draft.tasks.accept_pending)),
+                    min(deadline,time.monotonic()+.06))
+                evasion,evasion_report=world.duty_budget.run('exterior_evasion', lambda budget_end:
+                    exterior_evasion.propose(world,clock,budget_end),min(deadline,time.monotonic()+.01))
+                if evasion:
+                    identity=evasion[0].actor
+                    gate_candidates=[c for c in gate_candidates if c.actor!=identity]+evasion
+                    draft.external_gate.commands[identity]=[c.command for c in evasion]
+                    world.night_forage_commands.pop(identity,None)
+                    world.forage_contract=None
+            if draft.external_gate.commands:
+                guidance.duty_permit=draft.external_gate.permit
+                guidance.candidates=[c for c in guidance.candidates if guidance.permit(c)]
+                guidance.return_routes={i:r for i,r in guidance.return_routes.items() if i not in draft.external_gate.commands}
+                guidance.operator_stands={i:world.ours[i].pos for i in draft.external_gate.firearms}
+                guidance.candidates.extend(gate_candidates)
+                guidance.operator_plan_status='external_gate_fixed_guards'
+            if draft.external_gate.commands:
+                for identity, commands in getattr(world, 'repair_commands', {}).items():
+                    if identity in draft.external_gate.firearms:
+                        draft.external_gate.commands[identity].extend(commands)
+            guidance.candidates.extend(repairs)
+            candidates.extend(repairs)
             # A fixed gun site may initially be occupied by an idle pioneer.
             # Keep the site stable and move the role using real free cells.
             if world.battery_plan and clock.phases == {'day'}:
@@ -127,7 +200,7 @@ class Agent:
                 from .navigation import distance_field, neighbours
                 for identity, job in build_jobs.items():
                     actor = world.ours[identity]
-                    if not job.get("gate") or not actor.inventory["stone"]:
+                    if identity not in world.night_defenders or not job.get("gate") or not actor.inventory["stone"]:
                         continue
                     if guidance.return_routes.get(identity,{}).get("yield_for"):
                         continue  # Finish the real gate-traffic clearing route first.
@@ -174,9 +247,27 @@ class Agent:
                         guidance.candidates.extend(staged[1])
             for actor in world.movers:
                 guidance.blocked_moves.setdefault(actor.id, set()).update(world.navigation_avoided.get(actor.pos, set()))
+            clearing = draft.filter_failures(site_clearance.propose(world,clock,self.rules,guidance,
+                min(deadline,time.monotonic()+.02),task_actor),world.round)
+            clearing_ids={c.actor for c in clearing}
+            guidance.candidates=[c for c in guidance.candidates if c.actor not in clearing_ids]
+            for c in clearing:
+                guidance.site_clear_actions.setdefault(c.actor,[]).append(c.command)
+            guidance.candidates.extend(clearing)
             recovery_targets = draft.recovery.targets(world, self.rules, self.policy)
             urgent_upgrades = draft.filter_failures(economy.procurement.urgent_gatling_upgrades(
                 world,self.policy,self.rules,task_actor,priority_ids=recovery_targets),world.round)
+            from .night_roles import permits
+            from .validation import check_action, Verdict
+            # An exclusive commitment must be executable under this frame's
+            # duty rules before it can suppress the checked return incumbent.
+            urgent_upgrades = [c for c in urgent_upgrades
+                               if permits(world, clock, c)
+                               and (guidance.duty_permit is None or guidance.duty_permit(c) is not False)
+                               and (c.actor not in guidance.roster_transit_actions or guidance.permit(c))
+                               and check_action(world, clock, self.rules, c.actor, c.command,
+                                   task_actor=task_actor, task_moves=guidance.task_moves,
+                                   allow_task_control=guidance.allow_task_control).verdict == Verdict.VALID]
             for c in urgent_upgrades:
                 guidance.urgent_upgrades[c.actor] = c.command
                 target = position(c.command['targetPos'][0])
@@ -210,8 +301,12 @@ class Agent:
                 c.utility=90
                 candidates.append(c)
             scheduled = draft.day_schedule.candidates(world,clock,self.policy,build_jobs,guidance.operator_stands,
-                upgrade_plans,{task_actor}|set(guidance.recovery_actions)|set(guidance.urgent_upgrades)|set(guidance.funded_actions),
+                upgrade_plans,{task_actor}|set(guidance.recovery_actions)|set(guidance.urgent_upgrades)|set(guidance.funded_actions)|clearing_ids,
                 min(deadline,time.monotonic()+.12))
+            if getattr(world,'economy_first',False):
+                for c in scheduled:
+                    if c.actor not in guidance.recovery_actions and c.actor not in guidance.urgent_upgrades:
+                        guidance.funded_actions.setdefault(c.actor,[]).append(c.command)
             scheduled = [c for c in draft.filter_failures(scheduled,world.round) if guidance.permit(c)]
             for c in scheduled:guidance.day_actions.setdefault(c.actor,[]).append(c.command)
             candidates.extend(scheduled)
@@ -221,7 +316,11 @@ class Agent:
                     if c.command.get("action") == "build" and c.command.get("name") == "wall":
                         guidance.seal_builds[c.actor] = c.command
                         c.utility = 1000
-                        c.reason = "all roles inside: seal last wall before night"
+                        c.reason = "observed gate permission: seal last wall before night"
+            if getattr(world,'economy_first',False):
+                for c in ready:
+                    if c.actor not in guidance.day_actions and c.actor not in guidance.recovery_actions and c.actor not in guidance.urgent_upgrades:
+                        guidance.funded_actions.setdefault(c.actor,[]).append(c.command)
             ready = [c for c in draft.filter_failures(ready, world.round) if guidance.permit(c)]
             for candidate in ready:
                 guidance.construction_actions.setdefault(candidate.actor, []).append(candidate.command)
@@ -242,6 +341,13 @@ class Agent:
             for candidate in medical:
                 guidance.medical_actions.setdefault(candidate.actor, []).append(candidate.command)
             candidates.extend(medical)
+            supply = world.duty_budget.run('repair_supply', lambda budget_end: draft.repair_supply.candidates(
+                world, clock, self.rules, self.policy, budget_end, guidance,
+                excluded | set(guidance.medical_actions)), min(deadline,time.monotonic()+.04))
+            supply = draft.filter_failures(supply, world.round)
+            for candidate in supply:
+                guidance.repair_supply_actions.setdefault(candidate.actor,[]).append(candidate.command)
+            candidates.extend(supply)
             trips = draft.economic_routes.candidates(world, clock, self.policy, economy.construction_reservations(world, self.rules, jobs=build_jobs),
                                                       min(deadline, time.monotonic()+0.08), task_actor)
             trips = [c for c in draft.filter_failures(trips, world.round) if guidance.permit(c)]
@@ -266,10 +372,11 @@ class Agent:
                 # action: a flat crisis bonus rewards redundant consumables.
                 weights = {identity: weight*4 for identity, weight in weights.items()}
             for name, planner in (("combat", lambda: combat.propose(world, clock, self.rules, deadline, None if guidance.allow_task_control else task_actor,
-                                                                   base_fire_enabled=self.policy.base_fire_enabled and self.policy.joint_fire_enabled)),
+                                                                   base_fire_enabled=self.policy.base_fire_enabled and self.policy.joint_fire_enabled,
+                                                                   rocket_diversity_enabled=self.policy.rocket_diversity_enabled)),
                                   ("defence", lambda: draft.defence.candidates(world, clock, self.policy, deadline, task_actor,
                                                                               incumbent.selected, guidance)),
-                                  ("economy", lambda: economy.propose(world, clock, self.rules, self.policy, deadline, task_actor, guidance.operator_stands, upgrade_candidates=upgrade_candidates, build_jobs=build_jobs)),
+                                  ("economy", lambda: economy.propose(world, clock, self.rules, self.policy, deadline, task_actor, guidance.operator_stands, upgrade_candidates=upgrade_candidates, build_jobs=build_jobs, task_choice=task_choice)),
                                   ("treasure", lambda: draft.intelligence.candidates(world, clock, self.policy, deadline)),
                                   ("opponent", lambda: draft.opponent.candidates(world, clock, self.policy, task_actor, deadline))):
                 if time.monotonic() >= deadline:
@@ -332,6 +439,9 @@ class Agent:
             draft.opponent.finalize(decision.response, world)
             draft.defence.finalize(world, decision.response)
             draft.medical.finalize(world, decision.response)
+            draft.external_gate.finalize(world,decision.response)
+            draft.repair.finalize(world,decision.response)
+            draft.repair_supply.finalize(world,decision.response)
             draft.risk.finalize(world, clock, decision.response)
             draft.economic_routes.finalize(world, decision.selected, self.policy)
             validate_response(decision.response)
@@ -356,12 +466,17 @@ class Agent:
                       "build_region_status": self.rules.build_region_status(world),
                       "risk_scenarios": guidance.observations, "operator_stands": guidance.operator_stands,
                       "operator_plan_status": guidance.operator_plan_status,
+                      "construction_site_clearance": sorted(guidance.site_clear_actions),
+                      "construction_site_reservations": sorted(getattr(world,'operator_excluded_cells',set())),
+                      "task_choice": (None if task_choice is None else {
+                          'actor':task_choice['actor'],'reason':task_choice['reason'],
+                          'selected':task_choice['selected']}),
                       "return_routes": guidance.return_routes,
                       "navigation_retry_exclusions": {u.id:sorted(world.navigation_avoided.get(u.pos, set())) for u in world.movers},
                       "movement_retry_windows": draft.move_retry_windows(world.round),
                       "construction_jobs": build_jobs,
                       "work_status":{u.id:{"ore":[u.inventory[k] for k in ("stone","iron","copper")],
-                          "job":({"name":build_jobs[u.id]["name"],"gate":build_jobs[u.id].get("gate",False)} if u.id in build_jobs else None),
+                          "job":({"name":build_jobs[u.id]["name"],"gate":build_jobs[u.id].get("gate",False),"stock":build_jobs[u.id].get("stock_target"),"build_steps":build_jobs[u.id].get("construction_steps"),"deferred":build_jobs[u.id].get("defer_build")} if u.id in build_jobs else None),
                           "slack":guidance.return_routes.get(u.id,{}).get("slack_before_buffer"),
                           "schedule":draft.day_schedule.diagnostic.get(u.id),
                           "funded":funded_budgets.get(u.id),
@@ -371,6 +486,30 @@ class Agent:
                           "upgrade":({k:upgrade_plans[u.id][k] for k in ("name","steps","stage")} if u.id in upgrade_plans else None)}
                           for u in world.movers if u.kind=="worker"},
                       "battery_plan": world.battery_plan,
+                      "external_gate":draft.external_gate.diagnostic,
+                      "duty_budget":world.duty_budget.diagnostic(),
+                      "exterior_evasion":evasion_report,
+                      "repair":draft.repair.diagnostic,
+                      "repair_supply":draft.repair_supply.diagnostic,
+                      "night_roster": {"w":draft.night_roster.w, "p":draft.night_roster.p,
+                          "m":draft.night_roster.m, "defenders":sorted(world.night_defenders),
+                          "substituting":draft.night_roster.substituting,
+                          "handoff_requested":draft.night_roster.handoff_requested,
+                          "yielding":sorted(world.roster_yielding),
+                          "exit_pending":dict(draft.night_roster.exit_pending),
+                          "traffic": ({"traveller":draft.night_roster.traffic['traveller'],
+                              "blocker":draft.night_roster.traffic['blocker'],
+                              "stand":draft.night_roster.traffic['stand'],
+                              "goals":sorted(draft.night_roster.traffic['goals']),
+                              "gate_owned":bool(draft.night_roster.traffic.get('gate_owned'))}
+                              if draft.night_roster.traffic else None)},
+                      "task_side_layout": ({"status":draft.task_layout.status,
+                          **{k:draft.task_layout.plan[k] for k in (
+                              'c','w','gate','primary_task','task_round_trips','gate_detour_rounds',
+                              'suggested_gate_worker','worker_gate_steps','front_repair_coverage',
+                              'exposure_upper','exposure_unknown','feasible_candidates','rejected_candidates')}}
+                          if draft.task_layout.plan else {"status":draft.task_layout.status,
+                              "rejected_candidates":getattr(world,'task_layout_rejections',{})}),
                       "gatling_upgrades": {u.id:{"hp":u.health,"level":u.level,
                           "state":economy.procurement.gatling_upgrade_status(world,u,self.policy,self.rules)[0],
                           "threshold":economy.procurement.gatling_upgrade_status(world,u,self.policy,self.rules)[1]}
@@ -378,12 +517,15 @@ class Agent:
                       "wall_supply": {"need":len(economy.battery.missing_walls(world,self.rules)),
                           "goal":len(world.wall_targets) if world.wall_targets is not None else self.rules.wall_limit,
                           "ports":sorted(world.firing_ports),
+                          "stage":getattr(world,"wall_stage",None),
+                          "facing":getattr(world,"wall_direction_source",None),
                           "stone":{u.id:u.inventory["stone"] if u.backpack is not None else None for u in world.movers if u.kind=="worker"},
                           "quotas":{i:j.get("stock_target") for i,j in build_jobs.items() if j["name"]=="wall"},
                           "mines":sorted(world.zones.get("stone", ()))[:8],
                           "gaps":sorted(economy.battery.missing_walls(world,self.rules)),
                           "seal_ready":bool(world.seal_cells)},
                       "gun_status":combat.fire_status(world,clock,self.rules,response,candidates),
+                      "night_fire_capacity":forage_admission.fire_summary(world,response),
                       "feedback_counts": dict(draft.feedback_counts),
                       "construction_commitments": sorted(guidance.construction_actions),
                       "upgrade_commitments": sorted(guidance.upgrade_actions),

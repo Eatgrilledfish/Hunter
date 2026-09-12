@@ -335,12 +335,24 @@ class Policy:
     construction_commitment_enabled: bool = True
     closed_ring_rockets_enabled: bool = True
     forward_battery_enabled: bool = False
+    task_side_layout_enabled: bool = False
+    external_gate_enabled: bool = False
+    gate_seal_choice: str = 'auto'
+    gate_dawn_choice: str = 'auto'
+    night_foraging_enabled: bool = True
+    emergency_gate_enabled: bool = False
+    repair_plan_enabled: bool = False
+    repair_supply_enabled: bool = False
     corner_battery_ports_enabled: bool = False
     gatling_upgrade_health_fraction: float = 0.5
     upgrade_commitment_enabled: bool = True
     base_recovery_enabled: bool = True
     economic_route_commitment_enabled: bool = True
     day_schedule_enabled: bool = True
+    economy_first_enabled: bool = True
+    staged_walls_enabled: bool = True
+    construction_site_coordination_enabled: bool = True
+    wall_repair_health_fraction: float = 0.30
     defence_procurement_enabled: bool = False
     defence_gold_limit: int = 200
     joint_lookahead_enabled: bool = False
@@ -359,11 +371,16 @@ class Policy:
     summon_portfolio_enabled: bool = False
     summon_wave_memory_enabled: bool = False
     joint_fire_enabled: bool = True
+    rocket_diversity_enabled: bool = True
     base_fire_enabled: bool = False
     skill_reuse_enabled: bool = True
+    task_schedule_enabled: bool = True
+    task_full_timeout_guard_enabled: bool = False
+    task_gold_weight: float = 0.5
     operator_safety_enabled: bool = False
     operator_handoff_enabled: bool = False
     operator_cycle_enabled: bool = False
+    rocket_rotation_enabled: bool = False
     lethal_entry_guard_enabled: bool = False
     firing_lanes_enabled: bool = False
     weapon_portfolio_enabled: bool = True
@@ -380,7 +397,10 @@ class Policy:
             raise ValueError("unknown strategy parameter")
         for name, value in parameters.items():
             default = getattr(defaults, name)
-            if type(default) is bool:
+            if name in ('gate_seal_choice', 'gate_dawn_choice'):
+                if type(value) is not str or value not in ('auto', 'm', 'w'):
+                    raise ValueError(f"{name} must be auto, m or w")
+            elif type(default) is bool:
                 if type(value) is not bool:
                     raise ValueError(f"{name} must be boolean")
             elif type(default) is int:
