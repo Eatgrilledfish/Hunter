@@ -1,62 +1,206 @@
-核心问题：LLM 调用格式过于复杂，平台 LLM 无法正确返回
+# 自进化任务失败分析
 
-当前代码 (Hunter-main) 和参考代码 (自进化成功的代码) 在自进化任务上的根本差异在于 LLM 交互格式。
+## 核心结论
 
-详细对比
+当前代码（Hunter-main）的自进化任务失败，根本原因是 **LLM 交互协议过于复杂**，平台 LLM 无法正确返回符合要求的响应格式。
 
-1. LLM Prompt 格式
+fix 类任务能成功，是因为代码有 TOKEN 确定性提取逻辑，**完全绕过了 LLM**。api 类任务必须依赖 LLM 解析数据并提交答案，因格式验证失败而阻塞。
 
-当前代码 (tasks.py:1114-1209)：发送复杂的 JSON payload
+---
+
+## 一、日志证据
+
+从 `teamA.log` 可以看到三个自进化任务的实际执行情况：
+
+| 任务              | 类型 | 得分  | 结果   | 关键路径                                 |
+| ----------------- | ---- | ----- | ------ | ---------------------------------------- |
+| task_1_alpha.md   | fix  | 89/80 | ✅ 成功 | TOKEN 从命令输出直接提取，跳过 LLM       |
+| task_1_beijing.md | api  | 16/80 | ❌ 失败 | LLM 响应格式不匹配 → 多次重试 → 答案错误 |
+| task_2_beta.md    | fix  | 88/80 | ✅ 成功 | TOKEN 从命令输出直接提取，跳过 LLM       |
+
+### 成功路径示例（fix 任务）
+
+```
+Round 8:   acceptTask → 接受任务
+Round 9:   executeCmd: find+cat 定位文件
+Round 10:  读取文件内容，分类为 fix 类型
+Round 11:  LLM prompt → 让 LLM 决策下一步
+Round 12:  executeCmd: cd .../ws_1/ && sed -i 's/\r$//' check && ./check
+Round 13:  LLM prompt → 基于 check 输出决策
+Round 14:  executeCmd: mkdir -p logs/alpha && chmod 755 ...
+Round 15:  LLM prompt
+Round 16:  executeCmd: sed -i 's/port 9999/port 8080/' ...
+Round 17:  **TOKEN 'fc1e78eb2a5a' detected → 直接提交，跳过 LLM**
+```
+
+### 失败路径示例（api 任务）
+
+```
+Round 20:  acceptTask → 接受任务
+Round 21:  executeCmd: find+cat 定位文件
+Round 22:  读取文件内容，分类为 api 类型
+Round 23:  LLM prompt → 让 LLM 决策
+Round 24:  executeCmd: cat API_DOCS.md
+Round 25:  LLM prompt → 基于 API 文档决策
+Round 26:  executeCmd: curl ... X-API-Key ...
+Round 27:  LLM prompt → 基于 curl 响应决策
+Round 28:  executeCmd: curl ... Authorization: Bearer ...
+Round 29:  LLM prompt → 基于 200 响应决策
+Round 30:  executeCmd: curl 再次调用 API
+Round 31:  **LLM 返回格式不符合严格验证 → 答案提交失败**
+```
+
+---
+
+## 二、代码架构差异
+
+### 2.1 整体架构
+
+| 维度     | 当前代码（Hunter-main）  | 参考代码（自进化成功的代码）   |
+| -------- | ------------------------ | ------------------------------ |
+| 文件结构 | hunter/ 模块（60+ 文件） | rule/ 模块（7 文件）+ main3.py |
+| 代码量   | tasks.py 1209 行         | main3.py 833 行（含全部逻辑）  |
+| 设计哲学 | 严格协议 + 多层验证      | 简单直接 + 容错重试            |
+
+### 2.2 LLM Prompt 格式
+
+**当前代码**（`tasks.py:1114-1209`）：
+
+```python
+payload = {
+    "request_id": fingerprint(context["nonce"])[:16],
+    "task": task.text[:16384],
+    "evidence": evidence,              # 结构化证据数据
+    "allowed_intents": ["execute", "answer", "inspect"],
+    "reply_template": {"version": 1, "request_id": ..., "intent": "execute", ...},
+    "required_response": "ONLY JSON; copy reply_template version/request_id; ...",
+    "prompt_document_coverage": ...,
+    "omitted_evidence": ...,
+    "events": [...],
+}
 response["prompt"] = instructions + json.dumps(payload)
-其中 payload 包含：request_id、task、evidence（结构化证据数据）、allowed_intents、reply_template、required_response 等字段。指令本身混合了中英文，要求 LLM 返回 version:1, request_id, intent: execute|answer|inspect, command_plan: {operation: list_dir|read_slice|run_tool|run_python, ...} 格式的 JSON。
+```
 
-参考代码 (main3.py:177-294)：发送纯自然语言 prompt
+指令混合中英文，要求 LLM 理解 `command_plan`、`operation`、`evidence_refs` 等复杂概念。
+
+**参考代码**（`main3.py:177-294`）：
+
+```
 你在一个沙盒环境中执行任务。你可以通过 executeCmd 执行 shell 命令，每次只能执行一条。
-任务描述: {phase_task}                            Jump to bottom ↓
-任务文件内容: {task_content[:3000]}
-执行历史: ...                                     Jump to bottom ↓
-请决定下一步，只输出一个 JSON:
-- 执行命令: {"cmd": "要执行的 shell 命令"}        Jump to bottom ↓
-- 提交答案: {"submit": <完整JSON答案>}
-                                                  Jump to bottom ↓
-2. LLM 响应解析
-                                                  Jump to bottom ↓
-当前代码 (tasks.py:712-785)：严格的多层验证
-- 必须是合法 JSON（或 code fence 中的 JSON）      Jump to bottom ↓
-- 必须有 version: 1（整数类型检查）
-- 必须有匹配的 request_id 或 context（nonce 哈希  Jump to bottom ↓
-- 必须有 intent ∈ {"execute", "answer", "inspect"}
-- intent == "execute" 时必须有 command_plan，且 o Jump to bottom ↓ st_dir|read_slice|run_tool|run_python 之一
-- intent == "answer" 时必须有 answer_candidate 符合 spec 格式
-- 任何一项不通过 → invalid_llm 或 quarantined →   Jump to bottom ↓
+任务描述: 请阅读task_1_alpha.md，获取任务信息
+任务文件内容: ...
+目标地址/脚本已给出，直接调用：localhost:8899、./check
+fix 任务执行策略：
+  重要：每次 executeCmd 是独立 shell 会话，cd 不跨命令保留！
+  1. 第 1 条命令：cd 到任务目录，sed -i 's/\r$//' check，然后 ./check
+  2. 第 2 条命令：根据 ./check 输出的失败项，用 && 连接批量修复所有问题
+  3. 如果 ./check 通过会输出 TOKEN，直接提交 {"token": "TOKEN值"}
+请决定下一步，只输出一个 JSON，不要任何其他内容：
+- 执行命令: {"cmd": "要执行的 shell 命令"}
+- 提交答案: {"submit": <你提交给平台的完整JSON答案>}
+```
 
-参考代码 (main3.py:157-174)：简单 JSON 提取       Jump to bottom ↓
-obj = extract_json_obj(llm_text)  # 提取第一个 JSON 对象
-if "cmd" in obj: return ("cmd", obj["cmd"])     # Jump to bottom ↓
-if "submit" in obj: return ("submit", obj["submit"])  # 提交答案
-# 不可解析 → 重发 prompt 并强调格式               Jump to bottom ↓
+**关键差异**：参考代码的 prompt 直接告诉 LLM 该做什么，输出格式简单（`cmd` 或 `submit`）。当前代码的 prompt 是复杂 JSON payload，LLM 需要理解 `version`、`request_id`、`intent`、`command_plan` 等抽象概念。
 
-3. Sandbox/executeCmd                             Jump to bottom ↓
+### 2.3 LLM 响应解析
 
-当前代码：通过 compile_operation() 将操作编译为复 Jump to bottom ↓ OPERATION_SCRIPT，几百行），包含自己的 JSON协议、nonce 验证、文件安全检查等。先 discovery → locate_task → 然后才能执行操作。
-                                                  Jump to bottom ↓
-参考代码：直接发送 shell 命令
-resp["executeCmd"] = f"find /tmp /app /root /home Jump to bottom ↓ data -name {filename} -exec sh -c 'echo\"FILEPATH:$1\"; cat \"$1\"' _ {{}} \\; 2>/dev/null"
-# 后续命令也是直接 shell: cd /tmp/.../ws_1/ && se Jump to bottom ↓ ck && ./check
+**当前代码**（`tasks.py:712-785`）：严格多层验证
 
-4. 日志证据                                       Jump to bottom ↓
+```python
+def _consume_llm(self, world):
+    # 1. 必须是合法 JSON
+    data = strict_json(raw)
+    # 2. version 必须是整数 1
+    if type(data.get("version")) is not int or data["version"] != 1:
+        raise ValueError("LLM requires version=1")
+    # 3. request_id 或 context 必须匹配
+    request_id = fingerprint(expected["nonce"])[:16]
+    echoed = data.get("request_id")
+    if echoed != request_id:
+        self._quarantine(world, "llm", ...)  # 隔离
+    # 4. intent 必须是 execute|answer|inspect
+    if data.get("intent") not in {"execute", "answer", "inspect"}:
+        raise ValueError("unknown LLM intent")
+    # 5. execute 时必须有 command_plan，operation 必须是合法值
+    if data["intent"] == "execute":
+        plan = data.get("command_plan")
+        if not isinstance(plan, dict):
+            raise ValueError("missing command plan")
+```
 
-从 teamA.log 可以看到：                           Jump to bottom ↓
+**任何一层不通过 → `invalid_llm` 事件 → `llm_pending = None` → 任务进度被阻断**
 
-┌───────────────────┬──────┬───────────────────── Jump to bottom ↓ ─────────────────────────────────┐
-│       任务        │ 类型 │         结果         │                      原因                       │
-├───────────────────┼──────┼───────────────────── Jump to bottom ↓ ─────────────────────────────────┤
-│ task_1_alpha.md   │ fix  │ 成功 (89分)          │ TOKEN 从命令输出中确定性提取，绕过了 LLM        │
-├───────────────────┼──────┼───────────────────── Jump to bottom ↓ ─────────────────────────────────┤
-│ task_1_beijing.md │ api  │ 部分失败 (16分/80分) │ LLM 响应格式不匹配 → 多次重试 → 答案错误/不完整 │
-├───────────────────┼──────┼───────────────────── Jump to bottom ↓ ─────────────────────────────────┤
-│ task_2_beta.md    │ fix  │ 成功 (88分)          │ 同样是 TOKEN 确定性提取                         │
-└───────────────────┴──────┴───────────────────── Jump to bottom ↓ ─────────────────────────────────┘
+**参考代码**（`main3.py:157-174`）：简单 JSON 提取
 
-- fix 类任务成功是因为代码有 TOKEN 提取逻辑，直接 Jump to bottom ↓ 中提取 TOKEN 并提交，完全跳过 LLM
-- api 类任务失败是因为必须依赖 LLM 解析 API 响应数据并提交答案，但 LLM 的返回不符合严格的格式验证
+```python
+def parse_agent_decision(llm_text: str):
+    obj = extract_json_obj(llm_text)  # 提取第一个 JSON 对象
+    if "cmd" in obj and isinstance(obj["cmd"], str):
+        return ("cmd", obj["cmd"].strip())
+    if "submit" in obj:
+        return ("submit", json.dumps(obj["submit"], ensure_ascii=False))
+    return None  # 不可解析 → 重发 prompt 并强调格式
+```
+
+**关键差异**：参考代码只关心 `cmd` 或 `submit` 字段，其他字段全部忽略。不可解析时重发 prompt 并提示格式，不会阻断任务。
+
+### 2.4 executeCmd 执行方式
+
+**当前代码**：三步流程 + 复杂脚本
+
+```
+Step 1: discovery() → 执行 HUNTER_DISCOVER 协议发现环境
+Step 2: locate_task() → 定位任务文档
+Step 3: compile_operation() → 将操作编译为几百行的 Python 脚本
+```
+
+`compile_operation()` 生成的 `OPERATION_SCRIPT`（`sandbox.py:37-280`）包含：
+
+- 文件路径安全检查（`safe()` 函数防止越权）
+- JSON 协议包装（`version`、`context`、`operation`）
+- `list_dir`、`read_slice`、`run_tool`、`run_python` 四种操作
+- 目录变更检测、文件大小限制、超时控制
+
+**参考代码**：直接 shell 命令
+
+```python
+# 第一步：find+cat 定位并读取文件
+resp["executeCmd"] = (
+    "find /tmp /app /root /home /workspace /opt /data "
+    "-name task_1_alpha.md "
+    "-exec sh -c 'echo \"FILEPATH:$1\"; cat \"$1\"' _ {} \; 2>/dev/null"
+)
+
+# 后续：直接执行 LLM 决策的 shell 命令
+resp["executeCmd"] = "cd /tmp/.../ws_1/ && sed -i 's/\r$//' check && ./check"
+resp["executeCmd"] = "curl -s -H 'Authorization: Bearer xxx' 'http://localhost:8899/api/...'"
+```
+
+**关键差异**：参考代码直接发送 shell 命令，平台执行后返回原始输出。当前代码需要 LLM 返回特定格式的操作指令，再编译成 Python 脚本执行。
+
+### 2.5 确定性答案提取
+
+两者都有 TOKEN 提取逻辑，但实现位置不同：
+
+**当前代码**：在 `_consume_sandbox()` 中解析命令输出，检测 TOKEN
+**参考代码**：在 `agent_loop_step()` 中解析 `lastCmdResult`，检测 TOKEN
+
+参考代码的优势：
+
+- TOKEN 检测在 LLM prompt 之前，**同轮即可提交**
+- 省掉最后 2 轮（prompt + LLM 决策），在 `timeoutRounds=15` 的硬预算下是关键
+
+---
+
+## 三、失败根因总结
+
+| 层级            | 问题                                                         | 影响                                     |
+| --------------- | ------------------------------------------------------------ | ---------------------------------------- |
+| **Prompt 格式** | 复杂 JSON payload，LLM 难以理解                              | LLM 返回的 JSON 缺少必要字段或格式错误   |
+| **响应验证**    | 严格 5 层验证（version/request_id/intent/command_plan/operation） | 任何一层失败 → 任务被隔离/阻断           |
+| **执行方式**    | discovery → locate → compile 三步流程，每步 2 轮             | 消耗 6 轮预算，剩余 9 轮不够完成任务     |
+| **操作类型**    | `list_dir/read_slice/run_tool/run_python` 抽象操作           | LLM 不理解这些抽象，返回的是自然语言命令 |
+| **错误恢复**    | 验证失败后直接隔离，无重试机制                               | 一次格式错误就永久阻断                   |
+
+**fix 任务成功的原因**：TOKEN 从命令输出直接提取，完全绕过 LLM 响应解析流程。
+**api 任务失败的原因**：必须依赖 LLM 解析 API 响应数据并提交答案，LLM 返回格式不符合严格验证。
