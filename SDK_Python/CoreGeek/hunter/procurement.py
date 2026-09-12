@@ -200,6 +200,8 @@ def propose(world, policy, deadline, task_actor=None, *, plans=None, priority_id
     plans = {} if plans is None else plans
     plans.clear()
     actors = {u.id: u for u in world.movers if u.id != task_actor}
+    traders = getattr(world, 'pioneer_trade_ids', set())
+    trade_clock = getattr(world, 'strategy_clock', None)
     targets, purchase_rank, restrict_purchases, priority_ids = upgrade_demand(
         world, policy, priority_ids=priority_ids, rules=rules)
     if not actors or not targets:
@@ -231,6 +233,14 @@ def propose(world, policy, deadline, task_actor=None, *, plans=None, priority_id
                           for i, p in enumerate(steps[:4]))
         plans[identity] = {"target": target["unit"].id, "name": target["name"], "steps": length+1,
                            "stage": "deliver", "candidates": result[begin:]}
+        if identity in traders:
+            from .pioneer_trade import delivery_field
+            required = delivery_field(world, actor, target['unit'], deadline).get(actor.pos)
+            if required is None:
+                del result[begin:]
+                plans.pop(identity)
+            else:
+                plans[identity]['steps'] = required
     if world.gold is None or not world.zones.get("weaponShop") or not any(t["name"] in world.shop for t in targets.values()):
         return result
     # Do not turn the base's restoration fund into cheap wall vouchers while
@@ -239,7 +249,7 @@ def propose(world, policy, deadline, task_actor=None, *, plans=None, priority_id
         targets = {i:t for i,t in targets.items() if purchase_rank is not None and t['rank'] == purchase_rank}
     purchase_reserve = purchase_floor(world, policy, targets, priority_ids)
     gold = max(0, world.gold-purchase_reserve)
-    buyers = {k: u for k, u in actors.items() if k not in jobs and u.kind == "worker"
+    buyers = {k: u for k, u in actors.items() if k not in jobs and (u.kind == "worker" or k in traders)
               and u.capacity is not None and u.backpack is not None and len(u.backpack) < u.capacity}
     start_fields = {}
     while targets and buyers and time.monotonic() < deadline:
@@ -255,12 +265,21 @@ def propose(world, policy, deadline, task_actor=None, *, plans=None, priority_id
                     continue
                 delivery = field(actor, target)
                 paths = [(start[p]+delivery[p], start[p], p) for p in shops if p in start and p in delivery]
+                if identity in traders:
+                    from .pioneer_trade import delivery_field, return_margin
+                    circuit = delivery_field(world, actor, target['unit'], deadline)
+                    paths = [(start[p]+circuit[p]-1, start[p], p) for p in shops if p in start and p in circuit
+                             and trade_clock is not None and start[p]+1+circuit[p]+return_margin(world, policy) < trade_clock.until_night]
                 if paths:
                     total, to_shop, stand = min(paths)
-                    options.append((target["rank"], total, price, identity, target_id, to_shop, stand))
+                    # Prefer the designated trader for new travel. A worker
+                    # already at the counter may buy immediately instead of
+                    # waiting several rounds for P to arrive from the battery.
+                    options.append((target["rank"], bool(traders) and to_shop > 0,
+                                    identity not in traders, total, price, identity, target_id, to_shop, stand))
         if not options:
             break
-        _, total, price, identity, target_id, length, stand = min(options)
+        _, _, _, total, price, identity, target_id, length, stand = min(options)
         actor, target = buyers.pop(identity), targets.pop(target_id)
         begin = len(result)
         gold -= price

@@ -104,6 +104,9 @@ class Agent:
             draft = deepcopy(session)
             draft.tasks.reuse_enabled = self.policy.skill_reuse_enabled
             clock = draft.reconcile(world)
+            world.strategy_policy = self.policy
+            from . import pioneer_trade
+            pioneer_trade.prepare(world, clock)
             task_actor = draft.task_actor(world)
             fallback = self._early_base(world, clock, task_actor, draft).response
             draft.task_layout.prepare(world, self.rules, self.policy,
@@ -138,12 +141,23 @@ class Agent:
             from .night_roles import admit_task_departure
             task_choice = world.duty_budget.run('task_handoff', lambda budget_end:
                 admit_task_departure(world, clock, task_choice, budget_end), min(deadline,time.monotonic()+.02))
-            candidates.extend(draft.tasks.candidates(world, choice=task_choice))
             guidance = director.propose(world, clock, task_actor, draft.tasks.active, min(deadline, time.monotonic()+0.12), self.policy, draft.risk,
                                         failed_steps=draft.failed_move_steps(world) if self.policy.return_detour_enabled else None)
+            candidates.extend(draft.tasks.candidates(world, choice=task_choice))
+            world.pioneer_trade_stands = guidance.operator_stands
             repairs = world.duty_budget.run('repair', lambda budget_end: draft.repair.prepare(
                 world, clock, self.rules, self.policy, budget_end, draft.tasks.active),
                 min(deadline,time.monotonic()+.04))
+            pioneer = draft.night_roster.p
+            if (world.task_return_required and pioneer in guidance.roster_transit_actions
+                    and not draft.night_roster.traffic
+                    and pioneer not in world.roster_yielding
+                    and pioneer not in getattr(world, 'fixed_w_transit_actors', ())):
+                # A selected repair excursion is part of P's night duty.
+                # Admit only this frame's revalidated repair actions, without
+                # interrupting an actual teammate passage or releasing trade.
+                guidance.roster_transit_actions[pioneer].extend(
+                    c.command for c in repairs if c.actor == pioneer)
             world.forage_task_commands=[c.command for c in draft.filter_failures(candidates,world.round)
                                         if c.actor==draft.night_roster.p and c.command.get('action')=='submitAnswer']
             if draft.external_gate.deferred_night:
@@ -287,6 +301,12 @@ class Agent:
             upgrade_plans = {}
             upgrade_candidates = economy.procurement.propose(world, self.policy, min(deadline, time.monotonic()+0.08),
                                                               task_actor, plans=upgrade_plans, priority_ids=recovery_targets, rules=self.rules)
+            trades = draft.filter_failures(pioneer_trade.candidates(world, clock, self.policy, upgrade_plans,
+                min(deadline, time.monotonic()+.04)), world.round)
+            trades = [c for c in trades if guidance.permit(c)]
+            for c in trades:
+                guidance.day_actions.setdefault(c.actor, []).append(c.command)
+            candidates.extend(trades)
             recovery = draft.recovery.ready(world, clock, self.policy, upgrade_plans, recovery_targets,
                                             guidance.operator_stands, min(deadline, time.monotonic()+0.08))
             recovery = [c for c in draft.filter_failures(recovery, world.round) if guidance.permit(c)]
@@ -398,6 +418,8 @@ class Agent:
             if self.policy.news_hold_enabled and world.gold is not None and world.gold > self.policy.reserve_gold:
                 for candidate in candidates:
                     if candidate.command["action"] == "sell" and draft.intelligence.hold_ore(candidate.command["name"], clock):
+                        if candidate.actor in world.pioneer_trade_ids:
+                            continue
                         actor = world.ours[candidate.actor]
                         if actor.capacity and actor.backpack is not None and len(actor.backpack) < actor.capacity*0.8:
                             candidate.utility = -0.1
@@ -471,6 +493,8 @@ class Agent:
                       "task_choice": (None if task_choice is None else {
                           'actor':task_choice['actor'],'reason':task_choice['reason'],
                           'selected':task_choice['selected']}),
+                      "pioneer_trade": {"actors":sorted(world.pioneer_trade_ids), "reason":world.pioneer_trade_reason},
+                      "task_lifecycle": world.task_lifecycle.snapshot(world) if hasattr(world, 'task_lifecycle') else {},
                       "return_routes": guidance.return_routes,
                       "navigation_retry_exclusions": {u.id:sorted(world.navigation_avoided.get(u.pos, set())) for u in world.movers},
                       "movement_retry_windows": draft.move_retry_windows(world.round),

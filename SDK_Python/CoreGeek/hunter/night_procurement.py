@@ -52,7 +52,7 @@ def _view(world, blocked):
 
 
 def prepare(world, clock, rules, policy, actor, reach, home, blocked, remaining,
-            deadline, *, task_actor=None):
+            deadline, *, task_actor=None, open_exit=None, night_boundary=frozenset()):
     """Return one funded buy/shop move and a reusable vendor-to-shop tail.
 
     ``reach`` and ``home`` must be complete current-topology M distance maps;
@@ -77,15 +77,17 @@ def prepare(world, clock, rules, policy, actor, reach, home, blocked, remaining,
         answer.diagnostic['status'] = 'personal stock capacity or current gold unknown'
         return answer
     blue, yellow = station_rings(plan['anchor'])
-    gate = plan['gate']
+    gate = plan['gate'] if open_exit is None else open_exit
     gate_walls = [u for u in world.ours.values()
                   if u.alive and u.kind == 'wall' and u.pos == gate]
-    if len(gate_walls) != 1 or gate_walls[0].level != 1:
+    opened = open_exit is not None and gate in yellow and gate not in world.occupied
+    if not opened and (len(gate_walls) != 1 or gate_walls[0].level != 1):
         answer.diagnostic['status'] = 'no observed removable level-one gate'
         return answer
     # Do not remove a second object sharing G, a failed navigation exclusion,
     # another wall or a currently occupied character from the conditional map.
-    other_blocker = any(gate in u.cells and u.blocks and u.id != gate_walls[0].id
+    gate_wall = gate_walls[0] if gate_walls else None
+    other_blocker = any(gate in u.cells and u.blocks and (gate_wall is None or u.id != gate_wall.id)
                         for group in (world.ours, world.enemies, world.robots)
                         for u in group.values())
     other_blocker |= any(gate in cells for cells in world.zones.values())
@@ -100,7 +102,8 @@ def prepare(world, clock, rules, policy, actor, reach, home, blocked, remaining,
 
     actual = _view(world, (set(blocked) | world.occupied) - {actor.pos})
     projected = copy(world)
-    projected.occupied = (world.occupied - {gate}) | (set(blocked) - world.occupied)
+    projected.occupied = (world.occupied if opened else world.occupied - {gate}) | (
+        set(blocked) - world.occupied - set(night_boundary))
     # All roles and their exact personal counts remain present. Only M's route
     # lookup may use the conditional gate; W/P's stock needs an actual route.
     targets, rank, restricted, priority_ids = procurement.upgrade_demand(
@@ -126,7 +129,7 @@ def prepare(world, clock, rules, policy, actor, reach, home, blocked, remaining,
 
     def dawn_budget(entries):
         circuits = [delivery(actor, entry) for entry in entries]
-        costs = [1 + 2 + sum(2 * route[p] + 1 for route in circuits)
+        costs = [int(not opened) + 2 + sum(2 * route[p] + 1 for route in circuits)
                  for p in exterior if all(p in route for route in circuits)]
         return max(costs) if len(costs) == len(exterior) else None
 
@@ -136,15 +139,15 @@ def prepare(world, clock, rules, policy, actor, reach, home, blocked, remaining,
         return answer
     answer.assignments = tuple({'actor': identity, 'target': target['unit'].id,
                                 'name': target['name'], 'steps': steps,
-                                'conditional_dawn': identity == actor.id,
+                                'conditional_dawn': identity == actor.id and not opened,
                                 'dawn_required': held_dawn_required if identity == actor.id else None,
-                                'gate_id': gate_walls[0].id if identity == actor.id else None}
+                                'gate_id': gate_wall.id if identity == actor.id and gate_wall else None}
                                for identity, target, steps in allocations)
     remaining_targets = {key: target for key, target in remaining_targets.items()
                          if not restricted or rank is not None and target['rank'] == rank}
     reserve = procurement.purchase_floor(world, policy, remaining_targets, priority_ids)
     shops = interaction_cells(actual, world.zones.get('weaponShop', ()), actor.pos)
-    seeds = {p: 1 + home[p] + 1 + policy.return_buffer
+    seeds = {p: 1 + home[p] + int(not opened) + policy.return_buffer
              for p in shops if p in home and p in reach}
     if not seeds:
         answer.diagnostic.update(status='no actual shop and exterior gate route',
@@ -181,8 +184,8 @@ def prepare(world, clock, rules, policy, actor, reach, home, blocked, remaining,
     answer.diagnostic = dict(
         status='planned dawn delivery', target=identity, name=answer.name,
         target_level=target['unit'].level, target_pos=target['unit'].pos,
-        gate_id=gate_walls[0].id, gate=gate, opened_observed=False,
-        conditional_dawn=True, dawn_required=dawn_required,
+        gate_id=gate_wall.id if gate_wall else None, gate=gate, opened_observed=opened,
+        conditional_dawn=not opened, dawn_required=dawn_required,
         held_assignments=list(answer.assignments), price=price, gold=world.gold,
         reserve=reserve, funded_observed=funded, capacity_observed=capacity,
         required=night_required, remaining=remaining, return_steps=home[stand],

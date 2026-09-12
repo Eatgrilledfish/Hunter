@@ -505,13 +505,15 @@ def propose(world, clock, rules, policy, deadline, task_actor=None, operator_sta
         if actor.id == task_actor or time.monotonic() >= deadline:
             continue
         if actor.kind == "pioneer":
+            if clock.phases != {'day'} or actor.id in getattr(world, 'pioneer_trade_ids', ()):
+                continue
             if task_choice is not None and actor.id == task_choice['actor']:
                 result.extend(task_choice['candidates'])
                 continue
             # Navigation toward tasks is useful before task eligibility; accepting
             # and holding tasks belongs exclusively to the task engine.
             if not world.phase_task:
-                for task in world.tasks:
+                for task in getattr(world, 'available_tasks', world.tasks):
                     if task.get("isValid") is not True or task.get("coldDownRounds") != 0:
                         continue
                     cells = world.task_cells(task)

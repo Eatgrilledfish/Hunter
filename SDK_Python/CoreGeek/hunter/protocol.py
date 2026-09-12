@@ -124,6 +124,19 @@ class World:
     battery_plan: dict | None = None
     wall_targets: frozenset | None = None
     firing_ports: frozenset = field(default_factory=frozenset)
+    task_lifecycle: object | None = None
+
+    @property
+    def phase_task_observed(self):
+        return isinstance(self.raw.get('phaseTask'), str)
+
+    @property
+    def available_tasks(self):
+        return self.task_lifecycle.available(self) if self.task_lifecycle is not None else self.tasks
+
+    @property
+    def tasks_exhausted(self):
+        return bool(self.task_lifecycle is not None and self.task_lifecycle.exhausted)
 
     def inside(self, pos):
         return 0 <= pos[0] < self.width and 0 <= pos[1] < self.height

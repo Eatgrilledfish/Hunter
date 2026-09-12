@@ -56,7 +56,8 @@ class DaySchedule:
             actor=world.ours[identity];job=jobs.get(identity,{})
             if (getattr(world,'economy_first',False) and plan['stage']=='procure'
                     and self.active.get(identity,'harvest') not in ('cashout','shop','home')):continue
-            if actor.kind!='worker' or (job and not job.get('gate')) or world.seal_cells:continue
+            held_weapon_delivery = plan['stage']=='deliver' and job.get('name')=='wall'
+            if actor.kind!='worker' or (job and not job.get('gate') and not held_weapon_delivery) or world.seal_cells:continue
             endpoint_goals, endpoint = day_endpoints(world, actor, stands)
             home=distance_field(world,endpoint_goals,actor.pos,deadline)
             target=world.ours.get(plan['target'])

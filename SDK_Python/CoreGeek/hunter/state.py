@@ -60,6 +60,9 @@ class Session:
     repair_supply: RepairSupply = field(default_factory=RepairSupply)
 
     def task_actor(self, world):
+        if not world.phase_task_observed and self.tasks.active:
+            actor = world.ours.get(self.tasks.active.actor)
+            return actor.id if actor is not None and actor.alive else None
         if not world.phase_task:
             return None
         for actor in world.movers:
@@ -73,6 +76,7 @@ class Session:
         if world.round == 0:
             self.origin = 0
         clock = Clock(world.round, self.origin)
+        world.strategy_clock = clock
         self.risk.observe(world)
         self.joint_risk.observe(world)
         self.recovery.observe(world)

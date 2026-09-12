@@ -28,34 +28,24 @@ class NightRoster:
         if self.p is None and pioneers:
             self.p = pioneers[0].id
         live = {u.id for u in world.movers}
-        pioneer = world.ours.get(self.p)
-        shared = bool(pioneer and pioneer.alive and (
-            distance(pioneer.pos, plan['c']) <= 1 if plan else
-            any(distance(pioneer.pos, gun.pos) <= 1 for gun in world.weapons)))
-        if world.phase_task:
-            self.handoff_requested = False
-        replacement = self.p not in live or bool(world.phase_task and not shared)
-        if replacement:
-            self.substituting = True
-        elif self.substituting and not self.handoff_requested and (shared or (not plan and pioneer and any(
-                distance(pioneer.pos, gun.pos) <= 1 for gun in world.weapons))):
-            self.substituting = False
+        # A living P owns C even while returning from a daytime task. M is
+        # never recalled merely to let P solve another external night task.
+        # Actual pioneer death retains the existing emergency second guard.
+        self.handoff_requested = False
+        self.handoff_task = ()
+        self.substituting = self.p not in live
         second = self.m if self.substituting else self.p
         if self.traffic:
             traveller = world.ours.get(self.traffic["traveller"])
             blocker = world.ours.get(self.traffic["blocker"])
             fixed_w = self.traffic.get('kind') == 'fixed_w_return'
-            expired_return = (not self.traffic.get('gate_owned') and not fixed_w
-                              and world.phase_task and traveller and traveller.id == self.p
-                              and plan and set(self.traffic['goals']) <= set(plan['c_stands']))
             invalid_fixed = fixed_w and (not plan or self.traffic.get('common') != plan['w']
                 or self.traffic.get('gate') != plan['gate'] or self.traffic.get('c') != plan['c']
-                or self.traffic['traveller'] != self.w or self.traffic['blocker'] != second
-                or blocker and blocker.id == self.p and world.phase_task)
+                or self.traffic['traveller'] != self.w or self.traffic['blocker'] != second)
             restored_fixed = (fixed_w and plan and traveller and blocker
                               and traveller.pos == plan['w'] and blocker.pos in plan['c_stands'])
             if (not traveller or not traveller.alive or not blocker or not blocker.alive
-                    or expired_return or invalid_fixed or restored_fixed
+                    or invalid_fixed or restored_fixed
                     or (not fixed_w and not self.traffic.get('gate_owned') and traveller.pos in self.traffic["goals"])):
                 self.traffic = {}
         world.roster_yielding = {self.traffic["blocker"]} if self.traffic else set()
@@ -79,6 +69,15 @@ def operators(world, include_pioneer=True, task_actor=None, allow_task_control=F
 
 def permits(world, clock, candidate):
     command = candidate.command
+    actor = world.ours.get(candidate.actor)
+    if clock.phases != {'day'} and actor and actor.kind == 'pioneer':
+        if command.get('action') in {'acceptTask','collect','sell','buy','summonTreasure','drop'}:
+            return False
+        if command.get('action') == 'move':
+            # Only observed defence/clearance/repair routes can move P at
+            # night. A fresh procurement or treasure route cannot bypass C.
+            return (command in getattr(world,'pioneer_defence_moves',()) or
+                    command in getattr(world,'repair_commands',{}).get(actor.id,()))
     gate_duty=getattr(world,'gate_worker_duty',None)
     if (gate_duty and gate_duty.get('round')==world.round and command.get('action')=='remove'
             and command.get('targetPos')==[{'x':gate_duty['gate'][0],'y':gate_duty['gate'][1]}]
@@ -205,7 +204,7 @@ def _observe_exit(world):
                             traffic.get('exit_owned') and traffic.get('traveller') == roster.w))
     invalid = (not plan or len(world.stations) != 1 or pending['gate'] != plan['gate'] or
                (pending['m'], pending['p']) != (roster.m, roster.p) or
-               not m or not m.alive or not p or not p.alive or world.phase_task or
+               not m or not m.alive or not p or not p.alive or
                traffic and not own_traffic)
     if invalid:
         roster.exit_pending = {}
@@ -228,19 +227,12 @@ def _observe_exit(world):
                       if distance(q,u.pos)<=u.attack_range) >= p.health}
             world.navigation_avoided.setdefault(p.pos,set()).update(unsafe-{p.pos})
             roster.traffic['stand'] = pending['stand']
-    w = world.ours.get(roster.w)
-    worker_returned = not w or not w.alive or w.pos == plan['w']
-    if outside and not worker_returned:
-        # P's fixed assignment must stay at its real yield until W has
-        # traversed the same corridor. A zero-length transit route alone
-        # cannot replace the director's existing return-to-C assignment.
-        roster.traffic = dict(blocker=p.id,traveller=w.id,stand=pending['stand'],
-                              goals=frozenset({plan['w']}),exit_owned=True)
-        world.roster_yielding.add(p.id)
-    if outside and worker_returned and own_traffic:
+    if outside and own_traffic:
         world.roster_yielding.discard(traffic['blocker'])
         roster.traffic = {}
-    if outside and worker_returned and p.pos in plan['c_stands']:
+    # Restore P to C first. Its economic yield cell can itself block W;
+    # fixed-W clearance then handles that observed local geometry normally.
+    if outside and p.pos in plan['c_stands']:
         roster.exit_pending = {}
         return False
     return True
@@ -261,7 +253,20 @@ def _transit_stands(world, clock, deadline):
         return fixed_return
     result = {}
     p = world.ours.get(roster.p)
-    if roster.substituting and not roster.handoff_requested and p and p.alive and not world.phase_task:
+    m = world.ours.get(roster.m)
+    from .rules import station_rings
+    blue, yellow = station_rings(plan['anchor'])
+    interior = blue | yellow | world.stations[0].cells
+    exit_inside = bool(roster.exit_pending and m and m.pos in interior)
+    w = world.ours.get(roster.w)
+    if exit_inside and w and w.alive and w.pos not in interior:
+        # Zero-step return targets alone permit unrelated movement. Keep an
+        # exterior W in the actual passage whitelist until M is observed out,
+        # including failed yield/exit steps and incomplete route preparation.
+        result[w.id] = w.pos
+        world.fixed_w_transit_actors = (w.id,)
+    if (p and p.alive and p.pos not in plan['c_stands'] and not exit_inside
+            and (not world.phase_task or getattr(world,'task_return_required',False))):
         goals = set(plan['c_stands']) - {plan['w']} - (world.occupied - {p.pos})
         field = distance_field(world, [p.pos], p.pos, deadline)
         available = goals & field.keys()
@@ -270,8 +275,7 @@ def _transit_stands(world, clock, deadline):
         else:
             yielding = clear_c_access(world, p, set(plan['c_stands']), roster.m, deadline)
             result.update(yielding)
-    m = world.ours.get(roster.m)
-    if m and m.alive and (m.id not in defender_ids(world) or roster.handoff_requested):
+    if m and m.alive and m.id not in defender_ids(world) and m.pos in interior:
         # Missing attack facts do not justify a new night excursion. Medical
         # and existing triage remain available while the exterior route waits.
         threats = [u for u in world.robots.values() if u.alive and u.abnormal != 'dizzy']
@@ -288,55 +292,49 @@ def _transit_stands(world, clock, deadline):
                     if 2 * upper >= m.health:
                         blocked.add(q)
         world.navigation_avoided.setdefault(m.pos, set()).update(blocked - {m.pos})
-        goals = ((set(plan['c_stands']) - (world.occupied - {m.pos}))
-                 if roster.handoff_requested else economic_endpoints(
-                     world, m, observed_exits=clock.phases != {'day'})) - blocked
+        goals = economic_endpoints(world,m,observed_exits=clock.phases != {'day'}) - blocked
         field = distance_field(world, [m.pos], m.pos, deadline, extra_blocked=blocked - {m.pos})
         available = goals & field.keys()
         if available:
             result[m.id] = min(available, key=lambda q: (field[q], q))
         else:
-            result.update(clear_c_access(world, m, goals, roster.p, deadline))
-    if (roster.handoff_requested and roster.handoff_task and m and m.alive
-            and m.pos in plan['c_stands'] and p and p.alive and not world.phase_task):
-        # M's first C cell may itself block P's only exit. Move M to another
-        # real stand, then let the next observation authorize P's departure.
-        from .navigation import neighbours
-        task_goals = {q for cell in roster.handoff_task for q in neighbours(cell)}
-        field = distance_field(world,task_goals-world.occupied,p.pos,deadline)
-        if p.pos not in field:
-            yielding = clear_c_access(world,p,task_goals,roster.m,deadline)
+            yielding = clear_c_access(world,m,goals,roster.p,deadline)
             result.update(yielding)
-            if yielding:
-                # This yield serves the corridor crossing, not a task point
-                # that the scheduler may legitimately replace on the way.
-                from .rules import station_rings
-                blue, yellow = station_rings(plan['anchor'])
-                interior = blue | yellow | world.stations[0].cells
-                roster.traffic['goals'] = frozenset(q for q in neighbours(plan['gate'])
-                                                   if world.inside(q) and q not in interior)
-                roster.traffic['observed_handoff'] = dict(round=world.round,origin=m.pos,
-                                                          c=plan['c'],gate=plan['gate'])
+            if not yielding:
+                # W may occupy the first of P's two safe inner yield steps.
+                # Preview at most eight real W retreats, then observe that
+                # single move before publishing P's economic exit traffic.
+                from copy import copy
+                from .navigation import neighbours
+                w = world.ours.get(roster.w)
+                if (w and w.alive and w.pos in blue and w.pos != plan['w'] and p and p.pos in plan['c_stands']
+                        and all(u.attack_power is not None and u.attack_range is not None for u in threats)):
+                    for wait in sorted(set(neighbours(w.pos)) & blue - world.occupied):
+                        if time.monotonic() >= deadline:
+                            return result
+                        if wait in world.navigation_avoided.get(w.pos,set()):
+                            continue
+                        if 2*sum(u.attack_power for u in threats if distance(wait,u.pos)<=u.attack_range) >= w.health:
+                            continue
+                        preview=copy(world)
+                        preview.occupied=(world.occupied-{w.pos})|{wait}
+                        preview.night_roster=copy(roster)
+                        preview.roster_yielding=set(world.roster_yielding)
+                        if clear_c_access(preview,m,goals,roster.p,deadline):
+                            result[w.id]=wait
+                            break
     pending = roster.exit_pending
     if pending and m and m.alive and p and p.alive:
-        # A returning W cannot enter the one-cell corridor while M is still
-        # leaving through it. Once M is outside, restore W before releasing
-        # P's yield, so P's C cell does not block W's remaining route either.
+        # Finish actual M passage before P restores C. W already outside
+        # waits for the shared opening; an inner W uses the local plan above.
         from .rules import station_rings
         blue, yellow = station_rings(plan['anchor'])
         inside = blue | yellow | world.stations[0].cells
         w = world.ours.get(roster.w)
-        if w and w.alive and w.pos != plan['w']:
-            if m.pos in inside:
-                if w.pos not in inside:
-                    result[w.id] = w.pos
-                else:
-                    goals = economic_endpoints(world,w)
-                    field = distance_field(world,[w.pos],w.pos,deadline)
-                    available = goals & field.keys()
-                    if available:result[w.id] = min(available,key=lambda q:(field[q],q))
-            else:
-                result[w.id] = plan['w']
+        if m.pos in inside:
+            if w and w.alive and w.pos != plan['w'] and w.pos not in inside:
+                result[w.id] = w.pos
+                world.fixed_w_transit_actors = (w.id,)
             result[p.id] = pending['stand']
     if roster.traffic:
         result[roster.traffic['blocker']] = roster.traffic['stand']
@@ -365,8 +363,7 @@ def _fixed_w_transit(world, clock, deadline):
         return None
     w = world.ours.get(roster.w)
     blocker = world.ours.get(traffic['blocker'] if owned else roster.m if roster.substituting else roster.p)
-    if (not w or not w.alive or not blocker or not blocker.alive
-            or blocker.id == roster.p and world.phase_task):
+    if not w or not w.alive or not blocker or not blocker.alive:
         return None
     blue, _ = station_rings(plan['anchor'])
     area = blue | {plan['gate']}
@@ -478,6 +475,8 @@ def _fixed_w_transit(world, clock, deadline):
             stand=stand,goals=frozenset({plan['w']}),wait=wait,common=plan['w'],
             gate=plan['gate'],c=plan['c'],stage='retreat_w' if wait!=w.pos else 'yield_c')
         world.roster_yielding.add(blocker.id)
+        if blocker.id == roster.p and world.phase_task:
+            world.task_return_required = True
         return holds
     except BudgetExpired:
         # Do not publish an unfinished new option. Existing traffic waits on
@@ -494,7 +493,9 @@ def clear_c_access(world, traveller, goals, blocker_id, deadline):
     blocker = world.ours.get(blocker_id)
     if time.monotonic() >= deadline or not blocker or not blocker.alive or blocker.pos not in plan['c_stands']:
         return {}
-    if blocker.kind == 'pioneer' and world.phase_task:
+    if (blocker.kind == 'pioneer' and world.phase_task
+            and not getattr(world,'task_return_required',False)
+            and getattr(getattr(world,'night_clock',None),'phases',{'day'}) == {'day'}):
         return {}  # Task-neighbourhood movement needs its separate whitelist.
     # Test real stands against the blocked traveller's full route. An ordinary
     # economic exit can need two P steps along the blue floor: the first yield
@@ -535,6 +536,8 @@ def clear_c_access(world, traveller, goals, blocker_id, deadline):
         field = distance_field(opened, goals - opened.occupied, traveller.pos, deadline)
         if traveller.pos in field and time.monotonic() < deadline:
             world.roster_yielding.add(blocker.id)
+            if blocker.kind == 'pioneer' and world.phase_task:
+                world.task_return_required = True
             world.night_roster.traffic = dict(blocker=blocker.id, traveller=traveller.id,
                                               stand=stand, goals=frozenset(plan['c_stands'] if set(goals) & set(plan['c_stands']) else goals))
             roster = world.night_roster
@@ -547,72 +550,12 @@ def clear_c_access(world, traveller, goals, blocker_id, deadline):
 
 
 def admit_task_departure(world, clock, choice, deadline):
-    """A new external night task waits for M's observed C arrival."""
-    exiting = _observe_exit(world)
-    plan = getattr(world, 'task_side_plan', None)
-    if not plan or clock.phases != {'night'} or world.phase_task:
-        return choice
+    """Only daytime can start a task; night never recalls the economist."""
+    _observe_exit(world)
     defender_ids(world)
     roster = world.night_roster
-    selected = choice.get('selected') if choice else None
-    if exiting and (not selected or distance(selected['goal'],plan['c']) > 1):
-        # P already handed C back before yielding for the released M. A new
-        # task cannot reverse that unfinished exit into another replacement.
-        roster.handoff_requested = False
-        roster.handoff_task = ()
-        roster.substituting = False
-        live = {u.id for u in world.movers}
-        world.night_defenders = frozenset(i for i in (roster.w,roster.p) if i in live)
-        world.night_economists = frozenset({roster.m} & live)
-        return dict(actor=roster.p,selected=None,candidates=[],reason='finish observed worker exit and pioneer return to C')
-    if not selected:
-        still_available = any(
-            ((t.get('isValid') is True and t.get('coldDownRounds') == 0) or
-             (type(t.get('coldDownRounds')) is int and t['coldDownRounds'] > 0
-              and all(type(t.get(k)) is int and t[k] >= (1 if k == 'timeoutRounds' else 0)
-                      for k in ('scoreReward','goldReward','timeoutRounds'))))
-            and tuple(sorted(world.task_cells(t))) == roster.handoff_task for t in world.tasks)
-        if roster.handoff_requested and still_available:
-            return dict(actor=roster.p, selected=None, candidates=[], reason='continue observed replacement through occupied gate')
-        if roster.handoff_requested:
-            traffic = roster.traffic
-            if (traffic and not traffic.get('gate_owned')
-                    and {traffic.get('traveller'),traffic.get('blocker')} == {roster.m,roster.p}):
-                world.roster_yielding.discard(traffic['blocker'])
-                roster.traffic = {}
-        roster.handoff_requested = False
-        roster.handoff_task = ()
+    roster.handoff_requested = False
+    roster.handoff_task = ()
+    if clock.phases == {'day'}:
         return choice
-    if distance(selected['goal'], plan['c']) <= 1:
-        return choice
-    from .navigation import distance_field
-    m = world.ours.get(roster.m)
-    blocked = dict(actor=roster.p, selected=None, candidates=[], reason='wait for observed C replacement')
-    if not m or not m.alive or m.health < 165:
-        return blocked
-    if any(u.alive and u.kind == 'wall' and u.pos == plan['gate'] for u in world.ours.values()):
-        return blocked  # No ordinary night task creates an emergency gate opening.
-    # The transit planner handles actual movement and narrow gate clearing.
-    # Test a relaxed worker route only to request service, never to grant fire.
-    from copy import copy
-    relaxed = copy(world)
-    relaxed.occupied = world.occupied - {world.ours[roster.p].pos}
-    field = distance_field(relaxed, plan['c_stands'], m.pos, deadline)
-    if m.pos not in field:
-        return blocked
-    roster.handoff_requested = True
-    roster.handoff_task = tuple(sorted(world.task_cells(selected['task'])))
-    traffic = roster.traffic
-    observed = traffic.get('observed_handoff',{})
-    crossing = (not traffic.get('gate_owned') and traffic.get('blocker') == roster.m
-                and traffic.get('traveller') == roster.p and observed.get('c') == plan['c']
-                and observed.get('gate') == plan['gate'] and observed.get('origin') in plan['c_stands']
-                and type(observed.get('round')) is int and observed['round'] < world.round
-                and m.pos == traffic.get('stand'))
-    if m.pos not in plan['c_stands'] and not crossing:
-        return blocked
-    roster.substituting = True
-    world.night_defenders = frozenset(i for i in (roster.w, roster.m)
-                                     if i in {u.id for u in world.movers})
-    world.night_economists = frozenset()
-    return choice
+    return dict(actor=roster.p,selected=None,candidates=[],reason='pioneer night defence; economist stays outside')

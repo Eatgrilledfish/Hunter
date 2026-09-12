@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 import json
 import re
 import uuid
+import time
 
 from .arbitration import Candidate
 from .protocol import distance, fingerprint, obj, array, integer, strict_json
@@ -13,6 +14,8 @@ from .task_payload import pack_evidence
 from .program_recipes import ProgramRecipes, arguments as program_arguments
 from .task_timing import TaskTiming, descriptor as timing_descriptor
 from .task_checkpoints import remember as remember_checkpoint, checkpoint as task_checkpoint
+from .task_lifecycle import TaskLifecycle, family as task_family
+from .rules import Clock, Policy
 
 
 def execution_failure(data):
@@ -136,6 +139,7 @@ class TaskInstance:
     locate_round: int = -1
     timing_descriptor: tuple | None = None
     checkpoints: list = field(default_factory=list)
+    task_family: str | None = None
 
 
 def binding_value(task_text, argument):
@@ -559,6 +563,7 @@ def evidence_answer(task, spec):
 
 @dataclass
 class TaskEngine:
+    lifecycle: TaskLifecycle = field(default_factory=TaskLifecycle)
     timing: TaskTiming = field(default_factory=TaskTiming)
     programs: ProgramRecipes = field(default_factory=ProgramRecipes)
     receipt_namespace: str = field(default_factory=lambda: uuid.uuid4().hex)
@@ -574,6 +579,7 @@ class TaskEngine:
     def _close(self, reason, world):
         task = self.active
         if task:
+            self.lifecycle.end(task, reason, world)
             self.timing.close(task, reason, world.round)
             self.closed.append({"key": task.key, "reason": reason, "round": world.round,
                                 "outcome": "UNKNOWN", "submitted": task.submitted[-16:],
@@ -637,7 +643,11 @@ class TaskEngine:
                 continue
 
     def reconcile(self, world, clock, epoch):
+        world.task_lifecycle = self.lifecycle
+        world.strategy_clock = clock
         self.budget.reconcile(world, clock)
+        if not world.phase_task_observed:
+            return  # Missing/invalid phase is neither an end nor a fresh sandbox permit.
         text = world.phase_task
         if self.active and (not text or self.active.text == text):
             self._submission_feedback(world)
@@ -656,6 +666,9 @@ class TaskEngine:
             # Reconcile into a takeover instance; no previous pending can match.
         pioneer = next((u for u in world.movers if u.kind == "pioneer"), None)
         if pioneer is None:
+            observed = world.ours.get(self.active.actor) if self.active else None
+            if self.active and (observed is None or observed.health != 0):
+                return  # A missing unit/health observation cannot consume a task.
             self._close("pioneer unavailable", world)
             self.suppressed_text = text
             return
@@ -680,6 +693,7 @@ class TaskEngine:
             self.generation += 1
             key = f"{epoch}:{self.generation}:{accepted_round}:{fingerprint(text)[:16]}"
             self.active = TaskInstance(key, pioneer.id, text, cells, accepted_round, world.round, timeout)
+            self.active.task_family = task_family(world, task_info)
             self.active.timing_descriptor = timing_descriptor(task_info, cells)
             self.active.statement_names = task_documents(text)
             self.active.evidence["task"] = {"source": "task", "round": world.round,
@@ -937,8 +951,13 @@ class TaskEngine:
         task.sandbox_pending = None
 
     def candidates(self, world, *, choice=None):
+        if not world.phase_task_observed or getattr(world, 'task_return_required', False):
+            return []
         if self.active:
             task = self.active
+            actor = world.ours.get(task.actor)
+            if actor is None or not actor.alive:
+                return []
             if (task.answer is None and task.accept_round is not None and task.timeout is not None
                     and world.round >= task.accept_round + task.timeout - 2):
                 task.answer = task_checkpoint(task)
@@ -948,6 +967,11 @@ class TaskEngine:
             return []
         if world.phase_task or self.accept_pending:
             return []
+        clock = getattr(world, 'strategy_clock', Clock(world.round, None))
+        if clock.phases != {'day'}:
+            return []
+        from .task_schedule import can_accept
+        policy = getattr(world, 'strategy_policy', Policy())
         result = []
         for actor in world.movers:
             if actor.kind != "pioneer":
@@ -958,8 +982,10 @@ class TaskEngine:
                     continue
                 if selected['task'].get('isValid') is not True or selected['task'].get('coldDownRounds') != 0:
                     continue
-            if any(t.get("isValid") is True and type(t.get("coldDownRounds")) is int and t["coldDownRounds"] == 0
-                   and any(distance(actor.pos, p) <= 1 for p in world.task_cells(t)) for t in world.tasks):
+            nearby = [t for t in world.available_tasks
+                      if t.get("isValid") is True and type(t.get("coldDownRounds")) is int and t["coldDownRounds"] == 0
+                      and any(distance(actor.pos, p) <= 1 for p in world.task_cells(t))]
+            if len(nearby) == 1 and can_accept(world, clock, policy, self.timing, actor, nearby[0], time.monotonic()+.02):
                 result.append(Candidate(actor.id, {"action": "acceptTask"}, 20, "accept available adjacent own task"))
         return result
 
@@ -971,6 +997,9 @@ class TaskEngine:
                 return  # Accept does not confer task-channel eligibility yet.
         task = self.active
         if task is None:
+            return
+        actor = world.ours.get(task.actor)
+        if not world.phase_task_observed or actor is None or not actor.alive:
             return
         action = response["roleCommandMap"].get(task.actor, {})
         if action.get("action") == "move":
@@ -1019,6 +1048,8 @@ class TaskEngine:
             self.skills.observe_workflow(task, task.answer)
             task.answer = None
             return  # Never rely on exemption/sandbox surviving submission.
+        if getattr(world, 'task_return_required', False):
+            return  # Keep evidence/identity until the actual return is observed.
         # A known expiry is only a conservative stopping bound, not the unknown
         # official inclusive/exclusive timeout rule.
         stopping = task.timeout is not None and task.accept_round is not None and world.round >= task.accept_round+task.timeout-2

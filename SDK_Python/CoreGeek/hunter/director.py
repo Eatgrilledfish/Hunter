@@ -511,21 +511,91 @@ def triage(world, clock, task_actor, task, policy=None, risk_memory=None):
     return result
 
 
+def _pioneer_return_due(world, clock, policy, deadline):
+    """Real return distance can end daytime work; night always owns defence."""
+    roster = world.night_roster
+    pioneer = world.ours.get(roster.p)
+    if not pioneer or not pioneer.alive or not world.stations:
+        return False
+    traffic = roster.traffic
+    if (traffic and not traffic.get('gate_owned') and traffic.get('blocker') == pioneer.id
+            and (traffic.get('kind') == 'fixed_w_return' or clock.phases != {'day'})):
+        return True  # A failed real yield remains due even while P is at C.
+    plan = getattr(world,'task_side_plan',None)
+    goals = (set(plan['c_stands']) if plan else set(world.defence_cells))
+    if not goals:
+        goals = interaction_cells(world,[p for station in world.stations for p in station.cells],pioneer.pos)
+    if pioneer.pos in goals:
+        return False
+    if clock.phases != {'day'}:
+        return True
+    if not policy.return_commitment_enabled or not policy.pioneer_defence_enabled:
+        return False
+    if time.monotonic() >= deadline:
+        return False
+    actual = distance_field(world,goals-world.occupied,pioneer.pos,deadline)
+    length = actual.get(pioneer.pos)
+    if length is None and time.monotonic() < deadline:
+        # A role blocking the corridor cannot erase the departure deadline.
+        # This relaxed distance only requests return; every issued move still
+        # uses the observed occupied map and explicit clearance below.
+        relaxed = copy(world)
+        relaxed.occupied = world.occupied-{u.pos for u in world.movers}
+        length = distance_field(relaxed,goals-relaxed.occupied,pioneer.pos,deadline).get(pioneer.pos)
+    return (time.monotonic() < deadline and length is not None
+            and clock.until_night <= length+policy.return_buffer+(8 if world.defence_cells else 0))
+
+
 def propose(world, clock, task_actor, task, deadline, policy=None, risk_memory=None, *, failed_steps=None):
     policy = policy or Policy()
+    world.night_clock = clock
+    world.task_return_required = False
+    world.pioneer_defence_moves = []
+    defender_ids(world)
+    world.task_return_required = _pioneer_return_due(world,clock,policy,deadline)
+    if world.task_return_required and clock.phases != {'day'}:
+        pioneer = world.ours[world.night_roster.p]
+        threats = [r for r in world.robots.values() if r.alive and r.abnormal != 'dizzy']
+        blocked = set()
+        complete = True
+        for x in range(world.width):
+            if time.monotonic() >= deadline:
+                complete = False;break
+            for y in range(world.height):
+                point = x,y
+                sources = [r for r in threats if r.attack_range is None or distance(point,r.pos)<=r.attack_range]
+                if (any(r.attack_power is None or r.attack_range is None for r in sources)
+                        or 2*sum(r.attack_power for r in sources) >= pioneer.health):
+                    blocked.add(point)
+        if not complete:
+            # Expiry cannot turn every free neighbour into an observed wall.
+            # Check only the next possible step (at most eight cells) using
+            # the same threat facts; unknown range/power remains unsafe.
+            blocked = set()
+            for point in neighbours(pioneer.pos):
+                sources = [r for r in threats if r.attack_range is None or distance(point,r.pos)<=r.attack_range]
+                if (any(r.attack_power is None or r.attack_range is None for r in sources)
+                        or 2*sum(r.attack_power for r in sources) >= pioneer.health):
+                    blocked.add(point)
+        world.navigation_avoided.setdefault(pioneer.pos,set()).update(blocked-{pioneer.pos})
+    if world.task_return_required:
+        # Preserve task state until an actual departure is observed, but its
+        # old neighbourhood cannot pin the night C operator outside the base.
+        task_actor, task = None, None
+    include_pioneer = policy.pioneer_defence_enabled or clock.phases != {'day'}
     result = triage(world, clock, task_actor, task, policy, risk_memory)
     triage_candidates = list(result.candidates)
     # Reserve a complete current-state route bundle before optional placement
     # optimization can exhaust its time budget. Keep triage candidates separate.
     if policy.return_commitment_enabled:
-        result.operator_stands = fallback_stands(world, include_pioneer=policy.pioneer_defence_enabled,
+        result.operator_stands = fallback_stands(world, include_pioneer=include_pioneer,
                                                  task_actor=task_actor, allow_task_control=result.allow_task_control,
                                                  handoff_enabled=policy.operator_handoff_enabled and clock.phases == {'night'})
         baseline = return_plan(world, clock, result.operator_stands, policy, failed_steps=failed_steps)
         result.operator_plan_status = "fallback"
     else:
         baseline = ({}, [])
-    refined_stands = assign_operator_stands(world, clock, deadline, include_pioneer=policy.pioneer_defence_enabled,
+    refined_stands = assign_operator_stands(world, clock, deadline, include_pioneer=include_pioneer,
                                                     task_actor=task_actor, allow_task_control=result.allow_task_control,
                                                     safety_enabled=policy.operator_safety_enabled,
                                                     firing_lanes_enabled=policy.firing_lanes_enabled,
@@ -567,7 +637,7 @@ def propose(world, clock, task_actor, task, deadline, policy=None, risk_memory=N
                 result.candidates.extend(inward[1])
     # With fewer guns than roles, an unassigned pioneer still needs a return
     # destination. The base is a landmark, not assumed invulnerability.
-    if world.stations and policy.pioneer_defence_enabled:
+    if world.stations and include_pioneer:
         for actor in world.movers:
             if actor.id not in defender_ids(world) or (actor.kind != "pioneer" and not world.defence_cells) or actor.id == task_actor or actor.id in result.return_routes:
                 continue
@@ -686,14 +756,11 @@ def propose(world, clock, task_actor, task, deadline, policy=None, risk_memory=N
     for identity in getattr(world,'fixed_w_transit_actors',()):
         result.roster_transit_actions[identity] = [c.command for c in
             transit_candidates + triage_candidates if c.actor == identity]
-    if (clock.phases == {'night'} and roster and roster.handoff_requested
-            and traffic and not traffic.get('gate_owned')
-            and traffic.get('traveller') == roster.m and traffic.get('blocker') == roster.p):
-        # The replacement may have no route until P actually yields. That is
-        # still an active handoff, not spare time for an unrelated delivery.
-        # Keep its real moves and immediate rescue options; observation clears
-        # the traffic only after the traveller reaches its actual destination.
-        for identity in (roster.m, roster.p):
+    if (clock.phases != {'day'} and roster and traffic and not traffic.get('gate_owned')
+            and {traffic.get('traveller'),traffic.get('blocker')} == {roster.m,roster.p}):
+        # Physical P return/M exit owns this short corridor until the observed
+        # traveller passes. No task or unrelated delivery may reverse it.
+        for identity in (roster.m,roster.p):
             result.roster_transit_actions[identity] = [c.command for c in
                 transit_candidates + triage_candidates if c.actor == identity]
     for actor in world.movers:
@@ -704,4 +771,21 @@ def propose(world, clock, task_actor, task, deadline, policy=None, risk_memory=N
         result.horizon_risk[actor.id] = observation
         if actor_task:
             result.task_moves.update((c.command["targetPos"][0]["x"], c.command["targetPos"][0]["y"]) for c in proposed)
+    if world.task_return_required and roster and roster.p:
+        route = result.return_routes.get(roster.p,{})
+        steps = set(route.get('steps',()))
+        allowed = [c.command for c in result.candidates if c.actor == roster.p and (
+            c in triage_candidates or c.command.get('action') == 'move' and
+            tuple(c.command['targetPos'][0][k] for k in ('x','y')) in steps)]
+        result.roster_transit_actions[roster.p] = allowed
+        result.candidates = [c for c in result.candidates if c.actor != roster.p or c.command in allowed]
+        result.task_moves.update(tuple(c['targetPos'][0][k] for k in ('x','y'))
+                                 for c in allowed if c.get('action') == 'move')
+    if roster and roster.p:
+        route_steps = set(result.return_routes.get(roster.p,{}).get('steps',()))
+        transit_commands = result.roster_transit_actions.get(roster.p,())
+        world.pioneer_defence_moves = [c.command for c in result.candidates
+            if c.actor == roster.p and c.command.get('action') == 'move' and (
+                c in triage_candidates or c.command in transit_commands or
+                tuple(c.command['targetPos'][0][k] for k in ('x','y')) in route_steps)]
     return result

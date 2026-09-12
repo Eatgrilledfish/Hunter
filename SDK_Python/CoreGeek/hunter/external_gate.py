@@ -84,6 +84,7 @@ class ExternalGate:
         return command in self.commands[identity]
 
     def prepare(self, world, clock, rules, policy, deadline, task_busy=False, *, defer_regular_night=False):
+        world.night_economy_active=False
         self.commands={};self.firearms={};self.diagnostic={'stage':self.stage};self.cashout_report={};self.mining_report={};self.purchase_report={}
         self.deferred_night=False
         self.gate_offer={}
@@ -120,6 +121,7 @@ class ExternalGate:
                            defer_regular_night=defer_regular_night)
 
     def resume_night(self, world, clock, rules, policy, deadline, task=None, task_busy=False):
+        world.night_economy_active=False
         if not self.deferred_night:
             return []
         self.deferred_night=False
@@ -329,8 +331,24 @@ class ExternalGate:
         blue,yellow=station_rings(plan['anchor']);gate=plan['gate']
         walls={u.pos for u in world.ours.values() if u.alive and u.kind=='wall'}
         complete={u.pos:u for u in world.weapons}
-        active=self.emergency_active or self.inner_backup or self.stage in ('DUSK_MOVE','SEAL_PENDING','SEALED','NIGHT_FORAGE','NIGHT_CASHOUT','NIGHT_PURCHASE','RETURN_TO_GATE','RETURN_BLOCKED','DAWN_OPEN','DAWN_BACKUP')
+        active=self.emergency_active or self.inner_backup or self.stage in ('DUSK_MOVE','SEAL_PENDING','SEALED','NIGHT_FORAGE','NIGHT_CASHOUT','NIGHT_PURCHASE','NIGHT_WAIT_SERVICE','RETURN_TO_GATE','RETURN_BLOCKED','DAWN_OPEN','DAWN_BACKUP')
         fully_armed=set(complete)=={q for _,q in plan['slots']}
+        open_exit=None
+        roster=world.night_roster
+        economic_worker=world.ours.get(roster.m)
+        # An already exterior M can work through an observed open yellow exit
+        # on the first night, without a synthetic prior full-ring seal event.
+        if (clock.phases=={'night'} and policy.night_foraging_enabled and fully_armed
+                and economic_worker and economic_worker.alive
+                and economic_worker.pos not in blue|yellow|world.stations[0].cells
+                and economic_worker.id not in world.night_defenders):
+            openings=[q for q in yellow-world.occupied
+                      if any(p in blue and p not in world.occupied for p in neighbours(q))
+                      and any(world.inside(p) and p not in blue|yellow|world.stations[0].cells
+                              and p not in world.occupied for p in neighbours(q))]
+            if openings:
+                open_exit=min(openings,key=lambda q:(distance(economic_worker.pos,q),q!=gate,q))
+                gate=open_exit
         previous_seal=world.seal_cells
         try:
             if clock.phases == {'day'}:
@@ -348,6 +366,11 @@ class ExternalGate:
             opening = self.stage in ('DAWN_OPEN', 'DAWN_BACKUP', 'PROTECTED_GATE') or (
                 self.gate_assignment.get('kind')=='dawn' and not self.gate_assignment.get('completed_observed'))
             next_day = self.day is not None and clock.day > self.day
+            if clock.phases == {'day'} and next_day and gate not in walls and not opening:
+                # An open-exit economy night has no dawn removal to issue.
+                # End its reservation and continue this actual daytime frame.
+                self.day=None;self.stage='INACTIVE';self.return_committed=False;self.cashout_committed=False
+                active=False;next_day=False
             observed_day_gate = (self.day is None and gate in walls and clock.until_night > 18
                                  and (clock.day>=2 or walls==yellow))
             if clock.phases == {'day'} and (opening or next_day or observed_day_gate):
@@ -384,7 +407,11 @@ class ExternalGate:
             if not fully_armed and not active:
                 self.stage='DEFENCE_UNAVAILABLE'
                 return []
-            if not active:
+            if open_exit is not None:
+                self.w,self.m,self.p=roster.w,roster.m,roster.p
+                if self.day!=clock.day:self.return_committed=False;self.cashout_committed=False
+                self.day=clock.day
+            elif not active:
                 if (clock.phases!={'day'} or clock.day<2 or clock.until_night>18
                         or self.aborted_day==clock.day or task_busy or self.damage_upper is None
                         or walls!=yellow-{gate}):
@@ -419,6 +446,8 @@ class ExternalGate:
                         q=(x,y)
                         danger[q]=danger.get(q,0)+(robot.attack_power if robot.attack_power is not None else m.health)
             blocked.update(q for q,h in danger.items() if 2*h>=m.health)
+            night_boundary=blue|yellow|world.stations[0].cells if open_exit is not None else frozenset()
+            blocked.update(night_boundary)
             blocked.discard(m.pos)
             outside={q for q in neighbours(gate) if world.inside(q) and q not in blue|yellow|world.stations[0].cells and q not in blocked}
             home=_field(world,outside,blocked,deadline)
@@ -438,15 +467,16 @@ class ExternalGate:
             from .forage_admission import pioneer_service_available
             p_service=(pioneer_service_available(world) if clock.phases=={'night'}
                        else bool(p and p.pos in plan['c_stands'] and not task_busy))
+            observed_damage=self.damage_upper if self.damage_upper is not None else (0 if not threats else None)
             guard_ok=bool(fully_armed and w and w.alive and p and p.alive
                           and w.pos==plan['w'] and p_service
                           and w.health>=165 and p.health>=150
-                          and self.damage_upper is not None
-                          and all(u.health>2*max(self.damage_upper,danger.get(u.pos,0)) for u in (w,p)))
-            safe=(risk_known and m.health>=165 and self.damage_upper is not None
-                  and m.health>2*max(self.damage_upper,danger.get(m.pos,0)))
+                          and observed_damage is not None
+                          and all(u.health>2*max(observed_damage,danger.get(u.pos,0)) for u in (w,p)))
+            safe=(risk_known and m.health>=165 and observed_damage is not None
+                  and m.health>2*max(observed_damage,danger.get(m.pos,0)))
             from .forage_admission import assess
-            admission=assess(world,rules,policy,deadline) if guard_ok else {'allowed':False,'reason':'guards unavailable'}
+            admission=assess(world,rules,policy,deadline,open_exit=open_exit) if guard_ok else {'allowed':False,'reason':'guards unavailable'}
             mine_values={q:world.vendor[name] for name in ('stone','iron','copper')
                          if world.vendor.get(name,0)>0 for q in world.zones.get(name,())}
             mines=set(mine_values)
@@ -483,15 +513,17 @@ class ExternalGate:
                         self.stage='SEAL_PENDING'
                         command={'action':'build','name':'wall','targetPos':[pos_json(gate)]}
             elif clock.phases=={'night'}:
+                world.night_economy_active=True
                 remaining=min(130-(world.round-o)%130 for o in clock.offsets)
                 self.stage='RETURN_TO_GATE'
-                if (policy.night_foraging_enabled and not self.return_committed and gate in walls and guard_ok and safe and admission['allowed']
+                if (policy.night_foraging_enabled and not self.return_committed and (gate in walls or open_exit is not None) and guard_ok and safe and admission['allowed']
                         and m.capacity and m.backpack is not None):
                     saleable=self._saleable(world,m,reserve_gate=clock.day<10)
                     if not saleable:self.cashout_committed=False
                     from . import night_procurement
                     purchase=night_procurement.prepare(world,clock,rules,policy,m,reach,home,blocked,
-                                                       remaining,deadline,task_actor=self.p if world.phase_task else None)
+                                                       remaining,deadline,task_actor=self.p if world.phase_task else None,
+                                                       open_exit=open_exit,night_boundary=night_boundary)
                     self.purchase_report=purchase.diagnostic
                     self.purchase_report['receipt']=self.purchase_receipt
                     if self.purchase_pending:
@@ -549,8 +581,14 @@ class ExternalGate:
                                 if travel==0:command={'action':'collect','targetPos':[pos_json(mine)]}
                                 else:command=self._move(m,_field(world,[stand],blocked,deadline))
                 if command is None:
-                    self.return_committed=True
-                    if home[m.pos]:command=self._move(m,home)
+                    if open_exit is not None and safe and remaining>home[m.pos]+policy.return_buffer+2 and not self.return_committed:
+                        # Guard transit is an observation, not a permanent
+                        # nightly recall. Keep exterior M available for the
+                        # first frame where the actual W/P service is ready.
+                        self.stage='NIGHT_WAIT_SERVICE'
+                    else:
+                        self.return_committed=True
+                        if home[m.pos]:command=self._move(m,home)
             if time.monotonic()>=deadline:raise BudgetExpired
             self.commands={m.id:[command] if command else []}
             extra=[]
@@ -571,7 +609,7 @@ class ExternalGate:
                     self.firearms[actor.id]=tuple(complete[plan[k]].id for k in keys if plan[k] in complete)
             world.night_forage_commands={m.id:[command]} if command and command.get('action')=='collect' else {}
             self.diagnostic=dict(stage=self.stage,m=m.id,w=self.w,p=self.p,gate=gate,
-                                 actual_outside=m.pos not in blue,damage_upper=self.damage_upper,admission=admission,cashout=self.cashout_report,mining=self.mining_report,purchase=self.purchase_report)
+                                 actual_outside=m.pos not in blue,open_exit=open_exit,damage_upper=self.damage_upper,admission=admission,cashout=self.cashout_report,mining=self.mining_report,purchase=self.purchase_report)
             candidates=([Candidate(m.id,command,1000,'observed external gate cycle: '+self.stage,gold_reserve=economic_floor)]+extra) if command else []
             if clock.phases=={'day'} and self.stage in ('DUSK_MOVE','SEAL_PENDING'):
                 row=seal_row or (self.gate_assignment.get('row') if self.gate_assignment.get('kind')=='seal' else None)
@@ -579,6 +617,7 @@ class ExternalGate:
             return candidates
         except BudgetExpired:
             world.external_gate_permit=None;world.seal_cells=previous_seal
+            world.night_economy_active=False
             self.commands={self.m:[]} if active and self.m else {};self.firearms={}
             self.diagnostic={'stage':'BUDGET_EXHAUSTED'}
             self.gate_offer={}

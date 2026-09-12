@@ -232,7 +232,7 @@ def bundle_allowed(world, bundle, *, complete=True, require_service=False):
     return fire_allowed(world, commands, complete)
 
 
-def assess(world, rules, policy, deadline):
+def assess(world, rules, policy, deadline, *, open_exit=None):
     plan=world.task_side_plan
     roster=world.night_roster
     w,p=(world.ours.get(i) for i in (roster.w,roster.p))
@@ -250,7 +250,16 @@ def assess(world, rules, policy, deadline):
         return report
     blue,yellow=station_rings(plan['anchor'])
     walls={u.pos:u for u in world.ours.values() if u.alive and u.kind=='wall'}
-    if not yellow-{plan['gate']} <= walls.keys():
+    if open_exit is not None:
+        if open_exit not in yellow or open_exit in world.occupied:
+            report['reason']='economic exit is not observed open'
+            return report
+        if any(r.pos in blue|world.stations[0].cells for r in threats):
+            report['reason']='robot inside defensive ring'
+            return report
+        report['observed_open_exit']=open_exit
+        report['missing_permanent_walls']=sorted((yellow-{plan['gate']})-walls.keys())
+    elif not yellow-{plan['gate']} <= walls.keys():
         report['reason']='permanent wall missing'
         return report
     served={w.id:[guns[plan['a']],guns[plan['b']]],p.id:[guns[plan['c']]]}
