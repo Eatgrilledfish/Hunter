@@ -150,6 +150,15 @@ class Agent:
                 demands,rank,restricted,_=economy.procurement.upgrade_demand(world,self.policy,rules=self.rules)
                 funded=any((not restricted or d['rank']==rank) and d['name'] in world.shop
                     and (world.gold or 0)>=world.shop[d['name']] for d in demands.values())
+                if waiting and not funded:
+                    from .supply_basket import requirements
+                    funded=any(0 < world.shop.get(r['name'],0) <= (world.gold or 0)
+                               for r in requirements(world,self.rules,self.policy))
+                    actor=world.ours.get(task_choice['actor'])
+                    funded |= bool(actor and actor.backpack is not None and actor.capacity is not None
+                        and len(actor.backpack)<actor.capacity and any(
+                            actor.inventory[name]<limit and 0 < world.shop.get(name,0) <= (world.gold or 0)
+                            for name,limit in (('Medicine',2),('Bomb',60))))
                 if draft.sunset_market.upgrade_owner==task_choice['actor'] or waiting and funded:
                     task_choice=dict(actor=task_choice['actor'],selected=None,candidates=[],
                         reason='funded upgrade checkout precedes waiting for a future task')

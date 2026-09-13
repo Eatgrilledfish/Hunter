@@ -59,13 +59,18 @@ def prepare(state, world, clock, rules, policy, deadline):
 
     def clear_worker_for(traveller, goals):
         reach = distance_field(world,{worker.pos},worker.pos,deadline)
+        unblocked = copy(world)
+        unblocked.occupied = world.occupied-{worker.pos}
+        shortest = distance_field(unblocked,goals,traveller.pos,deadline).get(traveller.pos)
+        if shortest is None:return None
         for q in sorted(reach,key=lambda q:(reach[q],distance(q,gate),q)):
             if q in interior or reach[q] > 6 or q == traveller.pos:
                 continue
             preview = copy(world)
             preview.occupied = (world.occupied - {worker.pos}) | {q}
             passage = distance_field(preview,goals,traveller.pos,deadline)
-            if traveller.pos in passage and time.monotonic() < deadline:
+            if (passage.get(traveller.pos,float('inf'))<=shortest+1
+                    and time.monotonic() < deadline):
                 return step(worker,{q})
             if time.monotonic() >= deadline:
                 break
@@ -127,14 +132,10 @@ def prepare(state, world, clock, rules, policy, deadline):
         state.diagnostic.update(stage='MINER_EXIT',miner_outside_observed=False)
         return result
 
-    # The ordinary construction planner budgets the complete stone supply and
-    # wall tour. Do not replace that project with one-stone dusk builds, or
-    # hold its worker while P walks home. Ordered ingress owns only the final
-    # closure, after the other required walls have actually been observed.
+    # Construction owns the remaining walls, but an unfinished perimeter must
+    # not disable guard ingress. A worker at C can block the only path to A/B
+    # even when another wall elsewhere is still missing.
     missing = set(world.wall_targets or yellow) - walls.keys() - ({gate} if enclosing else set())
-    if missing:
-        state.diagnostic.update(stage='WORKER_CONSTRUCTION',remaining_walls=len(missing))
-        return result
     if not enclosing:
         # A front-only first-day layout has no final enclosing-wall closure.
         # Ordinary return planning still owns both guards; do not reserve W
@@ -145,17 +146,36 @@ def prepare(state, world, clock, rules, policy, deadline):
     relaxed = copy(world)
     relaxed.occupied = world.occupied - {u.pos for u in world.movers}
     home = distance_field(relaxed,{plan['w']},pioneer.pos,deadline)
-    worker_home = distance_field(relaxed,set(neighbours(gate)) & blue,worker.pos,deadline)
-    # Entry is sequential: reserve both real walks plus clearance/seal time.
-    required = home.get(pioneer.pos,0) + worker_home.get(worker.pos,0) + policy.return_buffer + 8
-    required += getattr(world,'worker_upgrade_use_steps',0)
+    # The exterior walks can happen concurrently. W's day itinerary already
+    # reserves its own trip, construction and voucher use. Adding that entire
+    # itinerary here recalled P from a nearby shop many turns too early.
+    # Reserve P's entry and bounded worker clearance at the actual bottleneck.
+    required = home.get(pioneer.pos,0) + policy.return_buffer + 8
     if clock.until_night > max(18,required):
+        if not missing and getattr(world,'worker_close_requested',False) and pioneer.pos != plan['w']:
+            # W has finished the wall tour and is waiting for final closure.
+            # Keep the entrance open now: a W blocking C also makes P's
+            # checkout budget see no return route, freezing P at the shop.
+            # Clear W without recalling P, so the remaining purchases finish.
+            actual = distance_field(world,{plan['w']},pioneer.pos,deadline).get(pioneer.pos)
+            if actual is None or actual > home.get(pioneer.pos,actual)+2:
+                command = clear_worker_for(pioneer,{plan['w']})
+                if command:offer(worker,command,'open return corridor for pioneer checkout before dusk')
+            elif worker.pos not in interior:
+                hold(worker)
+            state.diagnostic.update(stage='CHECKOUT_PASSAGE',pioneer_return_ordered=False)
+        if missing:state.diagnostic.update(stage='WORKER_CONSTRUCTION',remaining_walls=len(missing))
         return result
     world.ordered_ingress_due = True
     state.stage = 'PIONEER_FIRST'
 
     if pioneer.pos != plan['w']:
-        command = step(pioneer,{plan['w']})
+        actual = distance_field(world,{plan['w']},pioneer.pos,deadline).get(pioneer.pos)
+        # A long walk around the entire perimeter is not evidence that the
+        # worker has finished clearing the short gate corridor. Continue the
+        # clearance until P's actual path is close to its unobstructed path.
+        detour = actual is None or actual>home.get(pioneer.pos,actual)+2
+        command = None if detour else step(pioneer,{plan['w']})
         if command:
             offer(pioneer,command,'pioneer enters shared two-turret stand before worker')
             # A worker outside waits away from the only entry, then follows.
@@ -175,6 +195,13 @@ def prepare(state, world, clock, rules, policy, deadline):
 
     hold(pioneer)
     state.stage = 'WORKER_LAST'
+    if missing:
+        # P has cleared the bottleneck. W's single daily itinerary now owns
+        # construction/use AND its return budget. Forcing W home on every
+        # off-stand frame fights that itinerary and makes it walk back/forth.
+        # Do not claim a sealed ring or relax any wall build permission.
+        state.diagnostic.update(stage='GUARDS_IN_WITH_GAPS',remaining_walls=len(missing))
+        return result
     if gate in walls:
         state.stage = 'WORKER_SEALED'
         return result

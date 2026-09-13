@@ -81,6 +81,31 @@ class CaretakerDay:
         home = distance_field(world, defence_duties.stands(world, actor.id), actor.pos, deadline,
                               extra_blocked={plan['w']})
         margin = policy.return_buffer + (8 if set(world.wall_targets or ()) == yellow else 0)
+        self.diagnostic = dict(left=clock.until_night,missing_walls=len(missing),reserved_stone=stone)
+        if self.phase == 'harvest':
+            repairs = getattr(world,'repair_commands',{}).get(actor.id,[])
+            repair_steps = getattr(world,'day_repair_steps',{}).get(actor.id,1)
+            if repairs and repair_steps*2+home.get(actor.pos,float('inf'))+margin < clock.until_night:
+                return self.finish(world,guidance,jobs,actor,
+                    [Candidate(actor.id,c,260,'repair owned low-health wall before planning optional shopping') for c in repairs],
+                    'repair')
+            if home.get(actor.pos)==0 and not actor.inventory['stone']:
+                # An unfunded gap must not block a one-action improvement
+                # already paid for and usable from the actual duty stand.
+                immediate=[]
+                for target in world.ours.values():
+                    if (target.alive and target.level in (1,2) and
+                            procurement.upgrade_allowed(world,target,policy,rules) and
+                            max(abs(actor.pos[0]-target.pos[0]),abs(actor.pos[1]-target.pos[1]))<=1):
+                        prefix='Weapon' if target in world.weapons else 'Wall' if target.kind=='wall' else None
+                        name=f'{prefix}UpgradeVoucher{target.level}'
+                        if prefix and actor.inventory[name]:
+                            immediate.append((prefix!='Weapon',target.id,name,target))
+                if immediate:
+                    _,_,name,target=min(immediate,key=lambda t:t[:2])
+                    return self.finish(world,guidance,jobs,actor,[Candidate(actor.id,
+                        dict(action='use',name=name,targetPos=[pos_json(target.pos)]),240,
+                        'apply paid adjacent voucher after repair while remaining gaps lack material')],'use')
         # The construction planner already budgets every missing wall, walking,
         # final entry and sealing. Add the use tour after that actual endpoint.
         tail = home
@@ -105,75 +130,45 @@ class CaretakerDay:
         if tail is None or end is None or time.monotonic() >= deadline:
             return self.finish(world, guidance, jobs, actor, [], 'close', reason='route budget unavailable')
 
-        targets, rank, restricted, _ = procurement.upgrade_demand(world, policy, rules=rules)
+        # One shopping basket covers successive voucher tiers and personal
+        # night stock. Forecast sale proceeds are timing-only; the buy below
+        # still caps its quantity by the observed balance after receipts.
+        from . import supply_basket
+        trip_world = copy(world)
+        trip_world.occupied = world.occupied | {plan['w']}
+        trip = supply_basket.quote(trip_world,actor,clock,rules,policy,deadline,
+            home=home,tail=tail,end=end,margin=margin,sale_stock=stock,
+            cash=(world.gold or 0)+sum(n*world.vendor[k] for k,n in stock.items()))
+        cash = max(0,(world.gold or 0)-getattr(world,'treasure_reserved_gold',0))
+        order = None; count = 0; held = []; deliveries = {}; use_steps = 0
+        checkout = tail; sale = tail; required = None
+        if trip is not None:
+            held = trip['held']
+            use_steps = trip['use_steps']
+            checkout,sale,required = trip['checkout'],trip['sale'],trip['required']
+            if trip['orders']:
+                name,count = next(iter(trip['orders'].items()))
+                order = dict(name=name)
         fields = {}
-        def route(carrier, target):
-            if carrier.id == world.night_roster.p and target['unit'].pos == plan['c']:
-                return {}  # W's single turret must not wait on P's personal voucher.
-            key = carrier.id, target['unit'].id
+        def route(carrier,target):
+            key = carrier.id,target['unit'].id
             if key not in fields:
-                fields[key] = distance_field(world, interaction_cells(world, [target['unit'].pos], carrier.pos),
-                                             carrier.pos, deadline)
+                fields[key] = distance_field(trip_world,
+                    interaction_cells(trip_world,[target['unit'].pos],carrier.pos),carrier.pos,deadline)
             return fields[key]
-        carriers = {i:world.ours[i] for i in (world.night_roster.w, world.night_roster.p)
-                    if i in world.ours and world.ours[i].alive and world.ours[i].backpack is not None}
-        unfilled, deliveries, allocations = procurement.match_carried_supply(targets, carriers, deadline, route)
-        held = [t for i,t,_ in allocations if i == actor.id]
-        cash = max(0, (world.gold or 0) - getattr(world, 'treasure_reserved_gold', 0))
-        liquidation = cash + sum(n * world.vendor[k] for k,n in stock.items())
-        if self.phase == 'harvest':
-            liquidation += max(world.vendor.values(), default=0)
-        leading = [t for t in unfilled.values() if t['unit'].kind != 'station'
-                   and (not restricted or t['rank'] == rank) and world.shop.get(t['name'], 0) > 0]
-        affordable_upgrade = any(cash >= world.shop[t['name']] for t in leading)
-        # Only stock that can be applied after the walls are closed is ordered.
-        closed = copy(world)
-        closed.occupied = (world.occupied - {actor.pos}) | missing | {plan['w']}
-        reach = distance_field(closed, {end}, end, deadline)
-        leading = [t for t in leading if interaction_cells(closed, [t['unit'].pos], end) & reach.keys()]
-        order = min(leading, key=lambda t:(t['rank'], t['name'], t['unit'].id), default=None)
-        count = 0
-        if order and not held:
-            count = min(3, sum(t['name'] == order['name'] for t in leading),
-                        liquidation // world.shop[order['name']], actor.capacity - len(actor.backpack) + sum(stock.values()))
-        use_targets = held or [t for t in leading if order and t['name'] == order['name']][:count]
-        # Replenish personal repair stock only after the weapon/front-wall
-        # upgrade tier has actually finished, preserving the upgrade cash floor.
-        if (not held and not any(t['unit'].kind != 'station' for t in targets.values())
-                and world.shop.get('WallFixer',0) > 0 and actor.inventory['WallFixer'] < 2):
-            order = dict(name='WallFixer')
-            count = min(2-actor.inventory['WallFixer'], liquidation//world.shop['WallFixer'],
-                        actor.capacity-len(actor.backpack)+sum(stock.values()))
-        point, use_steps = end, 0
-        for target in use_targets:
-            field_to = distance_field(closed, interaction_cells(closed, [target['unit'].pos], point), point, deadline)
-            path = distance_field(closed, {point}, point, deadline)
-            choices = interaction_cells(closed, [target['unit'].pos], point) & path.keys()
-            if not choices or point not in field_to:
-                use_steps = None; break
-            goal = min(choices, key=lambda p:(path[p], p))
-            use_steps += path[goal] + 1
-            point = goal
-        back = distance_field(closed, defence_duties.stands(world, actor.id), point, deadline)
-        if use_steps is None or point not in back:
-            count = 0
-            use_steps = 0  # Unreachable held stock never authorizes a fresh purchase.
-        else:
-            use_steps += back[point]
+        ready = [(t['rank'],route(actor,t).get(actor.pos,float('inf')),t['unit'].id,t)
+                 for t in held if t['level']==t['unit'].level]
+        if ready:
+            _,length,_,target = min(ready,key=lambda t:t[:3])
+            if length != float('inf'):deliveries[actor.id]=(target,length)
+        affordable_upgrade = bool(order and cash >= world.shop[order['name']])
         self.use_budget = use_steps
-        tail = {p:n + use_steps for p,n in tail.items()}
-        shops = interaction_cells(world, world.zones.get('weaponShop', ()), actor.pos)
-        checkout = (weighted_field(world, {p:tail[p] + 1 for p in shops if p in tail}, actor, deadline)
-                    if count else tail)
-        sale = (weighted_field(world, {p:checkout[p] + len(stock) for p in
-                interaction_cells(world, world.zones.get('vendor', ()), actor.pos) if p in checkout}, actor, deadline)
-                if stock and checkout is not None else checkout)
-        required = sale.get(actor.pos) if sale is not None else None
-        if required is not None and (count or not affordable_upgrade):
+        if required is not None:
             self.last_required = required + margin
-        self.diagnostic = dict(required=None if required is None else required + margin,
-                               left=clock.until_night, reserved_stone=stone, use_steps=use_steps,
-                               missing_walls=len(missing),planned_walls=len(planned_walls))
+        self.diagnostic = dict(required=None if required is None else required+margin,
+            left=clock.until_night,reserved_stone=stone,use_steps=use_steps,
+            missing_walls=len(missing),planned_walls=len(planned_walls),
+            basket=dict(trip['orders']) if trip else {})
         if self.phase == 'harvest':
             repairs = getattr(world, 'repair_commands', {}).get(actor.id, [])
             repair_steps = getattr(world, 'day_repair_steps', {}).get(actor.id, 1)
@@ -219,6 +214,13 @@ class CaretakerDay:
                 return self.finish(world, guidance, jobs, actor, choices, 'sell')
             self.phase = 'buy'
         if self.phase == 'buy':
+            if (required is None and self.last_required is not None
+                    and self.last_required+2 < clock.until_night):
+                # A teammate can briefly occupy the single return corridor.
+                # Keep the already funded checkout until its last valid budget
+                # expires; do not turn one blocked frame into a daylong close.
+                return self.finish(world,guidance,jobs,actor,[],'buy',
+                    reason='temporarily blocked checkout route; preserve observed trip')
             if count and checkout is not None and checkout.get(actor.pos, float('inf')) + margin <= clock.until_night:
                 amount = min(count, cash // world.shop[order['name']], actor.capacity-len(actor.backpack))
                 if amount:

@@ -156,7 +156,11 @@ class DayDivision:
             outside_required = {q for q in remaining if not any(
                 p in world.build_interior and p not in topology.occupied for p in neighbours(q))}
             for target in remaining:
-                if first is None and target in occupied:continue
+                # The builder may currently stand on a missing wall cell.
+                # Its tour first walks to a work stand before issuing build;
+                # treating its own position as an immovable blocker deadlocks
+                # the next-stone budget while the worker has no stone yet.
+                if first is None and target in occupied and target != actor.pos:continue
                 for p in neighbours(target):
                     if p not in field or p in ring:continue
                     if outside_required:

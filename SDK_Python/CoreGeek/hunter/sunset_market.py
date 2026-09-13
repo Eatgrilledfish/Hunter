@@ -54,6 +54,23 @@ class SunsetMarket:
         from .defence_duties import enabled
         if enabled(world):
             if policy.staged_walls_enabled and policy.upgrade_commitment_enabled:
+                roster = world.night_roster
+                free = {i for i in (roster.w,roster.p) if i not in excluded and i in world.ours
+                        and world.ours[i].alive and world.ours[i].backpack is not None}
+                # Only one guard budgets the team's upgrade basket. Otherwise
+                # W reserves P's entire shopping tour and stops collecting even
+                # while the free pioneer is already going to the counter.
+                # A free pioneer may still be trapped behind the worker at C.
+                # Assign checkout only to a guard with an observed route to
+                # the shop; otherwise both reserve work for an immobile P.
+                reachable = {i for i in free if world.ours[i].pos in distance_field(
+                    world, interaction_cells(world,world.zones.get('weaponShop',()),world.ours[i].pos),
+                    world.ours[i].pos,deadline)}
+                owner = self.upgrade_owner if self.upgrade_owner in reachable else None
+                if owner is None:
+                    at_shop = [i for i in reachable if world.near_zone(world.ours[i].pos,'weaponShop')]
+                    owner = min(at_shop) if at_shop else roster.p if roster.p in reachable else roster.w
+                world.upgrade_checkout_actor = owner
                 daily = self.caretaker_day.prepare(world,clock,rules,policy,guidance,jobs,excluded,deadline)
                 from .upgrade_dispatch import prepare
                 owned = {world.night_roster.w} if daily is not None else set()
@@ -362,6 +379,11 @@ class SunsetMarket:
         cmd=response['roleCommandMap'].get(identity,{})
         if self.diagnostic.get('stage')=='upgrade_procure' and cmd.get('action') in ('move','buy'):
             self.upgrade_owner=identity
+        worker = getattr(world,'caretaker_day_actor',None)
+        daily_cmd = response['roleCommandMap'].get(worker,{})
+        if (getattr(world,'caretaker_day_phase',None)=='buy' and daily_cmd.get('action') in ('move','buy')
+                and getattr(world,'upgrade_checkout_actor',None)==worker):
+            self.upgrade_owner=worker
         if cmd.get('action')=='buy':
             self.pending[identity]={'name':cmd['name'],'prior':world.ours[identity].inventory[cmd['name']],
                                     'round':world.round}
