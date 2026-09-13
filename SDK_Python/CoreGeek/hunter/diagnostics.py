@@ -357,6 +357,9 @@ class Diagnostics(logging.Handler):
                 except ValueError:value=answer
                 self._write_compact('task_submit',**llm_trace.fit(dict(task=identity,left=task.get('left'),
                     answer_hash=llm_trace.digest(answer),fields=list(value)[:8] if isinstance(value,dict) else [],
+                    statistics={k:llm_trace.redact(value[k])[:80] if isinstance(value[k],str) else value[k]
+                                for k in ('city','total_count','world_heritage_count','oldest_era')
+                                if isinstance(value,dict) and k in value and type(value[k]) in (str,int,float,bool)},
                     token_hash=llm_trace.digest(value['token']) if isinstance(value,dict) and isinstance(value.get('token'),str) else None,
                     answer_type=type(value).__name__)))
 
@@ -457,6 +460,13 @@ class Diagnostics(logging.Handler):
                         result_round=tool.get("round"))))
                     if important:self._task_context(state,task)
                 else:state['stats']['task_exec_omitted']+=1
+                api=next((e for e in record.get('data',{}).get('runtime_events',[])
+                          if e.get('kind')=='json_shape' and e.get('temporal_value_counts')),None)
+                if api:
+                    self._write_compact('task_api',**llm_trace.fit(dict(task=task['id'],left=task.get('left'),
+                        evidence=eid,fields=api.get('record_fields'),pagination=api.get('pagination'),
+                        observed=api.get('records_observed'),responses=api.get('responses_observed'),
+                        temporal=api['temporal_value_counts'],partial=True)))
                 state["task_tools"].add(tool_key)
                 if len(state["task_tools"]) > 32:state["task_tools"]={tool_key}
             fault = getattr(self.local,"task_fault",None)

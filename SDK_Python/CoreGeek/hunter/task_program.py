@@ -86,11 +86,32 @@ def _hunter_auth_challenge(method, hint):
         _hunter_bearer_ready=True
         return True
     return False
-def _hunter_recovered(address):
-    for event in globals().get('_hunter_events',[]):
-        if (event.get('kind')=='http' and event.get('status')==401 and event.get('path')==_hp.urlsplit(address).path
+def _hunter_recovered(address, status=401):
+    for event in reversed(globals().get('_hunter_events',[])):
+        if (event.get('kind')=='http' and event.get('status')==status and event.get('path')==_hp.urlsplit(address).path
                 and event.get('origin') and _hunter_origin(event['origin'])==_hunter_origin(address)):
             event['recovered']=True
+            if status==400:break  # Only this corrected request, not earlier failed pages.
+def _hunter_location_challenge(method,address,hint):
+    if method!='GET' or not __import__('re').search(r'Missing required parameter:\\s*location\\b',hint,__import__('re').I):
+        return address
+    p=_hp.urlsplit(address)
+    pair=(p.scheme+'://'+p.netloc,p.path)
+    if pair not in _hunter_location_paths:_hunter_location_paths.append(pair)
+    return _hunter_parameter_url(address)
+def _hunter_call(opener,req,data,timeout):
+    try:return _hunter_opener_open(opener,req,data=data,timeout=timeout)
+    except _he.HTTPError as exc:
+        if exc.code!=400:raise
+        try:hint=exc.fp.peek(1024)[:1024].decode('utf-8','replace')
+        except (AttributeError,OSError,ValueError):hint=''
+        changed=_hunter_location_challenge(req.get_method(),req.full_url,hint)
+        if changed==req.full_url:raise
+        address=req.full_url
+        exc.close();req.full_url=changed
+        response=_hunter_opener_open(opener,req,data=data,timeout=timeout)
+        _hunter_recovered(address,400)
+        return response
 def _hunter_origin(url):
     p = _hp.urlsplit(url)
     return (p.scheme,p.hostname,p.port or 80)
@@ -117,7 +138,7 @@ def _hunter_open(self,url,data=None,timeout=5):
                 direct = _hu.build_opener(_hu.ProxyHandler({}), *[h for h in self.handlers if not isinstance(h,_hu.ProxyHandler)])
                 self._hunter_direct = direct
             bounded_timeout = min(timeout, 5) if isinstance(timeout, (int,float)) else 5
-            response = _hunter_opener_open(direct,req,data=data,timeout=bounded_timeout)
+            response = _hunter_call(direct,req,data,bounded_timeout)
             status = response.status
             return response
         except _he.HTTPError as exc:
@@ -130,7 +151,7 @@ def _hunter_open(self,url,data=None,timeout=5):
                     req.remove_header('Authorization')
                     req.add_header('Authorization','Bearer '+_hunter_key)
                     try:
-                        response=_hunter_opener_open(direct,req,data=data,timeout=bounded_timeout)
+                        response=_hunter_call(direct,req,data,bounded_timeout)
                     except _he.HTTPError as retry_error:
                         if retry_error.code!=401:_hunter_recovered(address)
                         else:_hunter_auth_failed.add(origin)
@@ -162,6 +183,12 @@ else:
             req.headers['Authorization']='Bearer '+_hunter_key
             response=_hunter_auth_requests_send(self,req,**kwargs)
             if response.status_code!=401:_hunter_recovered(req.url)
+        if (_hunter_origin(req.url) in _hunter_origins and response.status_code==400 and not kwargs.get('stream')):
+            changed=_hunter_location_challenge(req.method,req.url,response.text[:1024])
+            if changed!=req.url:
+                address=req.url;response.close();req.url=changed
+                response=_hunter_auth_requests_send(self,req,**kwargs)
+                if response.status_code<400:_hunter_recovered(address,400)
         return response
     _hrequests.Session.send = _hunter_send
 '''

@@ -1,5 +1,6 @@
 """Personal liquidation before a final, observed-cash night-stock checkout."""
 from dataclasses import dataclass, field
+from copy import copy
 import time
 
 from .arbitration import Candidate
@@ -46,8 +47,7 @@ class SunsetMarket:
             return []
         from .defence_duties import enabled
         if enabled(world):
-            self.diagnostic = {'stage':'worker_delivery_schedule', 'buyer':world.night_roster.w}
-            return []  # DaySchedule/Procurement prove the worker's full delivery circuit.
+            return self.worker_stock(world,clock,rules,policy,guidance,jobs,excluded,deadline)
         # Without a live pioneer, retain the workers' existing complete
         # sale/purchase/delivery schedule and emergency replacement duties.
         if not any(a.kind=='pioneer' for a in world.movers):
@@ -223,6 +223,83 @@ class SunsetMarket:
             self.diagnostic={'stage':'route_budget'}
             return []
         return result
+
+    def worker_stock(self, world, clock, rules, policy, guidance, jobs, excluded, deadline):
+        """Fund personal night supplies early, before construction uses the day.
+
+        Voucher delivery retains its existing complete route planner. This
+        short checkout owns only the supplies consumed by the maintenance W.
+        """
+        identity=world.night_roster.w
+        buyer=world.ours.get(identity)
+        self.diagnostic={'stage':'worker_delivery_schedule','buyer':identity}
+        if (not buyer or not buyer.alive or identity in excluded
+                or buyer.backpack is None or buyer.capacity is None
+                or identity not in guidance.operator_stands
+                or identity in guidance.recovery_actions
+                or identity in getattr(world,'return_recovery_actions',{})):
+            self.diagnostic['blocked']='duty_or_inventory';return []
+        if identity in self.pending:
+            self.diagnostic['blocked']='purchase_pending';return []
+        # Keep the full carried-voucher delivery commitment ahead of shopping.
+        if any(n and 'UpgradeVoucher' in k for k,n in buyer.inventory.items()):
+            self.diagnostic['blocked']='carried_voucher_delivery';return []
+        job=jobs.get(identity,{})
+        if job and job.get('name')!='wall':
+            self.diagnostic['blocked']='weapon_construction';return []
+        if job.get('defer_build') and not job.get('gate'):
+            self.diagnostic['blocked']='wall_material_project';return []
+        choices=[('WallFixer',max(0,2-buyer.inventory['WallFixer'])),
+                 ('Medicine',max(0,1-buyer.inventory['Medicine']))]
+        if not buyer.inventory['Bomb'] and not buyer.inventory['DizzyWeapon']:
+            choices += [('Bomb',1),('DizzyWeapon',1)]
+        costs=[r.gold for k in WEAPONS if (r:=rules.build_rule(world,k)) is not None]
+        reserve=min(costs,default=0)*max(0,rules.weapon_limit-len(world.weapons))
+        reserve+=getattr(world,'treasure_reserved_gold',0)
+        cash=max(0,(world.gold or 0)-reserve)
+        space=buyer.capacity-len(buyer.backpack)
+        orders=[(name,min(num,space,cash//world.shop[name])) for name,num in choices
+                if num and space>0 and world.shop.get(name,0)>0 and cash>=world.shop[name]]
+        if not orders:
+            self.diagnostic['blocked']='stock_ready_or_funds';return []
+        start=distance_field(world,[buyer.pos],buyer.pos,deadline)
+        from .defence_duties import rotator
+        reserved=({world.task_side_plan['w']} if rotator(world) in world.night_defenders else set())
+        back=distance_field(world,[guidance.operator_stands[identity]],buyer.pos,deadline,extra_blocked=reserved)
+        shops=interaction_cells(world,world.zones.get('weaponShop',()),buyer.pos)
+        # Prove the next actual purchase and return. Recheck later items on
+        # their own observed frames; a short window can still fund repair stock
+        # even when the entire optional basket would not fit.
+        from .rules import station_rings
+        _, yellow=station_rings(world.task_side_plan['anchor'])
+        # Budget the route after P occupies its assigned stand, not a shortcut
+        # through that stand while P is still outside. A partial ring needs no
+        # final seal work; the ordinary return margin still applies.
+        margin=policy.return_buffer+(8 if set(world.wall_targets or ())==yellow else 0)
+        actions=1
+        paths=sorted((start[q]+actions+back[q],start[q],q) for q in shops & start.keys() & back.keys()
+                     if start[q]+actions+back[q]+margin<=clock.until_night)
+        if not paths or time.monotonic()>=deadline:
+            self.diagnostic['blocked']='checkout_return_deadline';return []
+        total,length,stand=paths[0]
+        name,num=orders[0]
+        candidates=([Candidate(identity,dict(action='buy',name=name,num=num),180,
+                               'maintenance worker buys personal night supplies',gold_reserve=reserve)]
+                    if not length else moves(buyer,distance_field(world,[stand],buyer.pos,deadline),
+                                              'maintenance worker stocks supplies before dusk'))
+        preview=copy(guidance)
+        preview.return_routes={i:r for i,r in guidance.return_routes.items() if i!=identity}
+        candidates=[c for c in candidates if preview.permit(c)]
+        if not candidates or time.monotonic()>=deadline:
+            self.diagnostic['blocked']='duty_or_route_budget';return []
+        world.sunset_buyer=identity
+        world.sunset_actions[identity]=[c.command for c in candidates]
+        # Publish the same commitment to the downstream construction/funding
+        # planners; two disjoint whitelists would otherwise reject every move.
+        guidance.day_actions[identity]=list(world.sunset_actions[identity])
+        guidance.funded_actions[identity]=list(world.sunset_actions[identity])
+        self.diagnostic.update(stage='worker_stock_checkout',item=name,num=num,steps=total)
+        return candidates
 
     def order(self, world, buyer, rules, policy, deadline):
         if world.gold is None or buyer.capacity is None or len(buyer.backpack)>=buyer.capacity:

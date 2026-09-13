@@ -33,6 +33,13 @@ class NightRoster:
         if defence_duties.enabled(world):
             self.traffic = {}; self.exit_pending = {}
         live = {u.id for u in world.movers}
+        if defence_duties.enabled(world) and self.w not in live and self.m in live:
+            # Promote the observed surviving worker, including when the dead
+            # defender disappears from the complete role snapshot. A revival
+            # becomes the exterior worker; distance never swaps a living W.
+            self.w, self.m = self.m, self.w
+            self.return_recovery = {}
+            self.traffic = {}; self.exit_pending = {}
         # A living P remains the second defender while returning from a task. M is
         # never recalled merely to let P solve another external night task.
         # Actual pioneer death retains the existing emergency second guard.

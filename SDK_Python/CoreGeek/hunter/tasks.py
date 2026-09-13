@@ -1203,8 +1203,9 @@ class TaskEngine:
                 context = self._context(task, "choose_next_task_step")
                 evidence, document_coverage = pack_evidence(task)
                 instructions = MODEL_INSTRUCTIONS
-                from .task_payload import api_scope, api_observations
+                from .task_payload import api_scope, api_observations, statistics_review
                 payload = {"request_id": fingerprint(context["nonce"])[:16], "task": task.text[:16384], "evidence": evidence,
+                           "api_statistics_review":statistics_review(task),
                            "api_contract_observations":api_observations(task,self.api_memory.get(api_scope(task),())),
                            "allowed_actions":["submit"] if final_answer_only else ["cmd", "submit"],
                            "task_truncated_locally": len(task.text) > 16384,

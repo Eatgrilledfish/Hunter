@@ -11,6 +11,8 @@ import subprocess as _hsub, sys as _hsys, re as _hre
 _hunter_events = []
 _hunter_json_pending = False
 _hunter_json_pages = 0
+_hunter_temporal = {}
+_hunter_rows_observed = 0
 def _hunter_sample(value, depth=0):
     if depth > 3:return '<nested value omitted>'
     if isinstance(value,dict):
@@ -35,7 +37,7 @@ def _hunter_shape(value,depth=0):
     if isinstance(value,list):return {'type':'list','length':len(value),'item':_hunter_shape(value[0],depth+1) if value else None}
     return type(value).__name__
 def _hunter_loads(*args,**kwargs):
-    global _hunter_json_pending, _hunter_json_pages
+    global _hunter_json_pending, _hunter_json_pages, _hunter_rows_observed
     value=_hunter_json_loads(*args,**kwargs)
     if _hunter_json_pending:
         _hunter_json_pending=False
@@ -45,6 +47,23 @@ def _hunter_loads(*args,**kwargs):
         body = value.get('data',value) if isinstance(value,dict) else value
         rows = body.get('records') if isinstance(body,dict) else body
         if isinstance(rows,list):
+            _hunter_rows_observed += len(rows)
+            for row in rows:
+                if not isinstance(row,dict):continue
+                for key,val in list(row.items())[:32]:
+                    if not _hre.search(r'era|dynasty|period|year|date|年代|朝代|年份',str(key),_hre.I):continue
+                    if _hre.search(r'token|key|password|secret|authorization',str(key),_hre.I):continue
+                    if type(val) not in (str,int,float) or len(str(val))>80:continue
+                    key=str(key)[:64]
+                    if key not in _hunter_temporal and len(_hunter_temporal)>=6:continue
+                    counts=_hunter_temporal.setdefault(key,{})
+                    encoded=_hj.dumps(val,ensure_ascii=False)
+                    if encoded in counts or len(counts)<24:counts[encoded]=counts.get(encoded,0)+1
+            if _hunter_temporal:
+                record['temporal_value_counts']={key:[{'value':_hunter_json_loads(val),'count':count}
+                    for val,count in counts.items()] for key,counts in _hunter_temporal.items()}
+                record['records_observed']=_hunter_rows_observed
+                record['temporal_values_partial']=True  # Observed pages, capped values; not a proof of complete paging.
             record.update(records_on_page=len(rows),record_samples=_hunter_sample(rows),
                           samples_partial=True)
             if rows and isinstance(rows[0],dict):

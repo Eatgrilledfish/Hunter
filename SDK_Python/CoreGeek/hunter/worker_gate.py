@@ -128,6 +128,12 @@ def prepare(state, world, clock, rules, policy, deadline):
     if missing:
         state.diagnostic.update(stage='WORKER_CONSTRUCTION',remaining_walls=len(missing))
         return result
+    if not enclosing:
+        # A front-only first-day layout has no final enclosing-wall closure.
+        # Ordinary return planning still owns both guards; do not reserve W
+        # while P walks home and consume a feasible first-night shop window.
+        state.diagnostic.update(stage='PARTIAL_RING_DAY')
+        return result
 
     relaxed = copy(world)
     relaxed.occupied = world.occupied - {u.pos for u in world.movers}
