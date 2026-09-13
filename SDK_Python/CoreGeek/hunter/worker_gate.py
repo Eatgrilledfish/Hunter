@@ -31,6 +31,12 @@ def prepare(state, world, clock, rules, policy, deadline):
     world.gate_worker_duty = dict(round=world.round, gate=gate, worker=roster.w)
     world.ordered_gate_actions = {}
     world.ordered_ingress_due = False
+    if (clock.phases == {'day'} and miner and miner.alive
+            and miner.id not in world.night_defenders and miner.pos not in interior):
+        # The exit and the harvest route must agree. Otherwise the miner exits
+        # on one frame and takes a shortcut back across the empty wall ring on
+        # the next, repeating until construction happens to block that shortcut.
+        world.navigation_avoided.setdefault(miner.pos,set()).update(interior)
 
     def offer(actor, command, reason):
         state.commands[actor.id] = [command] if command else []
@@ -96,7 +102,8 @@ def prepare(state, world, clock, rules, policy, deadline):
         return result
 
     # The worker next to C opens the daytime exit. M never returns to do it.
-    if clock.day > 1 and gate in walls and clock.until_night > 35 and walls[gate].level == 1:
+    if (clock.day > 1 and gate in walls and clock.until_night > 35 and walls[gate].level == 1
+            and not getattr(world,'worker_close_requested',False)):
         state.stage = 'WORKER_DAWN_OPEN'
         goals = (set(neighbours(gate)) & blue) - {plan['w']}
         command = (dict(action='remove',targetPos=[pos_json(gate)]) if distance(worker.pos,gate)==1
@@ -141,6 +148,7 @@ def prepare(state, world, clock, rules, policy, deadline):
     worker_home = distance_field(relaxed,set(neighbours(gate)) & blue,worker.pos,deadline)
     # Entry is sequential: reserve both real walks plus clearance/seal time.
     required = home.get(pioneer.pos,0) + worker_home.get(worker.pos,0) + policy.return_buffer + 8
+    required += getattr(world,'worker_upgrade_use_steps',0)
     if clock.until_night > max(18,required):
         return result
     world.ordered_ingress_due = True

@@ -202,11 +202,16 @@ def propose(world, policy, deadline, task_actor=None, *, plans=None, priority_id
     actors = {u.id: u for u in world.movers if u.id != task_actor}
     from .defence_duties import enabled, caretaker
     if enabled(world):
-        actors = {i:a for i,a in actors.items() if i == caretaker(world)}
+        eligible = getattr(world,'upgrade_dispatch_ids',{caretaker(world)})
+        actors = {i:a for i,a in actors.items() if i in eligible}
     traders = getattr(world, 'pioneer_trade_ids', set())
     trade_clock = getattr(world, 'strategy_clock', None)
     targets, purchase_rank, restrict_purchases, priority_ids = upgrade_demand(
         world, policy, priority_ids=priority_ids, rules=rules)
+    if (getattr(world,'caretaker_day_actor',None) and set(actors) == {world.night_roster.p}):
+        # A free pioneer can support A/B while W completes its own daily
+        # circuit. Do not reserve C to a carrier blocked by W's return stand.
+        targets = {i:t for i,t in targets.items() if t['unit'].pos != world.task_side_plan['c']}
     if not actors or not targets:
         return []
     fields = {}
@@ -218,9 +223,12 @@ def propose(world, policy, deadline, task_actor=None, *, plans=None, priority_id
                                          actor.pos, deadline)
         return fields[key]
 
-    targets, jobs, _ = match_carried_supply(targets, actors, deadline, field)
+    stock_actors = {i:world.ours[i] for i in getattr(world,'upgrade_stock_ids',actors)
+                    if i in world.ours and world.ours[i].alive and world.ours[i].backpack is not None}
+    targets, jobs, _ = match_carried_supply(targets, stock_actors, deadline, field)
     result = []
     for identity, (target, length) in jobs.items():
+        if identity not in actors:continue
         begin = len(result)
         actor = actors[identity]
         if length == 0:
@@ -250,6 +258,8 @@ def propose(world, policy, deadline, task_actor=None, *, plans=None, priority_id
     # saving for a damaged base. Carried vouchers above are still delivered.
     if restrict_purchases:
         targets = {i:t for i,t in targets.items() if purchase_rank is not None and t['rank'] == purchase_rank}
+    if hasattr(world,'upgrade_dispatch_ids'):
+        world.upgrade_unfilled_targets=dict(targets)
     purchase_reserve = purchase_floor(world, policy, targets, priority_ids)
     gold = max(0, world.gold-purchase_reserve)
     buyers = {k: u for k, u in actors.items() if not getattr(world,'sunset_buyer',None)
@@ -279,11 +289,13 @@ def propose(world, policy, deadline, task_actor=None, *, plans=None, priority_id
                     # Prefer the designated trader for new travel. A worker
                     # already at the counter may buy immediately instead of
                     # waiting several rounds for P to arrive from the battery.
-                    options.append((target["rank"], bool(traders) and to_shop > 0,
+                    preferred=getattr(world,'upgrade_preferred_buyer',None)
+                    options.append((target["rank"], bool(preferred) and identity!=preferred,
+                                    identity in getattr(world,'upgrade_busy_ids',()), bool(traders) and to_shop > 0,
                                     identity not in traders, total, price, identity, target_id, to_shop, stand))
         if not options:
             break
-        _, _, _, total, price, identity, target_id, length, stand = min(options)
+        _, _, _, _, _, total, price, identity, target_id, length, stand = min(options)
         actor, target = buyers.pop(identity), targets.pop(target_id)
         begin = len(result)
         gold -= price
@@ -300,6 +312,8 @@ def propose(world, policy, deadline, task_actor=None, *, plans=None, priority_id
                           for i, p in enumerate(steps[:4]))
         plans[identity] = {"target": target_id, "name": target["name"], "steps": total+2,
                            "stage": "procure", "candidates": result[begin:]}
+        if getattr(world,'upgrade_buyer_limit',None)==1:
+            break
     return result
 
 

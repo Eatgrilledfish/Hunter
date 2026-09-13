@@ -9,6 +9,7 @@ from .protocol import MINERALS, WEAPONS, distance, pos_json
 from .day_schedule import day_endpoints
 from .night_roles import defender_ids
 from . import procurement
+from .caretaker_day import CaretakerDay
 
 
 def moves(actor, route, reason):
@@ -26,6 +27,9 @@ class SunsetMarket:
     settled: set = field(default_factory=set)
     pending: dict = field(default_factory=dict)
     diagnostic: dict = field(default_factory=dict)
+    upgrade_travellers: set = field(default_factory=set)
+    upgrade_owner: str | None = None
+    caretaker_day: CaretakerDay = field(default_factory=CaretakerDay)
 
     def prepare(self, world, clock, rules, policy, guidance, jobs, excluded, deadline):
         guidance.market_permit = lambda candidate: permits(world, candidate)
@@ -42,11 +46,22 @@ class SunsetMarket:
                 self.pending.pop(identity)
         if self.day != clock.day:
             self.day = clock.day; self.started = False; self.settled.clear()
+            self.upgrade_travellers.clear()
+            self.upgrade_owner=None
         if (not policy.day_schedule_enabled or clock.phases != {'day'} or clock.day is None
                 or not world.phase_task_observed or time.monotonic()>=deadline):
             return []
         from .defence_duties import enabled
         if enabled(world):
+            if policy.staged_walls_enabled and policy.upgrade_commitment_enabled:
+                daily = self.caretaker_day.prepare(world,clock,rules,policy,guidance,jobs,excluded,deadline)
+                from .upgrade_dispatch import prepare
+                owned = {world.night_roster.w} if daily is not None else set()
+                upgrades=prepare(self,world,clock,rules,policy,guidance,jobs,excluded | owned,deadline)
+                if daily is not None:
+                    self.diagnostic['worker_day'] = dict(self.caretaker_day.diagnostic)
+                    return daily + (upgrades or [])
+                if upgrades is not None:return upgrades
             return self.worker_stock(world,clock,rules,policy,guidance,jobs,excluded,deadline)
         # Without a live pioneer, retain the workers' existing complete
         # sale/purchase/delivery schedule and emergency replacement duties.
@@ -338,8 +353,15 @@ class SunsetMarket:
         return None
 
     def finalize(self, world, response):
+        for actor,command in response['roleCommandMap'].items():
+            if (command.get('action')=='use' and 'UpgradeVoucher' in command.get('name','')
+                    and command in getattr(world,'sunset_actions',{}).get(actor,())):
+                self.upgrade_travellers.add(actor)
+                if self.upgrade_owner==actor:self.upgrade_owner=None
         identity=getattr(world,'sunset_buyer',None)
         cmd=response['roleCommandMap'].get(identity,{})
+        if self.diagnostic.get('stage')=='upgrade_procure' and cmd.get('action') in ('move','buy'):
+            self.upgrade_owner=identity
         if cmd.get('action')=='buy':
             self.pending[identity]={'name':cmd['name'],'prior':world.ours[identity].inventory[cmd['name']],
                                     'round':world.round}
@@ -352,6 +374,20 @@ def permits(world, candidate):
     buyer=getattr(world,'sunset_buyer',None)
     if command in getattr(world,'treasure_actions',{}).get(identity,()):
         return True
+    if identity == getattr(world,'caretaker_day_actor',None):
+        phase = getattr(world,'caretaker_day_phase',None)
+        if command.get('action') in {'collect','sell'}:
+            expected = 'harvest' if command['action'] == 'collect' else 'sell'
+            return phase == expected and command in allowed.get(identity,())
+        if command.get('action') == 'use' and command.get('name') == 'WallFixer' and phase != 'repair':
+            return False
+        if command.get('action') == 'buy':
+            return phase == 'buy' and command in allowed.get(identity,())
+        if command.get('action') == 'use' and 'UpgradeVoucher' in command.get('name',''):
+            return phase == 'use' and command in allowed.get(identity,())
+    if (command.get('action')=='buy' and getattr(world,'upgrade_priority_pending',False)
+            and command.get('name') not in world.upgrade_priority_items):
+        return False
     if command.get('action')=='buy' and buyer and identity!=buyer:
         actor=world.ours.get(identity)
         return bool(command.get('name')=='Medicine' and actor and actor.health<=110)

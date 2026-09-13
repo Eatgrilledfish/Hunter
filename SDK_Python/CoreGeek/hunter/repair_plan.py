@@ -1,5 +1,6 @@
 """Personal wall repairs with observed cooldowns and real return paths."""
 from dataclasses import dataclass, field
+from collections import Counter
 import time
 
 from .arbitration import Candidate
@@ -36,9 +37,30 @@ class RepairPlan:
         self.service = {}
         self.diagnostic = {}
         world.repair_commands = {}
+        world.day_repair_steps = {}
         world.repair_service = self.service
         plan = getattr(world, 'task_side_plan', None)
         world.repair_policy_active = bool(policy.repair_plan_enabled and plan)
+        if world.repair_policy_active and defence_duties.enabled(world) and clock.phases == {'day'}:
+            self.active={}
+            actor=world.ours.get(defence_duties.caretaker(world))
+            if actor and actor.alive and actor.backpack is not None and actor.inventory['WallFixer']:
+                reachable=distance_field(world,{actor.pos},actor.pos,deadline)
+                options=[(w.health,reachable[p],w.id,p,w) for w in damaged_walls(world,rules)
+                         for p in interaction_cells(world,[w.pos],actor.pos) if p in reachable]
+                if options and time.monotonic()<deadline:
+                    _,length,_,stand,wall=min(options,key=lambda x:x[:4])
+                    from .day_schedule import DaySchedule
+                    choices=([Candidate(actor.id,dict(action='use',name='WallFixer',targetPos=[pos_json(wall.pos)]),
+                                        260,'daytime personal wall repair')] if not length else
+                             DaySchedule.moves(actor,distance_field(world,{stand},actor.pos,deadline),
+                                               'repair damaged wall before harvesting'))
+                    world.repair_commands[actor.id]=[c.command for c in choices]
+                    world.day_repair_steps[actor.id]=length+1
+                    self.diagnostic[actor.id]=dict(phase='DAY_REPAIR',wall=wall.id,remaining_actions=length+1,
+                                                   reason='personal repair route before daytime harvest')
+                    return choices
+            return []
         if not world.repair_policy_active or clock.phases != {'night'}:
             self.active = {}
             return []
@@ -48,6 +70,20 @@ class RepairPlan:
             self.active.pop(identity, None)
         c = next((g for g in world.weapons if g.pos == plan['c']), None)
         walls = damaged_walls(world, rules)
+        threats = [u for u in world.robots.values() if u.alive and u.abnormal != 'dizzy']
+        if any(u.attack_range is None or u.attack_power is None for u in threats):
+            self.diagnostic={'status':'UNKNOWN_ROBOT_ATTACK'}
+            return []
+        # Accumulate each observed robot's local range once. Scanning every
+        # map cell against every robot exhausted the repair slice in large waves.
+        exposure=Counter()
+        for robot in threats:
+            radius=robot.attack_range
+            for x in range(max(0,robot.pos[0]-radius),min(world.width,robot.pos[0]+radius+1)):
+                for y in range(max(0,robot.pos[1]-radius),min(world.height,robot.pos[1]+radius+1)):
+                    exposure[x,y]+=2*robot.attack_power
+                if time.monotonic()>=deadline:break
+            if time.monotonic()>=deadline:break
         result = []
         for identity in ((roster.w,) if defence_duties.enabled(world) else (roster.w, roster.p)):
             if time.monotonic() >= deadline:
@@ -67,19 +103,10 @@ class RepairPlan:
                             not any(distance(actor.pos, q) <= 1 for q in task.cells) or
                             actor.pos not in plan['c_stands']):
                 continue
-            threats = [u for u in world.robots.values() if u.alive and u.abnormal != 'dizzy']
-            if any(u.attack_range is None or u.attack_power is None for u in threats):
-                continue
             blocked = {plan['w']} if identity == defence_duties.caretaker(world) else set()
             if world.width * world.height > 41 * 32:
                 continue
-            for x in range(world.width):
-                if time.monotonic() >= deadline:
-                    break
-                for y in range(world.height):
-                    q = (x,y)
-                    if 2*sum(u.attack_power for u in threats if distance(u.pos,q)<=u.attack_range) >= actor.health:
-                        blocked.add(q)
+            blocked.update(q for q,damage in exposure.items() if damage>=actor.health)
             if time.monotonic() >= deadline:
                 break
             world.navigation_avoided.setdefault(actor.pos, set()).update(blocked - {actor.pos})
@@ -131,6 +158,8 @@ class RepairPlan:
                         break
                     result.extend(self._return(actor, home, current, world, service_context))
                 continue
+            self.diagnostic[identity]=dict(phase='WAIT',wall=None,remaining_actions=None,
+                observed_cooldown=window,reason='no damaged wall with a safe service route',stock=actor.inventory['WallFixer'])
             if identity == defence_duties.rotator(world) and actor.pos != plan['w']:
                 continue
             if identity == defence_duties.caretaker(world) and not current and actor.pos not in c_stands:
@@ -153,7 +182,11 @@ class RepairPlan:
                         continue
                     actions = outgoing[stand] + 1 + back
                     delayed = window is None or actions > window
-                    if delayed and not emergency:
+                    no_target = (known_service and not any(distance(g.pos,r.pos)<=g.attack_range+1
+                        for g in guns for r in threats))
+                    maintenance = defence_duties.enabled(world) and (no_target or stand==actor.pos
+                        or (pressure(world,wall) or 0)*actions>=wall.health*2)
+                    if delayed and not emergency and not maintenance:
                         continue
                     # No repair detour enters an observed lethal exposure.
                     threats = [u for u in world.robots.values() if u.alive and u.abnormal != 'dizzy']
@@ -170,7 +203,8 @@ class RepairPlan:
                     result.extend(self._return(actor, home, current, world, service_context))
                 continue
             delayed, actions, _, _, stand, wall = min(options, key=lambda r:r[:5])
-            why = 'observed wall pressure permits delayed fire' if delayed else 'fits observed remaining cooldown'
+            why = ('maintenance of damaged wall permits delayed fire' if delayed and defence_duties.enabled(world)
+                   else 'observed wall pressure permits delayed fire' if delayed else 'fits observed remaining cooldown')
             if stand == actor.pos:
                 command = {'action':'use', 'name':'WallFixer', 'targetPos':[pos_json(wall.pos)]}
                 offered = self._offer(actor, command, wall.id, world, 'USE_PENDING', actions, why,

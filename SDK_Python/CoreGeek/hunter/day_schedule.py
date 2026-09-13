@@ -97,6 +97,8 @@ class DaySchedule:
             return []
         result=[];claimed=set()
         for actor in sorted(world.movers,key=lambda u:u.id):
+            if actor.id == getattr(world,'caretaker_day_actor',None):
+                continue
             if actor.kind!='worker' or actor.id in excluded or actor.backpack is None or actor.capacity is None:
                 continue
             job=jobs.get(actor.id,{})
@@ -107,7 +109,7 @@ class DaySchedule:
                 if actor.inventory['stone'] < reserve or not job.get('defer_build'):continue
             elif job and (not job.get('gate') or actor.inventory['stone']<reserve and self.active.get(actor.id,'harvest')=='harvest'):continue
             if (getattr(world,'task_side_plan',None) and actor.id==world.night_roster.m
-                    and clock.until_night<=35 and not (job and not job.get('gate'))
+                    and (clock.until_night<=35 or policy.pioneer_rotation_enabled) and not (job and not job.get('gate'))
                     and len(actor.backpack)<actor.capacity):
                 from .rules import station_rings
                 blue,yellow=station_rings(world.task_side_plan['anchor'])

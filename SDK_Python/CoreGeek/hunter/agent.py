@@ -115,6 +115,11 @@ class Agent:
             draft.night_roster.prepare(world)
             world.night_foraging_enabled=self.policy.night_foraging_enabled
             economy.prepare_wall_cycle(world, clock, self.rules, self.policy)
+            daily = draft.sunset_market.caretaker_day
+            world.worker_close_requested = bool(self.policy.pioneer_rotation_enabled
+                and daily.day == clock.day and daily.phase in {'close','use'}
+                and not (world.phase_task or draft.tasks.active or draft.tasks.accept_pending))
+            world.worker_upgrade_use_steps = daily.use_budget if world.worker_close_requested else 0
             gate_candidates=world.duty_budget.run('gate', lambda budget_end: draft.external_gate.prepare(
                 world,clock,self.rules,self.policy,budget_end,
                 task_busy=bool(task_actor or draft.tasks.active or draft.tasks.accept_pending),defer_regular_night=True),
@@ -138,6 +143,16 @@ class Agent:
             candidates = list(immediate)
             deadline = start + self.policy.planning_seconds
             task_choice = task_schedule.choose(world,clock,self.policy,min(deadline,time.monotonic()+.04),draft.tasks.timing)
+            if (self.policy.pioneer_rotation_enabled and clock.phases=={'day'} and task_choice
+                    and task_choice.get('selected') and not draft.tasks.active and not draft.tasks.accept_pending):
+                selected=task_choice['selected'];offer=selected.get('task',{})
+                waiting=offer.get('isValid') is not True or offer.get('coldDownRounds',0)>0
+                demands,rank,restricted,_=economy.procurement.upgrade_demand(world,self.policy,rules=self.rules)
+                funded=any((not restricted or d['rank']==rank) and d['name'] in world.shop
+                    and (world.gold or 0)>=world.shop[d['name']] for d in demands.values())
+                if draft.sunset_market.upgrade_owner==task_choice['actor'] or waiting and funded:
+                    task_choice=dict(actor=task_choice['actor'],selected=None,candidates=[],
+                        reason='funded upgrade checkout precedes waiting for a future task')
             from .night_roles import admit_task_departure
             task_choice = world.duty_budget.run('task_handoff', lambda budget_end:
                 admit_task_departure(world, clock, task_choice, budget_end), min(deadline,time.monotonic()+.02))
@@ -157,6 +172,9 @@ class Agent:
             repairs = world.duty_budget.run('repair', lambda budget_end: draft.repair.prepare(
                 world, clock, self.rules, self.policy, budget_end, draft.tasks.active),
                 min(deadline,time.monotonic()+.04))
+            if self.policy.pioneer_rotation_enabled and clock.phases=={'night'}:
+                for c in repairs:
+                    guidance.repair_actions.setdefault(c.actor,[]).append(c.command)
             pioneer = draft.night_roster.p
             if (world.task_return_required and pioneer in guidance.roster_transit_actions
                     and not draft.night_roster.traffic

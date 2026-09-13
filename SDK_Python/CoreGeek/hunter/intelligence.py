@@ -43,6 +43,7 @@ class Intelligence:
     diagnostic: dict = field(default_factory=dict)
     llm_status: str = "idle"
     llm_diagnostic: dict = field(default_factory=dict)
+    unresolved: list = field(default_factory=list)
 
     @staticmethod
     def news_id(entry):
@@ -135,6 +136,10 @@ class Intelligence:
         self.treasure_complete=(set(folk)<=self.analyzed and not any(n['truncated_locally'] for n in folk.values()))
 
     def _ingest(self, world, data, sources):
+        rejected=Counter()
+        unresolved=data.get('unresolved',[])
+        if isinstance(unresolved,list):
+            self.unresolved=[s[:200] for s in unresolved[:6] if isinstance(s,str)]
         def support(value):
             citations = value.get("support")
             if not isinstance(citations, list) or not citations:
@@ -191,16 +196,21 @@ class Intelligence:
                 self.events.append(record)
         for candidate in data.get("treasures", [])[:8]:
             if not isinstance(candidate, dict) or support(candidate) is None:
+                rejected['unsupported_source']+=1
                 continue
             pos, items = position(candidate.get("position")), candidate.get("items")
             opening, closing = candidate.get("opening_round"), candidate.get("closing_round")
             if pos is None or not world.inside(pos) or not isinstance(items, list) or not items or len(items) > 40:
+                rejected['position_or_items']+=1
                 continue
             if any(not isinstance(x, str) or x not in world.shop for x in items):
+                rejected['unknown_shop_item']+=1
                 continue
             if not integer(opening, 0) or not integer(closing, opening) or closing-opening > 1300:
+                rejected['opening_window']+=1
                 continue
             if candidate.get("confidence") != "high" or candidate.get("all_conditions_resolved") is not True:
+                rejected['unresolved_conditions']+=1
                 continue
             record = {"position": pos, "items": sorted(items), "opening_round": opening, "closing_round": closing,
                       "support": support(candidate), "basis": "model_hypothesis_not_official", "confidence": "high"}
@@ -209,6 +219,8 @@ class Intelligence:
                     not any(r['hypothesis_id'] == record['id'] for r in self.rejections)):
                 self.treasures.append(record)
         self.events, self.treasures = self.events[-64:], self.treasures[-16:]
+        self.llm_diagnostic.update(hypotheses=len(self.treasures),proposed=len(data.get('treasures',[])),
+                                   rejected=dict(rejected),unresolved=self.unresolved)
 
     def hold_ore(self, mineral, clock):
         if not self.news_complete or clock.day is None:
@@ -231,7 +243,12 @@ class Intelligence:
         self.diagnostic={'stage':'inactive'}
         if (self.terminal or world.phase_task or not world.phase_task_observed or not policy.treasure_enabled
                 or not self.treasure_complete or clock.phases!={'day'}):
+            if policy.treasure_enabled and not self.terminal:
+                self.diagnostic={'stage':'waiting','reason':'active_task' if world.phase_task else
+                    'unread_folk_sources' if not self.treasure_complete else 'night_or_unknown_phase'}
             return []
+        self.diagnostic={'stage':'waiting','reason':'no_resolved_hypothesis' if not self.treasures else 'no_feasible_circuit',
+                         'hypotheses':len(self.treasures),'unresolved':self.unresolved}
         actor = next((u for u in world.movers if u.kind == "pioneer"), None)
         if actor is None or actor.backpack is None or actor.capacity is None:
             return []
@@ -329,8 +346,8 @@ class Intelligence:
         feedback=[a for a in self.attempts if a.get('result') in (2,3) and a['round'] not in self.reviewed_attempts]
         folk={k:v for k,v in retained.items() if v['section']=='folkLegends'}
         corpus=fingerprint(sorted(folk))
-        synthesize=(bool(folk) and not fresh and self.treasure_complete
-                    and len({c['kind'] for c in self.clues})>=2 and corpus not in self.synthesized_sources
+        synthesize=(bool(folk) and not (fresh & folk.keys()) and self.treasure_complete
+                    and bool(self.clues) and corpus not in self.synthesized_sources
                     and not any(h['closing_round']>=world.round and not any(a['hypothesis']==h['id'] for a in self.attempts)
                                 for h in self.treasures))
         if (not fresh and not feedback and not synthesize) or not session.tasks.budget.reserve():
@@ -343,7 +360,7 @@ class Intelligence:
         # Reserve context for a fresh fragment before filling the prompt with
         # more new text. Otherwise two full new fragments can permanently hide
         # the sentence crossing the boundary from the previous invocation.
-        seed = next((key for key in ordered if key in fresh and
+        seed = next((key for key in ordered if key in fresh and not synthesize and
                      not retained[key]['truncated_locally']), None)
         adjacent = []
         if seed is not None and retained[seed].get('parent_source'):
@@ -371,6 +388,9 @@ class Intelligence:
             "普通LLM每天最多3次，长文本分批读；信息不足就保留有原文支持的clues，不要猜答案。"
             "Return optional clues:[{kind:location|items|time|condition|contradiction,text:<brief finding>,support:[{source:id,quote:exact substring}]}]. "
             "Use known_clues and prior attempt feedback to connect earlier evidence and correct failed hypotheses. "
+            "在 synthesize 阶段必须逐项检查地点、祭品、开启时间、其他条件；齐全时输出 treasures 完整行动方案，不能只重复 clues。"
+            "仍缺信息时返回 unresolved:[具体缺失项]，不要把未知当作失败或把旧日相对日期自动平移。"
+            "昼70回合、夜60回合；已知 clock_origin 时，第d天白天起点为 clock_origin+(d-1)*130。按原文条件转换时间窗口。"
             "Current_map is observed now, not a historical map. Use taskbook offering descriptions to map clues to exact current shop IDs; keep unknown mappings unresolved. "
             "Combine current and retained earlier news as quoted data; preserve each source publication date. "
             "Long sources arrive as exact fragments with offsets. Unseen fragments may contradict current hypotheses; do not claim the whole source was read. "
@@ -397,6 +417,7 @@ class Intelligence:
                                                   "offering_descriptions": {k:v for k,v in OFFERING_DESCRIPTIONS.items() if k in world.shop},
                                                   "analysis_stage": "reassess" if feedback else "synthesize" if synthesize else "read_clues",
                                                   "known_clues": known_clues,
+                                                  "unresolved":self.unresolved,
                                                   "treasure_attempt_feedback": feedback,
                                                   "ordinary_calls_used_today": session.tasks.budget.attempts,
                                                   "previous_hypotheses": self.treasures[-16:],

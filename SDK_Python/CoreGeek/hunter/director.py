@@ -63,6 +63,7 @@ class Directive:
     upgrading_guns: set = field(default_factory=set)
     site_clear_actions: dict = field(default_factory=dict)
     roster_transit_actions: dict = field(default_factory=dict)
+    repair_actions: dict = field(default_factory=dict)
 
     def permit(self, candidate):
         """A due return is a macro commitment, not a price-dependent bid.
@@ -84,6 +85,11 @@ class Directive:
             return candidate.command in self.roster_transit_actions[candidate.actor] or (
                 candidate.command.get('action') == 'use'
                 and candidate.command.get('name') in {'Medicine', 'Bomb', 'DizzyWeapon'})
+        if candidate.command.get('action')=='attack' and candidate.command.get('controllerId') in self.repair_actions:
+            return False
+        if candidate.actor in self.repair_actions:
+            return candidate.command in self.repair_actions[candidate.actor] or (
+                candidate.command.get('action')=='use' and candidate.command.get('name') in {'Medicine','Bomb','DizzyWeapon'})
         if candidate.command.get('action') == 'attack' and (
                 candidate.actor in self.upgrading_guns or candidate.command.get('controllerId') in self.urgent_upgrades):
             return False

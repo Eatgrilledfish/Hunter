@@ -157,10 +157,12 @@ class Diagnostics(logging.Handler):
             duty['rumour'] = rumour
         treasure = obj(decision.get('treasure'))
         if treasure.get('stage') not in (None,'inactive'):
-            duty['treasure'] = {k:treasure[k] for k in ('stage','actor','target','items','required','opening','closing') if k in treasure}
+            duty['treasure'] = {k:treasure[k] for k in ('stage','actor','target','items','required','opening','closing','reason','hypotheses','unresolved') if k in treasure}
         market = obj(decision.get('sunset_market'))
         if market.get('stage') not in (None,'inactive'):
-            duty['market'] = {k:market[k] for k in ('stage','buyer','fallback_worker','waiting','item','num','gold','blocked') if k in market}
+            duty['market'] = {k:market[k] for k in ('stage','buyer','fallback_worker','waiting','item','num','gold','blocked','target','required','worker_busy') if k in market}
+            if market.get('worker_day'):
+                duty['market']['worker_day'] = market['worker_day']
         evasion = obj(decision.get('exterior_evasion'))
         if evasion.get('status') not in (None,'inactive','not an exterior economist','interior transit handled by roster'):
             duty['evasion'] = {key:evasion[key] for key in ('status','nearest','in_range',
@@ -226,7 +228,8 @@ class Diagnostics(logging.Handler):
                 hp=[wall.get('health'),self.max_health.get('wall',{}).get(wall.get('level'))],
                 stock=bag.count('WallFixer') if isinstance(bag,list) else None,
                 remaining=repair.get('remaining_actions'),cd=repair.get('observed_cooldown'),
-                selected=bool(repair.get('selected')),delayed=repair.get('delayed_fire'))
+                selected=bool(repair.get('selected')),delayed=repair.get('delayed_fire'),
+                reason=self._brief(repair.get('reason'),80))
         if repairs:
             duty['repair'] = repairs
         origin = decision.get('origin')
