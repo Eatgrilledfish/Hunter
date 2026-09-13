@@ -542,6 +542,18 @@ def evidence_answer(task, spec):
         if not isinstance(spec.get("reasoning"), str) or not spec["reasoning"].strip() or "value" not in spec:
             raise ValueError("inference requires value and explanation")
         value, basis = spec["value"], "model_inference_not_verified"
+    # The transport answer is a string, but a JSON task's semantic value is
+    # structured. Decode one complete strict JSON envelope without spending
+    # another model turn; prose, duplicate keys and nonfinite values still fail.
+    if isinstance(value, str) and answer_contract(task)['json_required']:
+        try:
+            decoded = strict_json(value)
+        except ValueError:
+            pass
+        else:
+            if isinstance(decoded, (dict, list)):
+                value = decoded
+                spec = dict(spec, format='json')
     validate_answer(task, spec, value, refs)
     diagnostic = value
     if isinstance(value, str):
@@ -1085,10 +1097,18 @@ class TaskEngine:
         # A known expiry is only a conservative stopping bound, not the unknown
         # official inclusive/exclusive timeout rule.
         stopping = task.timeout is not None and task.accept_round is not None and world.round >= task.accept_round+task.timeout-2
-        final_answer_only = stopping and world.round == task.accept_round+task.timeout-2 and any(
+        at_boundary = stopping and world.round == task.accept_round+task.timeout-2
+        # A declared final output needs one observed sandbox response, with no
+        # further model round. Dispatch at the stopping bound and submit only
+        # after the existing execution/answer-contract checks accept that result.
+        final_execution = (at_boundary and task.sandbox_pending is None
+            and isinstance(task.command_plan, dict)
+            and task.command_plan.get('operation') in {'run_python', 'run_tool'}
+            and isinstance(task.command_plan.get('answer_output'), dict))
+        final_answer_only = at_boundary and not final_execution and any(
             e.get("usable") and e.get("answer_usable") is not False and e.get("data", {}).get("operation") in {"run_python", "run_tool"}
             and e["data"].get("completeness") == "complete" for e in task.evidence.values())
-        if stopping and not final_answer_only:
+        if stopping and not (final_answer_only or final_execution):
             return
         if task.statement_empty:
             return  # An empty/binary document cannot supply task requirements.
@@ -1176,6 +1196,8 @@ class TaskEngine:
                                         "op":plan.get("operation"), "path":str(plan.get("path", "."))[:160]})
                     task.plan_failures += 1
                 task.command_plan = None
+        if stopping and not final_answer_only:
+            return  # A failed final execution cannot start another model cycle.
         if task.llm_pending is None and not response["executeCmd"] and task.sandbox_pending is None:
             if self.budget.reserve(active_task=True):
                 context = self._context(task, "choose_next_task_step")

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "version": "finite-evolution-worker-night-economy-2026-09-12",
-  "basis": "User-confirmed policy: each evolution point has three finite task lifecycles; pioneer performs daytime tasks then trade and returns to C at night, W rotates A/B, M mines/sells/buys outside at night. Admission uses current routes and defence; previous unlimited-task B0 score comparison is superseded.",
+  "version": "pioneer-rotation-worker-maintenance-2026-09-13",
+  "basis": "Pioneer handles daytime evolution, long-context tasks and treasure, enters A/B rotation first. Maintenance worker owns C, personal upgrades and repairs, enters last and seals. Exterior miner liquidates every ore type at dawn before resuming mining.",
   "parameters": {
     "planning_seconds": 2.8,
     "lock_seconds": 0.15,
@@ -68,6 +68,7 @@
     "lethal_entry_guard_enabled": false,
     "firing_lanes_enabled": false,
     "weapon_portfolio_enabled": true,
-    "portfolio_saturation_enabled": false
+    "portfolio_saturation_enabled": false,
+    "pioneer_rotation_enabled": true
   }
 }

@@ -14,6 +14,10 @@ def api_observations(task, remembered=()):
     for event in list(remembered)+[v for e in task.evidence.values()
             for v in e.get('data',{}).get('runtime_events',[])]:
         if event.get('kind') not in {'http','json_shape','exception'}:continue
+        # Persist the interface shape, never carry a previous city's record
+        # samples or pagination totals into the next task as current evidence.
+        if event.get('kind')=='json_shape':
+            event={k:v for k,v in event.items() if k not in {'record_samples','pagination','records_on_page','responses_observed'}}
         if event not in result:result.append(event)
     return result[-16:]
 

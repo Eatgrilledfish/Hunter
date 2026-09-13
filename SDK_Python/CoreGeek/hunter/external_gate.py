@@ -27,6 +27,17 @@ def valid_seal(world, builds):
     walls = {u.pos for u in world.ours.values() if u.alive and u.kind=='wall'}
     m,w,p = (world.ours.get(permit[k]) for k in ('m','w','p'))
     plan = getattr(world,'task_side_plan',None)
+    if permit.get('ordered'):
+        from .defence_duties import enabled, rotator
+        rotation = world.ours.get(permit.get('rotator'))
+        return bool(enabled(world) and w and w.alive and w.kind=='worker' and actor==w.id
+            and rotation and rotation.alive and rotation.id==rotator(world) and rotation.id!=w.id
+            and rotation.pos==plan['w'] and w.pos in blue and distance(w.pos,target)==1
+            and w.inventory['stone']>=1 and target==plan['gate'] and target not in world.occupied
+            and all(u.id in world.night_defenders or u.pos not in blue|yellow|world.stations[0].cells
+                    for u in world.movers)
+            and not any(u.alive and u.pos in blue|world.stations[0].cells for u in world.robots.values())
+            and walls==yellow-{target} and {u.pos for u in world.weapons}=={q for _,q in plan['slots']})
     return bool(plan and m and all(u and u.alive for u in (w,p))
         and len(world.movers)==(3 if m.alive else 2) and len({m.id,w.id,p.id})==3
         and m.kind=='worker' and w.kind=='worker' and p.kind=='pioneer'
@@ -55,6 +66,8 @@ class ExternalGate:
     last_action: tuple | None = None
     return_committed: bool = False
     inner_backup: bool = False
+    cashout_day: int | None = None
+    cashout_done: bool = False
     cashout_committed: bool = False
     cashout_report: dict = field(default_factory=dict)
     mining_report: dict = field(default_factory=dict)
@@ -120,6 +133,10 @@ class ExternalGate:
         plan=getattr(world,'task_side_plan',None)
         if not policy.external_gate_enabled or not plan or clock.day is None:
             return []
+        from .defence_duties import enabled
+        if enabled(world):
+            from .worker_gate import prepare
+            return prepare(self,world,clock,rules,policy,deadline)
         candidates=self._cycle(world,clock,rules,policy,deadline,task_busy,plan,
                                defer_regular_night=defer_regular_night)
         if clock.phases=={'day'} and not task_busy:

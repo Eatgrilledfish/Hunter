@@ -2,6 +2,7 @@
 from dataclasses import dataclass, field
 
 from .protocol import distance
+from . import defence_duties
 
 
 @dataclass
@@ -21,15 +22,18 @@ class NightRoster:
         pioneers = sorted((u for u in world.movers if u.kind == 'pioneer'), key=lambda u: u.id)
         plan = getattr(world, 'task_side_plan', None)
         # Preserve identities across travel, death and revival. Choose the
-        # observed common-stand occupant first when attaching to a running game.
+        # nearest worker duty stand when attaching to a running game.
         if self.w is None and workers:
-            self.w = min(workers, key=lambda u: (distance(u.pos, plan['w']) if plan else 0, u.id)).id
+            goals = set(plan['c_stands']) if defence_duties.enabled(world) else {plan['w']} if plan else set()
+            self.w = min(workers, key=lambda u: (min((distance(u.pos,q) for q in goals),default=0), u.id)).id
         if self.m is None:
             self.m = next((u.id for u in workers if u.id != self.w), None)
         if self.p is None and pioneers:
             self.p = pioneers[0].id
+        if defence_duties.enabled(world):
+            self.traffic = {}; self.exit_pending = {}
         live = {u.id for u in world.movers}
-        # A living P owns C even while returning from a daytime task. M is
+        # A living P remains the second defender while returning from a task. M is
         # never recalled merely to let P solve another external night task.
         # Actual pioneer death retains the existing emergency second guard.
         self.handoff_requested = False
@@ -77,6 +81,17 @@ def permits(world, clock, candidate):
     if not market_permits(world, candidate):
         return False
     command = candidate.command
+    if defence_duties.enabled(world) and command.get('action')=='remove':
+        from .protocol import pos_json
+        if command.get('targetPos')==[pos_json(world.task_side_plan['gate'])]:
+            return command in getattr(world,'ordered_gate_actions',{}).get(candidate.actor,())
+    if defence_duties.enabled(world) and command.get('action')=='build' and command.get('name')=='wall':
+        from .protocol import pos_json
+        from .rules import station_rings
+        _, yellow = station_rings(world.task_side_plan['anchor'])
+        if (set(world.wall_targets or ()) == yellow
+                and command.get('targetPos')==[pos_json(world.task_side_plan['gate'])]):
+            return command in getattr(world,'ordered_gate_actions',{}).get(candidate.actor,())
     treasure = getattr(world,'treasure_actions',{})
     if candidate.actor in treasure and not (command.get('action')=='use' and command.get('name') in {'Medicine','Bomb','DizzyWeapon'}):
         if command not in treasure[candidate.actor]:return False
@@ -151,7 +166,7 @@ def weapon_allowed(world, identity, weapon_id):
         return True
     gun = world.ours.get(weapon_id)
     roster = world.night_roster
-    sites = (plan['a'], plan['b']) if identity == roster.w else (plan['c'],)
+    sites = (plan['a'], plan['b']) if identity == defence_duties.rotator(world) else (plan['c'],)
     return bool(gun and gun.pos in sites)
 
 
@@ -176,7 +191,7 @@ def _fixed_stands(world, deadline, include_pioneer=True, task_actor=None, allow_
     for actor in operators(world, include_pioneer, task_actor, allow_task_control):
         if time.monotonic() >= deadline:
             return {}  # Publish no partially calculated assignment.
-        goals = {plan['w']} if actor.id == world.night_roster.w else set(plan['c_stands']) - {plan['w']}
+        goals = defence_duties.stands(world, actor.id)
         traffic = world.night_roster.traffic
         if traffic and actor.id == traffic['blocker']:
             goals = {traffic['stand']}
@@ -192,6 +207,8 @@ def _fixed_stands(world, deadline, include_pioneer=True, task_actor=None, allow_
 
 
 def transit_stands(world, clock, deadline):
+    if defence_duties.enabled(world):
+        return {}  # Ordered ingress is owned by worker_gate, with observed positions.
     budget = getattr(world, 'duty_budget', None)
     if budget is not None:
         return budget.run('duty_transit', lambda end: _transit_stands(world, clock, end), deadline)

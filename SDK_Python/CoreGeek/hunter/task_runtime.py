@@ -10,6 +10,15 @@ import atexit as _ha, json as _hj, os as _ho, shlex as _hs, shutil as _hh
 import subprocess as _hsub, sys as _hsys, re as _hre
 _hunter_events = []
 _hunter_json_pending = False
+_hunter_json_pages = 0
+def _hunter_sample(value, depth=0):
+    if depth > 3:return '<nested value omitted>'
+    if isinstance(value,dict):
+        return {str(k)[:64]:('<redacted>' if _hre.search('token|key|password|secret|authorization',str(k),_hre.I)
+                else _hunter_sample(v,depth+1)) for k,v in list(value.items())[:24]}
+    if isinstance(value,list):return [_hunter_sample(v,depth+1) for v in value[:2]]
+    if isinstance(value,str):return value[:160]
+    return value
 def _hunter_event(**record):
     if len(_hunter_events) < 4:
         _hunter_events.append(record)
@@ -26,11 +35,22 @@ def _hunter_shape(value,depth=0):
     if isinstance(value,list):return {'type':'list','length':len(value),'item':_hunter_shape(value[0],depth+1) if value else None}
     return type(value).__name__
 def _hunter_loads(*args,**kwargs):
-    global _hunter_json_pending
+    global _hunter_json_pending, _hunter_json_pages
     value=_hunter_json_loads(*args,**kwargs)
     if _hunter_json_pending:
         _hunter_json_pending=False
         record=dict(kind='json_shape',shape=_hunter_shape(value))
+        _hunter_json_pages += 1
+        record['responses_observed'] = _hunter_json_pages
+        body = value.get('data',value) if isinstance(value,dict) else value
+        rows = body.get('records') if isinstance(body,dict) else body
+        if isinstance(rows,list):
+            record.update(records_on_page=len(rows),record_samples=_hunter_sample(rows),
+                          samples_partial=True)
+            if rows and isinstance(rows[0],dict):
+                record['record_fields']={str(k)[:64]:type(v).__name__ for k,v in list(rows[0].items())[:32]}
+        if isinstance(body,dict) and isinstance(body.get('pagination'),dict):
+            record['pagination']=_hunter_sample(body['pagination'])
         prior=next((i for i,e in enumerate(_hunter_events) if e.get('kind')=='json_shape'),None)
         if prior is not None:_hunter_events[prior]=record
         else:_hunter_event(**record)

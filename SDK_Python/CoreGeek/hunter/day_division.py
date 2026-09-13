@@ -11,7 +11,7 @@ from .navigation import distance_field, neighbours
 from .protocol import distance, pos_json
 from .layout import LayoutGuard
 from .arbitration import Candidate
-from . import battery
+from . import battery, defence_duties
 from .wall_policy import planned_gate
 from .night_roles import defender_ids, economic_endpoints
 
@@ -46,6 +46,8 @@ class DayDivision:
         missing = set(battery.missing_walls(world, rules))
         if not workers or not missing:
             return {i:j for i,j in jobs.items() if j['name'] != 'wall'}
+        if defence_duties.enabled(world) and world.night_roster.w in {u.id for u in workers}:
+            self.supplier = world.night_roster.w
         if self.supplier not in {u.id for u in workers}:
             choices = []
             for u in workers:
@@ -54,7 +56,7 @@ class DayDivision:
                               for p in neighbours(m) if p in field), default=world.width*world.height)
                 choices.append((not (u.inventory['stone'] >= len(missing)), travel, u.id))
             self.supplier = min(choices)[-1]
-        if len(missing)==1 and not world.ours[self.supplier].inventory['stone']:
+        if not defence_duties.enabled(world) and len(missing)==1 and not world.ours[self.supplier].inventory['stone']:
             carriers = [u for u in workers if u.inventory['stone']]
             if carriers:
                 self.supplier = min(carriers,key=lambda u:u.id).id
@@ -111,7 +113,7 @@ class DayDivision:
         # makes a redundant mining trip. Only the primary supplier mines a deficit.
         other = next(u for u in workers if u.id != self.supplier)
         share = min(other.inventory['stone'], max(0,len(missing)-1))
-        if share:
+        if share and not defence_duties.enabled(world):
             options = []
             for target in sorted(missing,key=lambda p:(distance(other.pos,p),p)):
                 if target == job['target'] or target == self.gate or target in world.occupied:
@@ -182,7 +184,7 @@ class DayDivision:
             positioning = 0
         elif plan:
             roster = world.night_roster
-            goals = {plan['w']} if actor.id == roster.w else set(plan['c_stands']) - {plan['w']}
+            goals = defence_duties.stands(world, actor.id)
             positioning = 0
         else:
             goals = set(world.build_interior)
@@ -192,7 +194,7 @@ class DayDivision:
             return None
         entry = min(entries,key=lambda p:(field[p],p))
         total += field[entry] + positioning
-        if exterior and self.gate in missing:
+        if (exterior or defence_duties.enabled(world)) and self.gate in missing:
             total += 1  # M's separate exterior build action, not a third guard.
         if first is None:
             first = (self.gate, entry, field[entry])

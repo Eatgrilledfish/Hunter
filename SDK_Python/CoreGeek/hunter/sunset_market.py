@@ -44,6 +44,10 @@ class SunsetMarket:
         if (not policy.day_schedule_enabled or clock.phases != {'day'} or clock.day is None
                 or not world.phase_task_observed or time.monotonic()>=deadline):
             return []
+        from .defence_duties import enabled
+        if enabled(world):
+            self.diagnostic = {'stage':'worker_delivery_schedule', 'buyer':world.night_roster.w}
+            return []  # DaySchedule/Procurement prove the worker's full delivery circuit.
         # Without a live pioneer, retain the workers' existing complete
         # sale/purchase/delivery schedule and emergency replacement duties.
         if not any(a.kind=='pioneer' for a in world.movers):

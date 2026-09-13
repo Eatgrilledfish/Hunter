@@ -9,6 +9,9 @@ from .protocol import MINERALS, pos_json
 def prepare(world, clock):
     world.strategy_clock = clock
     world.pioneer_trade_ids = set()
+    if getattr(getattr(world, "strategy_policy", None), "pioneer_rotation_enabled", False):
+        world.pioneer_trade_reason = "daytime tasks and treasure; worker owns maintenance trade"
+        return
     # A late attachment may have no lifetime history. Current absence can still
     # release useful daytime work, without claiming six confirmed completions.
     listed = world.raw.get('teamOur', {}).get('playerTasks')

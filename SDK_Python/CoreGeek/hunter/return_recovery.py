@@ -15,7 +15,8 @@ def propose(world, clock, policy, deadline):
     plan = getattr(world, 'task_side_plan', None)
     worker = world.ours.get(roster.w)
     report = {'stage':'inactive'}
-    if not plan or not worker or not worker.alive or worker.pos == plan['w']:
+    from .defence_duties import stands
+    if not plan or not worker or not worker.alive or worker.pos in stands(world, worker.id):
         roster.return_recovery = {}
         return [], report
     pending = roster.return_recovery
@@ -27,7 +28,9 @@ def propose(world, clock, policy, deadline):
         return [], report
     if clock.phases == {'day'} and clock.until_night > 20 and not pending:
         return [], report
-    target = plan['w']
+    from .defence_duties import stands
+    targets = stands(world, worker.id)
+    target = min(targets, key=lambda q: max(abs(q[0]-worker.pos[0]), abs(q[1]-worker.pos[1])))
     # A reachable ordinary route needs no demolition. An ongoing recovery owns
     # that route until actual arrival, so builders cannot close its new opening.
     field = distance_field(world, {target}, worker.pos, deadline)

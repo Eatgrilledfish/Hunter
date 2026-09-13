@@ -183,6 +183,13 @@ class Agent:
                     world.night_forage_commands.pop(identity,None)
                     world.forage_contract=None
             if draft.external_gate.commands:
+                if self.policy.pioneer_rotation_enabled:
+                    for identity, commands in draft.external_gate.commands.items():
+                        guidance.roster_transit_actions.pop(identity,None)
+                        if identity==draft.night_roster.p:
+                            moves=[c for c in commands if c.get('action')=='move']
+                            world.pioneer_defence_moves.extend(moves)
+                            guidance.task_moves.update(tuple(c['targetPos'][0][k] for k in ('x','y')) for c in moves)
                 guidance.duty_permit=draft.external_gate.permit
                 guidance.candidates=[c for c in guidance.candidates if guidance.permit(c)]
                 guidance.return_routes={i:r for i,r in guidance.return_routes.items() if i not in draft.external_gate.commands}
@@ -225,6 +232,8 @@ class Agent:
                 from .navigation import distance_field, neighbours
                 for identity, job in build_jobs.items():
                     actor = world.ours[identity]
+                    if self.policy.pioneer_rotation_enabled:
+                        continue  # worker_gate owns the final builder and ordered ingress.
                     if identity not in world.night_defenders or not job.get("gate") or not actor.inventory["stone"]:
                         continue
                     if guidance.return_routes.get(identity,{}).get("yield_for"):
@@ -414,7 +423,9 @@ class Agent:
             candidates.extend(medical)
             supply = world.duty_budget.run('repair_supply', lambda budget_end: draft.repair_supply.candidates(
                 world, clock, self.rules, self.policy, budget_end, guidance,
-                excluded | set(guidance.medical_actions) | set(world.sunset_actions)), min(deadline,time.monotonic()+.04))
+                excluded | set(guidance.medical_actions) | set(world.sunset_actions)
+                | ({identity for identity, job in build_jobs.items() if not job.get('gate')}
+                   if self.policy.pioneer_rotation_enabled else set())), min(deadline,time.monotonic()+.04))
             supply = draft.filter_failures(supply, world.round)
             for candidate in supply:
                 guidance.repair_supply_actions.setdefault(candidate.actor,[]).append(candidate.command)

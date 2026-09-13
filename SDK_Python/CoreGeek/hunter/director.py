@@ -530,7 +530,8 @@ def _pioneer_return_due(world, clock, policy, deadline):
             and (traffic.get('kind') == 'fixed_w_return' or clock.phases != {'day'})):
         return True  # A failed real yield remains due even while P is at C.
     plan = getattr(world,'task_side_plan',None)
-    goals = (set(plan['c_stands']) if plan else set(world.defence_cells))
+    from .defence_duties import stands
+    goals = (stands(world, pioneer.id) if plan else set(world.defence_cells))
     if not goals:
         goals = interaction_cells(world,[p for station in world.stations for p in station.cells],pioneer.pos)
     if pioneer.pos in goals:
@@ -560,7 +561,7 @@ def propose(world, clock, task_actor, task, deadline, policy=None, risk_memory=N
     world.task_return_required = False
     world.pioneer_defence_moves = []
     defender_ids(world)
-    world.task_return_required = _pioneer_return_due(world,clock,policy,deadline)
+    world.task_return_required = bool(getattr(world,"ordered_ingress_due",False) or _pioneer_return_due(world,clock,policy,deadline))
     if world.task_return_required and clock.phases != {'day'}:
         pioneer = world.ours[world.night_roster.p]
         threats = [r for r in world.robots.values() if r.alive and r.abnormal != 'dizzy']

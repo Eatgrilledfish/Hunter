@@ -103,7 +103,8 @@ class LayoutGuard:
         roster=getattr(self.world,'night_roster',None)
         clock=getattr(self.world,'strategy_clock',None)
         if plan and roster and any(kind=='wall' for _,kind,_ in builds):
-            for identity,goals in ((roster.w,{plan['w']}),(roster.p,set(plan['c_stands']))):
+            from .defence_duties import stands
+            for identity,goals in ((i,stands(self.world,i)) for i in (roster.w,roster.p)):
                 actor=self.world.ours.get(identity)
                 if not actor or not actor.alive:continue
                 reachable={q for q in goals if q in after and after.get(actor.pos)==after[q]}

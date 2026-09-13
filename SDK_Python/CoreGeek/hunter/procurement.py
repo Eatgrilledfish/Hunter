@@ -200,6 +200,9 @@ def propose(world, policy, deadline, task_actor=None, *, plans=None, priority_id
     plans = {} if plans is None else plans
     plans.clear()
     actors = {u.id: u for u in world.movers if u.id != task_actor}
+    from .defence_duties import enabled, caretaker
+    if enabled(world):
+        actors = {i:a for i,a in actors.items() if i == caretaker(world)}
     traders = getattr(world, 'pioneer_trade_ids', set())
     trade_clock = getattr(world, 'strategy_clock', None)
     targets, purchase_rank, restrict_purchases, priority_ids = upgrade_demand(

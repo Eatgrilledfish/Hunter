@@ -336,6 +336,7 @@ class Policy:
     closed_ring_rockets_enabled: bool = True
     forward_battery_enabled: bool = False
     task_side_layout_enabled: bool = False
+    pioneer_rotation_enabled: bool = False
     external_gate_enabled: bool = False
     gate_seal_choice: str = 'auto'
     gate_dawn_choice: str = 'auto'

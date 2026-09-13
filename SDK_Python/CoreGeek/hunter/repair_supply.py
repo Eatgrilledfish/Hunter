@@ -96,7 +96,8 @@ class RepairSupply:
         defender_ids(world)
         roster=world.night_roster
         result=[]
-        for identity in (roster.w,roster.p):
+        from .defence_duties import enabled
+        for identity in ((roster.w,) if enabled(world) else (roster.w,roster.p)):
             if time.monotonic()>=deadline or slots<=0 or price>budget:
                 break
             actor=world.ours.get(identity)
@@ -109,7 +110,7 @@ class RepairSupply:
                 continue
             # W stocks a package on an existing shop visit. P may make a
             # measured daytime trip while no task is active/pending.
-            if identity==roster.w and not world.near_zone(actor.pos,'weaponShop'):
+            if not enabled(world) and identity==roster.w and not world.near_zone(actor.pos,'weaponShop'):
                 continue
             home=guidance.operator_stands.get(identity)
             if home is None:

@@ -6,6 +6,7 @@ from .arbitration import Candidate
 from .navigation import distance_field, interaction_cells, neighbours
 from .protocol import distance, pos_json
 from .night_roles import defender_ids
+from . import defence_duties
 
 
 def damaged_walls(world, rules):
@@ -48,7 +49,7 @@ class RepairPlan:
         c = next((g for g in world.weapons if g.pos == plan['c']), None)
         walls = damaged_walls(world, rules)
         result = []
-        for identity in (roster.w, roster.p):
+        for identity in ((roster.w,) if defence_duties.enabled(world) else (roster.w, roster.p)):
             if time.monotonic() >= deadline:
                 break
             actor = world.ours.get(identity)
@@ -69,7 +70,7 @@ class RepairPlan:
             threats = [u for u in world.robots.values() if u.alive and u.abnormal != 'dizzy']
             if any(u.attack_range is None or u.attack_power is None for u in threats):
                 continue
-            blocked = {plan['w']} if identity == roster.p else set()
+            blocked = {plan['w']} if identity == defence_duties.caretaker(world) else set()
             if world.width * world.height > 41 * 32:
                 continue
             for x in range(world.width):
@@ -83,14 +84,14 @@ class RepairPlan:
                 break
             world.navigation_avoided.setdefault(actor.pos, set()).update(blocked - {actor.pos})
             current = self.active.get(identity)
-            if identity == roster.w:
+            if identity == defence_duties.rotator(world):
                 self.active.pop(identity, None)
                 current = None
             guns = ([g for g in world.weapons if g.pos in (plan['a'], plan['b'])]
-                    if identity == roster.w else ([c] if c else []))
-            gun_count = 2 if identity == roster.w else 1
+                    if identity == defence_duties.rotator(world) else ([c] if c else []))
+            gun_count = 2 if identity == defence_duties.rotator(world) else 1
             served = tuple(g.id for g in sorted(guns, key=lambda g: g.id))
-            served_weapon = served if identity == roster.w else (served[0] if served else None)
+            served_weapon = served if identity == defence_duties.rotator(world) else (served[0] if served else None)
             window = (min(g.cooldown for g in guns)
                       if len(guns) == gun_count and all(g.cooldown is not None for g in guns)
                       else None)
@@ -130,12 +131,12 @@ class RepairPlan:
                         break
                     result.extend(self._return(actor, home, current, world, service_context))
                 continue
-            if identity == roster.w and actor.pos != plan['w']:
+            if identity == defence_duties.rotator(world) and actor.pos != plan['w']:
                 continue
-            if identity == roster.p and not current and actor.pos not in c_stands:
+            if identity == defence_duties.caretaker(world) and not current and actor.pos not in c_stands:
                 continue  # An unrelated excursion cannot become a repair commitment.
             outgoing = distance_field(world, [actor.pos], actor.pos, deadline)
-            home = distance_field(world, c_stands, actor.pos, deadline) if identity == roster.p else {}
+            home = distance_field(world, c_stands, actor.pos, deadline) if identity == defence_duties.caretaker(world) else {}
             options = []
             for wall in walls:
                 if current and wall.id != current['wall']:
@@ -143,11 +144,11 @@ class RepairPlan:
                 emergency = pressure(world, wall)
                 emergency = emergency is not None and emergency >= wall.health
                 stands = interaction_cells(world, [wall.pos], actor.pos)
-                if identity == roster.w or is_task:
+                if identity == defence_duties.rotator(world) or is_task:
                     stands &= {actor.pos}
-                stands -= {plan['w']} if identity == roster.p else set()
+                stands -= {plan['w']} if identity == defence_duties.caretaker(world) else set()
                 for stand in stands & outgoing.keys():
-                    back = home.get(stand) if identity == roster.p else 0
+                    back = home.get(stand) if identity == defence_duties.caretaker(world) else 0
                     if back is None:
                         continue
                     actions = outgoing[stand] + 1 + back
