@@ -1,4 +1,11 @@
 """Competition entry point: POST / and callback(json_data)."""
+if __package__:
+    from .hunter.log_mode import configure_process_output
+else:
+    from hunter.log_mode import configure_process_output
+
+LOG_MODE = configure_process_output()
+
 import base64
 import argparse
 import logging
@@ -21,7 +28,7 @@ else:
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024  # Local input budget, not an official limit.
 app.json.ensure_ascii = False
-diagnostics = Diagnostics()
+diagnostics = Diagnostics(mode=LOG_MODE)
 logging.getLogger("hunter").addHandler(diagnostics)
 logging.getLogger("hunter").propagate = False  # Avoid a second unbounded traceback via the root handler.
 logging.getLogger("werkzeug").setLevel(logging.WARNING)  # Successful POST access lines are redundant.

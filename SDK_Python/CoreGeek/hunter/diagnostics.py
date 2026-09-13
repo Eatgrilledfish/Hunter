@@ -16,12 +16,13 @@ import uuid
 from .protocol import obj, array
 from . import llm_trace
 from .checker_contract import checker_paths
+from .log_mode import resolve_mode
 
 
 class Diagnostics(logging.Handler):
     def __init__(self, mode=None, interval=20):
         super().__init__(logging.WARNING)
-        self.mode = "full" if (mode or os.environ.get("HUNTER_LOG_MODE")) == "full" else "compact"
+        self.mode = resolve_mode(mode)
         self.interval = max(1, int(interval))
         self.run_id = uuid.uuid4().hex
         self.local = threading.local()
@@ -583,6 +584,8 @@ class Diagnostics(logging.Handler):
                 state["critical_reported"] = False
 
     def event(self, event, **data):
+        if self.mode == "off":
+            return
         # Logging must never replace a valid competition response with a failure.
         try:
             if self.mode == "compact":
@@ -609,6 +612,8 @@ class Diagnostics(logging.Handler):
                 pass
 
     def emit(self, record):
+        if self.mode == "off":
+            return
         if self.mode == "compact":
             where = [f"{Path(f.filename).name}:{f.lineno}:{f.name}" for f in traceback.extract_tb(record.exc_info[2])[-3:]] if record.exc_info else []
             self.event("exception" if record.exc_info else "warning",message=self._brief(record.getMessage(),160),
@@ -619,6 +624,8 @@ class Diagnostics(logging.Handler):
                    if record.exc_info else None)
 
     def startup(self, agent):
+        if self.mode == "off":
+            return
         self.max_health = {kind:dict(levels) for kind,levels in agent.rules.max_health.items()}
         root = Path(__file__).resolve().parents[2]
         hashes = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
@@ -638,6 +645,8 @@ class Diagnostics(logging.Handler):
                    rules=agent.rules, policy=agent.policy)
 
     def run(self, raw, function):
+        if self.mode == "off":
+            return function(raw)
         previous = self.local.__dict__.copy()
         self.local.call = uuid.uuid4().hex
         self.local.round = raw.get("roundNo") if isinstance(raw, dict) else None
@@ -670,4 +679,6 @@ class Diagnostics(logging.Handler):
             self.local.__dict__.update(previous)
 
     def outcome(self, value):
+        if self.mode == "off":
+            return
         self.local.outcome = value

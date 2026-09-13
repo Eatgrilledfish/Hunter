@@ -9,6 +9,33 @@
 
 ## 比赛诊断日志
 
+### 无日志比赛版本与切换
+
+仓库默认保留精简日志。无日志启动：
+
+```bash
+bash SDK_Python/run_quiet.sh 8000
+```
+
+也可以继续用标准入口，通过环境变量选择本次启动的模式：
+
+```bash
+HUNTER_LOG_MODE=off bash SDK_Python/run.sh 8000
+HUNTER_LOG_MODE=compact bash SDK_Python/run.sh 8000
+HUNTER_LOG_MODE=full bash SDK_Python/run.sh 8000
+```
+
+平台只能执行固定 `run.sh <port>` 时，修改 `SDK_Python/log_mode.conf` 为
+`off`、`compact` 或 `full`。无日志包默认 `off`，日志包默认 `compact`；
+两包策略源码相同，不包含仓库里的历史比赛 `log`。环境变量优先于文件，
+`run_quiet.sh` 则始终强制 `off`。
+
+`off` 不生成 SDK 诊断，并把服务进程 stdout/stderr 重定向到空设备，覆盖
+Flask、启动、访问和异常输出。直接启动 `main3.py` 也读取同一设置。
+切换在下次启动生效；不要在正在进行的比赛中重启，以免丢失对局内存状态。
+此开关不改变三个协议响应字段、模型调用或任务沙盒结果；平台自行记录的
+请求、响应、模型和沙盒内容不受本地日志开关控制。
+
 按原方式 `bash SDK_Python/run.sh <port>` 启动即可。SDK 默认使用
 `print(..., flush=True)` 输出日志，由比赛平台收集，不写日志文件、不额外打包。
 赛后直接复制平台上的精简 `HUNTER` 日志即可。
