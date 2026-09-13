@@ -72,7 +72,7 @@ class CaretakerDay:
             return None
         plan = world.task_side_plan
         _, yellow = station_rings(plan['anchor'])
-        missing = set(world.wall_targets or ()) - walls
+        missing = set(world.wall_targets or ()) - walls - set(getattr(world,'helper_wall_targets',()))
         rule = rules.build_rule(world, 'wall')
         stone = len(missing) * rule.items.get('stone', 0) if rule else 0
         stock = {k:max(0, actor.inventory[k] - (stone if k == 'stone' else 0))
@@ -275,6 +275,11 @@ class CaretakerDay:
                         targetPos=[pos_json(target['unit'].pos)]), 240, 'apply personal voucher after feasible wall work and return')]
                        if not length else DaySchedule.moves(actor, route(actor, target), 'deliver personal voucher after feasible wall work'))
             return self.finish(world, guidance, jobs, actor, choices, 'use')
+        orders=[name for name,n in actor.inventory.items() if n and name.endswith('SummonOrder')]
+        if (orders and getattr(world,'summon_use_remaining',0) and not getattr(world,'critical_base_ids',())
+                and home.get(actor.pos,float('inf'))+policy.return_buffer+1 < clock.until_night):
+            return self.finish(world,guidance,jobs,actor,[Candidate(actor.id,
+                dict(action='use',name=orders[0]),240,'use personal next-wave order after maintenance')],'use')
         return self.finish(world, guidance, jobs, actor, DaySchedule.moves(actor, home, 'return to single turret after daily work'), 'home')
 
     def finish(self, world, guidance, jobs, actor, choices, phase, **details):

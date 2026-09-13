@@ -31,7 +31,14 @@ def prepare(market, world, clock, rules, policy, guidance, jobs, excluded, deadl
             continue
         stock = {k:actor.inventory[k] for k in ('stone','iron','copper')
                  if actor.kind=='pioneer' and actor.inventory[k] and world.vendor.get(k,0)>0}
+        emergency = [u for u in world.stations if u.id in getattr(world,'critical_base_ids',()) and u.level in (1,2)]
+        if any(actor.inventory[f'StationUpgradeVoucher{u.level}'] or
+               0 < world.shop.get(f'StationUpgradeVoucher{u.level}',0) <= (world.gold or 0) for u in emergency):
+            stock = {}  # An already funded rescue must not detour to sell ore.
         trip = supply_basket.quote(view,actor,clock,rules,policy,deadline,home=home,sale_stock=stock)
+        if time.monotonic() >= deadline:
+            market.diagnostic['blocked']='planning_budget_exhausted'
+            break  # An unfinished quote is not evidence that shopping cannot fit.
         if trip is None:
             market.diagnostic['blocked']='no_return_or_use_route'
             continue
@@ -62,6 +69,13 @@ def prepare(market, world, clock, rules, policy, guidance, jobs, excluded, deadl
                          if actor.pos in interaction_cells(view,[req['unit'].pos],actor.pos)
                          else DaySchedule.moves(actor,route,'deliver personal upgrade chain before night'))
                 stage='upgrade_deliver'
+            elif (getattr(world,'summon_use_remaining',0) and not getattr(world,'critical_base_ids',())
+                  and any(n and k.endswith('SummonOrder') for k,n in actor.inventory.items())
+                  and home.get(actor.pos,float('inf'))+policy.return_buffer+1 < clock.until_night):
+                item=next(k for k,n in actor.inventory.items() if n and k.endswith('SummonOrder'))
+                choices=[Candidate(actor.id,dict(action='use',name=item),240,
+                                   'use owned next-wave order within observed daily quota before returning')]
+                stage='pressure_use';num=1
             elif actor.id in market.upgrade_travellers or market.upgrade_owner==actor.id:
                 choices=DaySchedule.moves(actor,home,'complete shopping return before night')
         preview=copy(guidance)

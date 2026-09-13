@@ -41,7 +41,7 @@ class BaseRecovery:
             threshold = .65 if weapon_demand else .2
             self.diagnostic['bases'][base.id].update(priority_loss_fraction=threshold,
                 weapon_demand=weapon_demand)
-            if getattr(world, "staged_walls", False):
+            if getattr(world, "staged_walls", False) and base.health > reference*.35:
                 from .wall_policy import priority_units
                 leading = priority_units(world)
                 if not leading or any(u.kind != "station" for u in leading):

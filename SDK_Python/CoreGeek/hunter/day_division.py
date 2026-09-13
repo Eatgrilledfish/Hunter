@@ -7,7 +7,7 @@ from collections import Counter
 from copy import copy
 from dataclasses import dataclass
 import time
-from .navigation import distance_field, neighbours
+from .navigation import distance_field, neighbours, interaction_cells
 from .protocol import distance, pos_json
 from .layout import LayoutGuard
 from .arbitration import Candidate
@@ -23,8 +23,20 @@ class DayDivision:
     gate: tuple | None = None
     building: bool = False
 
+    @staticmethod
+    def reconcile_assistance(world, jobs):
+        reserved = getattr(world, 'helper_wall_targets', ())
+        if reserved and not any(j.get('helper') for j in jobs.values()):
+            supplier = world.wall_assistance.get('supplier')
+            if supplier in jobs:
+                jobs[supplier]['stock_target'] += len(reserved)
+            world.helper_wall_targets = frozenset()
+            world.wall_assistance.update(active=False,reason='helper has prior movement or dawn trade duty')
+
     def assign(self, world, clock, rules, policy, jobs, deadline):
         world.economy_first = False
+        world.helper_wall_targets = frozenset()
+        world.wall_assistance = {'active': False}
         if (not policy.economy_first_enabled or not policy.day_schedule_enabled
                 or not policy.construction_commitment_enabled or not world.build_interior
                 or world.firing_ports or len(world.weapons) != rules.weapon_limit
@@ -112,6 +124,20 @@ class DayDivision:
         # stone on remaining walls instead of selling it while the supplier
         # makes a redundant mining trip. Only the primary supplier mines a deficit.
         other = next(u for u in workers if u.id != self.supplier)
+        if defence_duties.enabled(world):
+            deficit = max(0, len(missing)-actor.inventory['stone'])
+            rescue = bool(getattr(world, 'critical_base_ids', ()))
+            late = tour is None or tour['steps']+deficit+policy.return_buffer >= clock.until_night
+            if deficit or late or rescue:
+                helper = self.assistance(world,clock,policy,other,missing,ring,job,guard,deadline)
+                if helper:
+                    result[other.id] = helper
+                    job['stock_target'] -= 1
+                    world.helper_wall_targets = frozenset({helper['target']})
+                    world.wall_assistance = dict(active=True,worker=other.id,target=helper['target'],
+                        supplier=self.supplier,deficit=deficit,late=late,critical=rescue,
+                        steps=helper['construction_steps'])
+            return result
         share = min(other.inventory['stone'], max(0,len(missing)-1))
         if share and not defence_duties.enabled(world):
             options = []
@@ -136,6 +162,45 @@ class DayDivision:
                                      and clock.until_night > other_tour['steps'] + 3))
                 job['stock_target'] -= share
         return result
+
+    def assistance(self, world, clock, policy, actor, missing, ring, job, guard, deadline):
+        """One feasible exterior wall per observation; W alone keeps the gate.
+
+        The miner uses its own stone, or budgets one actual collection and
+        return to the work stand. It never needs to enter W/P's corridor.
+        """
+        blocked = ring | world.build_interior | world.stations[0].cells
+        start = distance_field(world, {actor.pos}, actor.pos, deadline, extra_blocked=blocked)
+        options = []
+        for target in sorted(missing-{self.gate, job['target']}):
+            if time.monotonic() >= deadline:
+                break
+            if target in world.occupied:
+                continue
+            preview = Candidate(actor.id,dict(action='build',name='wall',targetPos=[pos_json(target)]),0,'exterior assistance')
+            if not guard.check([preview])[0]:
+                continue
+            goals = interaction_cells(world,[target],actor.pos)-blocked
+            work = distance_field(world,goals,actor.pos,deadline,extra_blocked=blocked)
+            if actor.inventory['stone']:
+                required = work.get(actor.pos, float('inf'))+1
+                mine = None
+            else:
+                mining = [(start[p]+1+work[p]+1,m) for m in world.zones.get('stone',())
+                          for p in interaction_cells(world,[m],actor.pos) if p in start and p in work]
+                if not mining:
+                    continue
+                required,mine = min(mining)
+            if required+policy.return_buffer <= clock.until_night:
+                facing = target in getattr(world,'monster_front_walls',())
+                options.append((not facing,required,target,mine,goals))
+        if not options:
+            return None
+        _,required,target,mine,goals = min(options,key=lambda x:x[:3])
+        return dict(job,target=target,stock_target=1,gate=False,economy_first=False,
+                    helper=True,helper_mine=mine,helper_goals=sorted(goals),
+                    construction_steps=required,construction_endpoint='exterior',
+                    defer_build=False)
 
     def tour(self, world, actor, missing, ring, deadline, occupied=()):
         """Budget all remaining build actions, outside walk, entry and closure.

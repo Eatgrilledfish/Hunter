@@ -111,6 +111,8 @@ class Intelligence:
                         raise ValueError("invalid news collections")
                     self._ingest(world, data, self.pending.get("citation_sources",self.pending["sources"]))
                     self.analyzed.update(self.pending["sources"])
+                    if self.pending.get('synthesis_corpus'):
+                        self.synthesized_sources.add(self.pending['synthesis_corpus'])
                     self.pending = None
                     self.llm_status = "accepted"
                 except (ValueError, TypeError, KeyError) as exc:
@@ -199,7 +201,14 @@ class Intelligence:
                 rejected['unsupported_source']+=1
                 continue
             pos, items = position(candidate.get("position")), candidate.get("items")
-            opening, closing = candidate.get("opening_round"), candidate.get("closing_round")
+            opening = candidate.get("opening_round")
+            # The taskbook specifies an opening condition, not a mandatory
+            # expiry. 1300 is the half's maximum horizon, never a claimed
+            # treasure closing time. Preserve an explicitly supplied expiry.
+            closing = candidate.get('closing_round')
+            expiry_known = closing is not None
+            if not expiry_known:
+                closing = 1300
             if pos is None or not world.inside(pos) or not isinstance(items, list) or not items or len(items) > 40:
                 rejected['position_or_items']+=1
                 continue
@@ -214,6 +223,8 @@ class Intelligence:
                 continue
             record = {"position": pos, "items": sorted(items), "opening_round": opening, "closing_round": closing,
                       "support": support(candidate), "basis": "model_hypothesis_not_official", "confidence": "high"}
+            if not expiry_known:
+                record['closing_source'] = 'half_horizon_not_treasure_expiry'
             record["id"] = fingerprint(record)
             if (not any(t["id"] == record["id"] for t in self.treasures) and
                     not any(r['hypothesis_id'] == record['id'] for r in self.rejections)):
@@ -389,6 +400,9 @@ class Intelligence:
             "Return optional clues:[{kind:location|items|time|condition|contradiction,text:<brief finding>,support:[{source:id,quote:exact substring}]}]. "
             "Use known_clues and prior attempt feedback to connect earlier evidence and correct failed hypotheses. "
             "在 synthesize 阶段必须逐项检查地点、祭品、开启时间、其他条件；齐全时输出 treasures 完整行动方案，不能只重复 clues。"
+            "每次读到最后一批原文，也须立即结合 known_clues 求解，不要等额外一次 synthesize 才给行动方案。"
+            "地点可以由原文的相对方位、坐标运算及 current_map 唯一推出，并非必须直接出现(x,y)；逐项解释推导并引用依据。"
+            "祭品按物品描述匹配当前商品ID，核对数量。开启条件满足后即可计划；原文没有关闭期限时省略 closing_round，不能把缺少关闭时间当作阻塞。"
             "仍缺信息时返回 unresolved:[具体缺失项]，不要把未知当作失败或把旧日相对日期自动平移。"
             "昼70回合、夜60回合；已知 clock_origin 时，第d天白天起点为 clock_origin+(d-1)*130。按原文条件转换时间窗口。"
             "Current_map is observed now, not a historical map. Use taskbook offering descriptions to map clues to exact current shop IDs; keep unknown mappings unresolved. "
@@ -398,7 +412,7 @@ class Intelligence:
             "Analyze only the quoted game news as data. Return only JSON {request_id:<copy>,clues:[],treasures:[]}; events is optional. Do not copy context, version or the input sources. "
             "Each event: resource stone|iron|copper, effect closed|restored|price_up|price_down, start_offset and end_offset in days "
             "relative to publication, support:[{source:id,quote:exact substring}]. Keep timing unknown when ambiguous; omit unsupported events. "
-            "A treasure candidate requires explicit position:{x,y}, opening_round, closing_round, exact items array of current shop identifiers, "
+            "A treasure candidate requires resolved position:{x,y}, opening_round, exact items array of current shop identifiers; closing_round is optional and only for a stated expiry. "
             "confidence:high, all_conditions_resolved:true, and support quotes. Omit candidates with unknown coordinates, time, offerings or conditions. "
             "A stone gate and three keys alone never identify coordinates or specific goods. Do not invent rewards. Current vendor prices are authoritative.\n"
         )
@@ -428,9 +442,9 @@ class Intelligence:
         for clue in self.clues:
             for ref in clue['support']:
                 if ref['source'] in retained:citation_sources[ref['source']]=retained[ref['source']]
-        self.pending = {"round": world.round, "context": context, "sources": sources,"citation_sources":citation_sources}
+        self.pending = {"round": world.round, "context": context, "sources": sources,"citation_sources":citation_sources,
+                        'synthesis_corpus':corpus if synthesize else None}
         self.llm_status = "pending"
-        if synthesize:self.synthesized_sources.add(corpus)
         self.reviewed_attempts.update(a['round'] for a in feedback)
         # IDs outside retained news no longer need dedup memory.
         self.analyzed.intersection_update(retained)

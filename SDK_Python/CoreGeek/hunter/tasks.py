@@ -8,7 +8,7 @@ import time
 from .arbitration import Candidate
 from .protocol import distance, fingerprint, obj, array, integer, strict_json
 from .sandbox import parse_result, discovery, bootstrap, compile_operation, task_documents, locate_task
-from .task_protocol import INSTRUCTIONS as MODEL_INSTRUCTIONS, normalize as normalize_decision
+from .task_protocol import INSTRUCTIONS as MODEL_INSTRUCTIONS, FINAL_INSTRUCTIONS, normalize as normalize_decision
 from .documents import DocumentLedger
 from .answer_contract import contract as answer_contract, validate as validate_answer
 from .task_payload import pack_evidence
@@ -1202,10 +1202,10 @@ class TaskEngine:
             if self.budget.reserve(active_task=True):
                 context = self._context(task, "choose_next_task_step")
                 evidence, document_coverage = pack_evidence(task)
-                instructions = MODEL_INSTRUCTIONS
+                instructions = FINAL_INSTRUCTIONS if final_answer_only else MODEL_INSTRUCTIONS
                 from .task_payload import api_scope, api_observations, statistics_review
                 payload = {"request_id": fingerprint(context["nonce"])[:16], "task": task.text[:16384], "evidence": evidence,
-                           "api_statistics_review":statistics_review(task),
+                           "api_statistics_review":statistics_review(task, final_answer_only),
                            "api_contract_observations":api_observations(task,self.api_memory.get(api_scope(task),())),
                            "allowed_actions":["submit"] if final_answer_only else ["cmd", "submit"],
                            "task_truncated_locally": len(task.text) > 16384,
@@ -1229,7 +1229,7 @@ class TaskEngine:
                            "submitted": [{"hash": s["hash"], "text": s["text"][:2048],
                                           "feedback": s.get("feedback")} for s in task.submitted[-4:]],
                            "recipe_hints": [{"plan": r["plan"], "manifest": r.get("manifest"),
-                                             "level": r["validation_level"]} for r in self.skills.records[-4:]]}
+                                             "level": r["validation_level"]} for r in self.skills.records[-4:]] if not final_answer_only else []}
                 # Put a concrete current envelope at the very end, where it cannot
                 # be confused with old identities or buried in the long protocol.
                 payload['reply_template'] = {'request_id':payload['request_id'],

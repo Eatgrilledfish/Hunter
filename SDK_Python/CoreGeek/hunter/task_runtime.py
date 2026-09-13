@@ -13,6 +13,8 @@ _hunter_json_pending = False
 _hunter_json_pages = 0
 _hunter_temporal = {}
 _hunter_rows_observed = 0
+_hunter_json_dataset = None
+_hunter_page_sets = {}
 def _hunter_sample(value, depth=0):
     if depth > 3:return '<nested value omitted>'
     if isinstance(value,dict):
@@ -48,6 +50,7 @@ def _hunter_loads(*args,**kwargs):
         rows = body.get('records') if isinstance(body,dict) else body
         if isinstance(rows,list):
             _hunter_rows_observed += len(rows)
+            record['records_observed'] = _hunter_rows_observed
             for row in rows:
                 if not isinstance(row,dict):continue
                 for key,val in list(row.items())[:32]:
@@ -70,6 +73,22 @@ def _hunter_loads(*args,**kwargs):
                 record['record_fields']={str(k)[:64]:type(v).__name__ for k,v in list(rows[0].items())[:32]}
         if isinstance(body,dict) and isinstance(body.get('pagination'),dict):
             record['pagination']=_hunter_sample(body['pagination'])
+            paging = body['pagination']
+            total, offset = paging.get('total_count'), paging.get('offset')
+            if (isinstance(rows,list) and type(total) is int and total>=0
+                    and type(offset) is int and offset>=0 and _hunter_json_dataset is not None):
+                key = (_hunter_json_dataset,total)
+                if key in _hunter_page_sets or len(_hunter_page_sets)<8:
+                    intervals = _hunter_page_sets.setdefault(key,[])
+                    if len(intervals)<64:
+                        intervals.append((offset,offset+len(rows)))
+                    merged=[]
+                    for start,end in sorted(intervals):
+                        if merged and start<=merged[-1][1]:merged[-1][1]=max(merged[-1][1],end)
+                        else:merged.append([start,end])
+                    covered=sum(max(0,min(end,total)-min(start,total)) for start,end in merged)
+                    record['pagination_coverage']={'total_count':total,'covered_records':covered,
+                        'complete': covered==total,'ranges':merged[:8],'ranges_partial':len(merged)>8}
         prior=next((i for i,e in enumerate(_hunter_events) if e.get('kind')=='json_shape'),None)
         if prior is not None:_hunter_events[prior]=record
         else:_hunter_event(**record)
@@ -109,7 +128,7 @@ def _hunter_http_detail(url, error=None):
         except (AttributeError,OSError,ValueError,TypeError):pass
     return info
 def _hunter_observe_http(self, url, data=None, timeout=5):
-    global _hunter_json_pending
+    global _hunter_json_pending, _hunter_json_dataset
     address = url.full_url if isinstance(url, _hr.Request) else url
     local = isinstance(address, str) and _hp.urlsplit(address).hostname in ('localhost', '127.0.0.1')
     try:
@@ -117,6 +136,9 @@ def _hunter_observe_http(self, url, data=None, timeout=5):
         if local:
             _hunter_event(kind='http',status=response.status,**_hunter_http_detail(url))
             _hunter_json_pending=200<=response.status<300
+            parsed=_hp.urlsplit(address)
+            _hunter_json_dataset=(parsed.scheme,parsed.netloc,parsed.path,
+                tuple(sorted((k,v) for k,v in _hp.parse_qsl(parsed.query) if k not in ('offset','limit'))))
         return response
     except _he.HTTPError as exc:
         if local:_hunter_event(kind='http',status=exc.code,**_hunter_http_detail(url,exc))
@@ -132,7 +154,7 @@ except ImportError:
 else:
     _hunter_requests_send = _hrequests.Session.send
     def _hunter_observe_requests(self, req, **kwargs):
-        global _hunter_json_pending
+        global _hunter_json_pending, _hunter_json_dataset
         local = _hp.urlsplit(req.url).hostname in ('localhost','127.0.0.1')
         if local:
             kwargs['proxies'] = {}
@@ -149,6 +171,9 @@ else:
                     detail = _hunter_http_detail(view,error)
                 _hunter_event(kind='http',status=response.status_code,**detail)
                 _hunter_json_pending=200<=response.status_code<300
+                parsed=_hp.urlsplit(req.url)
+                _hunter_json_dataset=(parsed.scheme,parsed.netloc,parsed.path,
+                    tuple(sorted((k,v) for k,v in _hp.parse_qsl(parsed.query) if k not in ('offset','limit'))))
             return response
         except _hrequests.RequestException as exc:
             if local:_hunter_event(kind='http',error=type(exc).__name__)

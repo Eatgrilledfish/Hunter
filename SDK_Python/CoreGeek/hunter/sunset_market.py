@@ -29,6 +29,7 @@ class SunsetMarket:
     diagnostic: dict = field(default_factory=dict)
     upgrade_travellers: set = field(default_factory=set)
     upgrade_owner: str | None = None
+    checkout_intents: dict = field(default_factory=dict)
     caretaker_day: CaretakerDay = field(default_factory=CaretakerDay)
 
     def prepare(self, world, clock, rules, policy, guidance, jobs, excluded, deadline):
@@ -42,12 +43,22 @@ class SunsetMarket:
             feedback = world.raw.get('lastRoundRoleActionResults', {})
             failed = (world.round == order['round']+1 and isinstance(feedback,dict)
                       and feedback.get(identity) is False)
-            if failed or (actor and actor.backpack is not None and actor.inventory[order['name']]>order['prior']):
+            arrived = actor and actor.backpack is not None and actor.inventory[order['name']]>order['prior']
+            if arrived and identity in self.checkout_intents:
+                intent=self.checkout_intents[identity]
+                name=order['name']
+                intent[name]=max(0,intent.get(name,0)-(actor.inventory[name]-order['prior']))
+                if not any(intent.values()):self.checkout_intents.pop(identity)
+            if failed or arrived:
                 self.pending.pop(identity)
         if self.day != clock.day:
             self.day = clock.day; self.started = False; self.settled.clear()
             self.upgrade_travellers.clear()
             self.upgrade_owner=None
+            self.checkout_intents.clear()
+        if getattr(world,'critical_base_ids',()):
+            self.checkout_intents.clear()  # New survival priority overrides routine purchases.
+        world.checkout_order_limits=self.checkout_intents
         if (not policy.day_schedule_enabled or clock.phases != {'day'} or clock.day is None
                 or not world.phase_task_observed or time.monotonic()>=deadline):
             return []
@@ -71,7 +82,16 @@ class SunsetMarket:
                     at_shop = [i for i in reachable if world.near_zone(world.ours[i].pos,'weaponShop')]
                     owner = min(at_shop) if at_shop else roster.p if roster.p in reachable else roster.w
                 world.upgrade_checkout_actor = owner
-                daily = self.caretaker_day.prepare(world,clock,rules,policy,guidance,jobs,excluded,deadline)
+                emergency = [u for u in world.stations if u.id in getattr(world,'critical_base_ids',()) and u.level in (1,2)]
+                worker = world.ours.get(roster.w)
+                worker_rescue = bool(emergency and worker and (owner == roster.w or any(
+                    worker.inventory[f'StationUpgradeVoucher{u.level}'] for u in emergency)))
+                # Each free guard gets a bounded share. A complex wall tour
+                # must not consume the pioneer's entire shopping search.
+                worker_deadline=(time.monotonic()+max(0,deadline-time.monotonic())*.5
+                                 if roster.p in free else deadline)
+                daily = (None if worker_rescue else
+                         self.caretaker_day.prepare(world,clock,rules,policy,guidance,jobs,excluded,worker_deadline))
                 from .upgrade_dispatch import prepare
                 owned = {world.night_roster.w} if daily is not None else set()
                 upgrades=prepare(self,world,clock,rules,policy,guidance,jobs,excluded | owned,deadline)
@@ -379,6 +399,8 @@ class SunsetMarket:
         cmd=response['roleCommandMap'].get(identity,{})
         if self.diagnostic.get('stage')=='upgrade_procure' and cmd.get('action') in ('move','buy'):
             self.upgrade_owner=identity
+            if identity not in self.checkout_intents and self.diagnostic.get('basket'):
+                self.checkout_intents[identity]=dict(self.diagnostic['basket'])
         worker = getattr(world,'caretaker_day_actor',None)
         daily_cmd = response['roleCommandMap'].get(worker,{})
         if (getattr(world,'caretaker_day_phase',None)=='buy' and daily_cmd.get('action') in ('move','buy')

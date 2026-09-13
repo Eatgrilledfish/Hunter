@@ -14,8 +14,12 @@ from .day_schedule import weighted_field
 
 
 def requirements(world, rules, policy):
+    from .wall_policy import upgrade_rank
+    emergency = {u.id for u in world.stations if u.id in getattr(world, 'critical_base_ids', ()) and u.level in (1, 2)}
     result = []
     for unit in world.ours.values():
+        if emergency and unit.id not in emergency:
+            continue
         if not unit.alive or unit.level not in (1, 2):
             continue
         if not procurement.upgrade_allowed(world, unit, policy, rules):
@@ -24,13 +28,13 @@ def requirements(world, rules, policy):
                   else 'Station' if unit.kind == 'station' else None)
         if not prefix:
             continue
-        rank = {'Weapon':1, 'Wall':2, 'Station':3}[prefix]
-        for level in range(unit.level, 3):
+        rank = upgrade_rank(world, unit)
+        for level in range(unit.level, unit.level+1 if emergency else 3):
             result.append(dict(unit=unit, level=level, name=f'{prefix}UpgradeVoucher{level}', rank=rank))
     return sorted(result, key=lambda r:(r['rank'], r['level'], r['unit'].id))
 
 
-def basket(world, actor, rules, policy, deadline, *, cash=None):
+def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=None):
     """Match every owned tier once, then fund as much useful stock as possible."""
     roster = world.night_roster
     carriers = {i:world.ours[i] for i in (roster.w, roster.p) if i in world.ours
@@ -64,9 +68,12 @@ def basket(world, actor, rules, policy, deadline, *, cash=None):
     costs = [r.gold for k in WEAPONS if (r:=rules.build_rule(world,k)) is not None]
     reserve = (min(costs,default=0)*max(0,rules.weapon_limit-len(world.weapons))
                + getattr(world,'treasure_reserved_gold',0))
+    emergency = any(u.id in getattr(world, 'critical_base_ids', ()) and u.level in (1, 2) for u in world.stations)
+    if emergency:
+        reserve = 0  # Restoring the endangered base takes precedence over optional funds.
     primary = getattr(world,'upgrade_checkout_actor',actor.id)==actor.id
     worker = carriers.get(roster.w)
-    if actor.id == roster.p and worker and world.shop.get('WallFixer',0)>0:
+    if not emergency and actor.id == roster.p and worker and world.shop.get('WallFixer',0)>0:
         # P cannot carry W's maintenance supplies. Preserve the small amount
         # W still needs for its own two repair packs, not an arbitrary gold floor.
         reserve += max(0,2-worker.inventory['WallFixer'])*world.shop['WallFixer']
@@ -74,32 +81,43 @@ def basket(world, actor, rules, policy, deadline, *, cash=None):
     space = actor.capacity-len(actor.backpack)
     prepaid = set(covered)
     planned = []
+    limits = Counter(order_limits) if order_limits is not None and not emergency else None
     for req in unfilled:
         if not primary:break
         if space <= 0 or time.monotonic() >= deadline:
             break
         uid = req['unit'].id
         price = world.shop.get(req['name'],0)
+        if limits is not None and limits[req['name']] <= 0:
+            continue
         predecessor = req['level'] == req['unit'].level or (uid,req['level']-1) in covered
         if not predecessor or reachable(actor.id,req) is None or not 0 < price <= available:
             continue
         # Keep an actor's successive tiers together whenever it can carry them.
         # Vouchers already in another backpack are reserved, never transferred.
         planned.append(req); covered.add((uid,req['level']))
+        if limits is not None:limits[req['name']] -= 1
         available -= price; space -= 1
     walls = [u for u in world.ours.values() if u.alive and u.kind=='wall']
     stock = []
-    if actor.id == roster.w and walls:
+    if not emergency and actor.id == roster.w and walls:
         damaged = sum(u.health*10 < rules.max_health.get('wall',{}).get(u.level,u.health)*3 for u in walls)
         stock.append(('WallFixer', max(2, damaged+(len(walls)+3)//4)))
-    if primary or actor.id==roster.w:stock.append(('Medicine', 2))
+    if not emergency and (primary or actor.id==roster.w):stock.append(('Medicine', 2))
     # Night actions and bag space bound useful explosive reserves. The budget
     # may buy several in one action rather than stopping at the old one-item cap.
-    if primary:stock.append(('Bomb', 60))
+    if primary and not emergency:
+        stock.extend((('DizzyWeapon', 2), ('Bomb', 60)))
+        # Spend smaller residuals on next-wave pressure only after personal
+        # defence stock. Held orders across all bags already occupy the quota.
+        slots=getattr(world,'summon_purchase_slots',0)
+        if slots and policy.summon_pressure_enabled:
+            stock.append(('SmallRobotSummonOrder', actor.inventory['SmallRobotSummonOrder']+slots))
     for name, target in stock:
         price = world.shop.get(name,0)
         if price <= 0: continue
         count = min(space, available//price, max(0,target-actor.inventory[name]))
+        if limits is not None:count=min(count,limits[name])
         if count:
             planned.extend(dict(name=name,rank=4,level=0,unit=None) for _ in range(count))
             available -= count*price;space -= count
@@ -113,7 +131,9 @@ def use_tour(world, actor, entries, start, home, deadline, fields=None):
     view.occupied = world.occupied-{actor.pos}
     remaining = [e for e in entries if e['unit'] is not None]
     fields = {} if fields is None else fields
-    point, total = start, 0
+    point = start
+    total = sum(e['unit'] is None and e['name'].endswith('SummonOrder') for e in entries)
+    total += min(getattr(world,'summon_use_remaining',0),sum(n for k,n in actor.inventory.items() if k.endswith('SummonOrder')))
     while remaining:
         if time.monotonic() >= deadline:return None
         if point not in fields:fields[point] = distance_field(view,{point},point,deadline)
@@ -134,7 +154,8 @@ def quote(world, actor, clock, rules, policy, deadline, *, home, tail=None, end=
           cash=None, sale_stock=None, margin=None):
     """Fit useful purchases, skipping detours that would suppress the whole trip."""
     if actor.backpack is None or actor.capacity is None or not home:return None
-    data = basket(world,actor,rules,policy,deadline,cash=cash)
+    order_limits=getattr(world,'checkout_order_limits',{}).get(actor.id)
+    data = basket(world,actor,rules,policy,deadline,cash=cash,order_limits=order_limits)
     if data is None:return None
     tail = home if tail is None else tail
     end = min((p for p in home if home[p]==0), default=None) if end is None else end
@@ -200,6 +221,7 @@ def quote(world, actor, clock, rules, policy, deadline, *, home, tail=None, end=
         if price<=0:continue
         count=min(actor.capacity-len(actor.backpack)-len(selected),available//price,
                   max(0,target-actor.inventory[name]-counts[name]))
+        if order_limits is not None:count=min(count,max(0,order_limits.get(name,0)-counts[name]))
         if count<=0:continue
         entries=[dict(name=name,rank=4,level=0,unit=None) for _ in range(count)]
         trial=attempt(selected+entries)

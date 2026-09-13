@@ -103,9 +103,9 @@ def upgrade_demand(world, policy, *, priority_ids=(), rules=None):
     """Read observed targets and the purchasing tier before matching inventory."""
     staged = getattr(world, "staged_walls", False)
     if staged:
-        from .wall_policy import priority_units
+        from .wall_policy import priority_units, upgrade_rank
         leading = {u.id for u in priority_units(world)}
-        priority_ids = ()  # User order supersedes the old critical-base exception.
+        priority_ids = set(priority_ids) | set(getattr(world, 'critical_base_ids', ()))
     targets = {}
     for unit in sorted(world.ours.values(), key=lambda u: (u.kind == "wall", u.id)):
         if not unit.alive or unit.level not in {1, 2}:
@@ -122,7 +122,7 @@ def upgrade_demand(world, policy, *, priority_ids=(), rules=None):
                                         else 1 if prefix == "Weapon" and (unit.kind == "rocket" or not world.build_interior)
                                         else 2 if prefix == "Weapon" else 3 if prefix == "Station" else 4}
         if staged and unit.id in targets:
-            targets[unit.id]["rank"] = (1 if unit.kind in WEAPONS else 2 if unit.kind == "wall" else 3)
+            targets[unit.id]["rank"] = upgrade_rank(world, unit)
     # Fix the purchasing tier before assigning held stock. Held Gatling range
     # vouchers and rocket vouchers are not observed upgrades yet; their pending
     # deliveries must not release this tier's budget to lower-priority work.
@@ -144,7 +144,7 @@ def upgrade_demand(world, policy, *, priority_ids=(), rules=None):
             purchase_rank = None
     if staged:
         purchase_rank = min((t["rank"] for i,t in targets.items() if i in leading), default=None)
-        if len(world.weapons) < (rules.weapon_limit if rules else 3):
+        if len(world.weapons) < (rules.weapon_limit if rules else 3) and not getattr(world, 'critical_base_ids', ()):
             purchase_rank = None
     return targets, purchase_rank, restrict_purchases, priority_ids
 

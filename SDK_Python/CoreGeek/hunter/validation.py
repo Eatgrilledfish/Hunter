@@ -94,6 +94,15 @@ def check_action(world, clock, rules, identity, command, *, task_actor=None, sum
                 return invalid("gatling cone exceeds 90 degrees")
         if actor.kind == "railgun" and target == actor.pos:
             return invalid("zero firing direction")
+        from .robot_targets import opposing, area_clear, line_clear
+        if actor.kind == 'rocket':
+            if not area_clear(world,targets):return invalid('would damage opponent-camp robot')
+        elif any(r.alive and opposing(world,r) for r in world.robots.values()):
+            from .combat import line_damage
+            for endpoint in targets:
+                damage=line_damage(world,actor,endpoint,rules)
+                if not line_clear(world,actor,endpoint,rules,damage):
+                    return invalid('would damage opponent-camp robot on firing line')
     elif action in {"collect", "build", "remove"}:
         if actor.kind != "worker":
             return invalid("worker required")
@@ -190,6 +199,8 @@ def check_action(world, clock, rules, identity, command, *, task_actor=None, sum
             elif name in {"DizzyWeapon", "Bomb"}:
                 if target is None:
                     return invalid("item requires target")
+                from .robot_targets import area_clear
+                if not area_clear(world,targets):return invalid('would affect opponent-camp robot')
             elif name == "WallFixer" or name.startswith(("WeaponUpgradeVoucher", "WallUpgradeVoucher", "StationUpgradeVoucher")):
                 if target is None or distance(actor.pos, target) > 1:
                     return invalid("building item requires adjacent target anchor")

@@ -465,12 +465,13 @@ class Diagnostics(logging.Handler):
                     if important:self._task_context(state,task)
                 else:state['stats']['task_exec_omitted']+=1
                 api=next((e for e in record.get('data',{}).get('runtime_events',[])
-                          if e.get('kind')=='json_shape' and e.get('temporal_value_counts')),None)
+                          if e.get('kind')=='json_shape' and (e.get('temporal_value_counts') or e.get('pagination_coverage'))),None)
                 if api:
                     self._write_compact('task_api',**llm_trace.fit(dict(task=task['id'],left=task.get('left'),
                         evidence=eid,fields=api.get('record_fields'),pagination=api.get('pagination'),
                         observed=api.get('records_observed'),responses=api.get('responses_observed'),
-                        temporal=api['temporal_value_counts'],partial=True)))
+                        coverage=api.get('pagination_coverage'),
+                        temporal=api.get('temporal_value_counts'),partial=True)))
                 state["task_tools"].add(tool_key)
                 if len(state["task_tools"]) > 32:state["task_tools"]={tool_key}
             fault = getattr(self.local,"task_fault",None)

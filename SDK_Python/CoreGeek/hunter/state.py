@@ -154,10 +154,10 @@ class Session:
             # candidate with ambiguity, rather than silently shifting an old date.
             if previous and previous["hash"] == digest and (clock.day is None or previous["observed_day"] == clock.day):
                 continue
-            self.news.append({"section": section, "hash": digest, "text": text[:131072],
+            self.news.append({"section": section, "hash": digest, "text": text[:2*1024*1024],
                               "observed_round": world.round, "observed_day": clock.day,
                               "publication_certain": self.origin is not None and (world.round-self.origin) % 130 == 0,
-                              "truncated_locally": len(text) > 131072})
+                              "truncated_locally": len(text) > 2*1024*1024})
         self.news = self.news[-64:]
         self.tasks.reconcile(world, clock, self.epoch)
         self.intelligence.reconcile(world, clock, self)

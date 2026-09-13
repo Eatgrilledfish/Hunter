@@ -137,6 +137,7 @@ class Agent:
             build_jobs = draft.day_schedule.division.assign(world,clock,self.rules,self.policy,build_jobs,time.monotonic()+.25)
             if draft.external_gate.commands:
                 build_jobs={i:j for i,j in build_jobs.items() if i not in draft.external_gate.commands}
+            draft.day_schedule.division.reconcile_assistance(world,build_jobs)
             immediate = draft.filter_failures(economy.immediate(world, self.rules, task_actor, jobs=build_jobs, policy=self.policy), world.round)
             incumbent = self._base(world, clock, task_actor, immediate)
             fallback = incumbent.response
@@ -176,6 +177,7 @@ class Agent:
                     guidance.candidates.append(c)
                     guidance.roster_transit_actions[c.actor]=[c.command]
                     build_jobs.pop(c.actor,None)
+                draft.day_schedule.division.reconcile_assistance(world,build_jobs)
             candidates.extend(draft.tasks.candidates(world, choice=task_choice))
             world.pioneer_trade_stands = guidance.operator_stands
             repairs = world.duty_budget.run('repair', lambda budget_end: draft.repair.prepare(
@@ -352,8 +354,14 @@ class Agent:
                 market_excluded.add(draft.tasks.accept_pending.get('actor'))
             if task_choice and task_choice.get('selected'):
                 market_excluded.add(task_choice['actor'])
+            from .opponent import next_wave_window, SUMMONS
+            summon_window=next_wave_window(clock)
+            world.summon_use_remaining=(draft.opponent.remaining if summon_window and clock.phases=={'day'} else 0)
+            world.summon_purchase_slots=max(0,world.summon_use_remaining-
+                sum(u.inventory[k] for u in world.movers for k in SUMMONS)-
+                sum(p['num'] for p in draft.opponent.pending_buys.values()))
             market = draft.sunset_market.prepare(world,clock,self.rules,self.policy,guidance,build_jobs,
-                market_excluded,min(deadline,time.monotonic()+.15))
+                market_excluded,min(deadline,time.monotonic()+.30))
             candidates.extend(draft.filter_failures(market,world.round))
             recovery_targets = draft.recovery.targets(world, self.rules, self.policy)
             urgent_upgrades = draft.filter_failures(economy.procurement.urgent_gatling_upgrades(
@@ -593,6 +601,7 @@ class Agent:
                       "navigation_retry_exclusions": {u.id:sorted(world.navigation_avoided.get(u.pos, set())) for u in world.movers},
                       "movement_retry_windows": draft.move_retry_windows(world.round),
                       "construction_jobs": build_jobs,
+                      "wall_assistance": getattr(world,'wall_assistance',{}),
                       "work_status":{u.id:{"ore":[u.inventory[k] for k in ("stone","iron","copper")],
                           "job":({"name":build_jobs[u.id]["name"],"gate":build_jobs[u.id].get("gate",False),"stock":build_jobs[u.id].get("stock_target"),"build_steps":build_jobs[u.id].get("construction_steps"),"deferred":build_jobs[u.id].get("defer_build")} if u.id in build_jobs else None),
                           "slack":guidance.return_routes.get(u.id,{}).get("slack_before_buffer"),
@@ -637,6 +646,7 @@ class Agent:
                           "ports":sorted(world.firing_ports),
                           "stage":getattr(world,"wall_stage",None),
                           "facing":getattr(world,"wall_direction_source",None),
+                          "assistance":getattr(world,'wall_assistance',{}),
                           "stone":{u.id:u.inventory["stone"] if u.backpack is not None else None for u in world.movers if u.kind=="worker"},
                           "quotas":{i:j.get("stock_target") for i,j in build_jobs.items() if j["name"]=="wall"},
                           "mines":sorted(world.zones.get("stone", ()))[:8],

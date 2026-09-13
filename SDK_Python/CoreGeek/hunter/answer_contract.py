@@ -120,6 +120,23 @@ def validate(task, spec, value, refs):
     if required['schema']:
         validate_schema(value, required['schema'], partial)
     results = [task.evidence[key].get("data", {}) for key in refs]
+    # Concrete observed pagination can disprove a complete API aggregation.
+    # This does not infer missing pages, field meanings or unseen API contracts.
+    aggregate_fields = set(fields) | set((required.get('schema') or {}).get('properties', {}))
+    aggregate = bool(aggregate_fields & {'world_heritage_count','oldest_era'})
+    if required['execution_required'] and aggregate and not partial:
+        for result in results:
+            for event in result.get('runtime_events', []):
+                if event.get('kind') != 'json_shape':
+                    continue
+                coverage = event.get('pagination_coverage')
+                if isinstance(coverage,dict) and coverage.get('complete') is False:
+                    raise ValueError('API pagination incomplete: observed record ranges do not cover total_count')
+                paging = event.get('pagination', {})
+                observed = event.get('records_observed',event.get('records_on_page'))
+                total = paging.get('total_count') if isinstance(paging,dict) else None
+                if type(observed) is int and type(total) is int and observed < total:
+                    raise ValueError(f'API pagination incomplete: observed {observed} records of {total}')
     if required["execution_required"] and not any(
             r.get("operation") in {"run_tool", "run_python"} and r.get("status") == "ok"
             and r.get("completeness") == "complete" for r in results):

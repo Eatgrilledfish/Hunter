@@ -284,6 +284,26 @@ def ready_construction(world, clock, rules, policy, deadline, *, jobs=None):
         actor = world.ours[identity]
         if time.monotonic() >= deadline or actor.backpack is None:
             continue
+        if job.get('helper'):
+            from .rules import station_rings
+            blue, yellow = station_rings(world.stations[0].pos)
+            blocked = blue | yellow | world.stations[0].cells
+            if actor.inventory['stone']:
+                goals = set(job['helper_goals'])
+                action = dict(action='build',name='wall',targetPos=[pos_json(job['target'])])
+            else:
+                mine = job.get('helper_mine')
+                if mine is None:
+                    continue
+                goals = interaction_cells(world,[mine],actor.pos)-blocked
+                action = dict(action='collect',targetPos=[pos_json(mine)])
+            reach = distance_field(world,goals,actor.pos,deadline,extra_blocked=blocked)
+            if actor.pos in goals:
+                result.append(Candidate(identity,action,80,'exterior miner assists delayed wall construction'))
+            elif actor.pos in reach:
+                steps = sorted(p for p in neighbours(actor.pos) if reach.get(p,float('inf')) < reach[actor.pos])
+                result.extend(movement(actor,steps,80,'exterior miner approaches its own wall work stand'))
+            continue
         if job.get("economy_first"):
             # A collection/build commitment cannot spend the final return
             # window. The gate actor is already inside when it seals.
