@@ -78,7 +78,12 @@ class CaretakerDay:
         stock = {k:max(0, actor.inventory[k] - (stone if k == 'stone' else 0))
                  for k in MINERALS if world.vendor.get(k, 0) > 0}
         stock = {k:n for k,n in stock.items() if n}
-        home = distance_field(world, defence_duties.stands(world, actor.id), actor.pos, deadline,
+        # Daytime use tours may pass through either side of C. Restricting
+        # their starting endpoint to the final front stand can hide a gun
+        # behind P's occupied tile and omit its otherwise deliverable coupon.
+        # The normal return planner still selects the front stand for night.
+        home_cells = defence_duties.stands(world, actor.id)
+        home = distance_field(world, home_cells, actor.pos, deadline,
                               extra_blocked={plan['w']})
         margin = policy.return_buffer + (8 if set(world.wall_targets or ()) == yellow else 0)
         self.diagnostic = dict(left=clock.until_night,missing_walls=len(missing),reserved_stone=stone)
@@ -176,6 +181,11 @@ class CaretakerDay:
             left=clock.until_night,reserved_stone=stone,use_steps=use_steps,
             missing_walls=len(missing),planned_walls=len(planned_walls),
             basket=dict(trip['orders']) if trip else {})
+        if (self.phase == 'harvest' and affordable_upgrade and trip is not None and trip['fits']
+                and not max(0, stone-actor.inventory['stone'])):
+            # Once defence is funded, convert the money now. More mining must
+            # not postpone checkout until movement/closure consumes the window.
+            self.phase = 'sell'
         if self.phase == 'harvest':
             repairs = getattr(world, 'repair_commands', {}).get(actor.id, [])
             repair_steps = getattr(world, 'day_repair_steps', {}).get(actor.id, 1)

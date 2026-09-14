@@ -12,6 +12,8 @@ from .navigation import distance_field, interaction_cells
 from .protocol import WEAPONS, distance
 from .day_schedule import weighted_field
 
+OPTIONAL_STOCK = {'DizzyWeapon', 'Bomb', 'SmallRobotSummonOrder'}
+
 
 def requirements(world, rules, policy):
     from .wall_policy import upgrade_rank
@@ -37,8 +39,7 @@ def requirements(world, rules, policy):
 def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=None):
     """Match every owned tier once, then fund as much useful stock as possible."""
     roster = world.night_roster
-    carriers = {i:world.ours[i] for i in (roster.w, roster.p) if i in world.ours
-                and world.ours[i].alive and world.ours[i].backpack is not None}
+    carriers = {u.id:u for u in world.movers if u.backpack is not None}
     carriers.setdefault(actor.id, actor)
     supply = {i:u.inventory.copy() for i,u in carriers.items()}
     fields = {i:distance_field(world, {u.pos}, u.pos, deadline) for i,u in carriers.items()}
@@ -100,12 +101,15 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
         available -= price; space -= 1
     walls = [u for u in world.ours.values() if u.alive and u.kind=='wall']
     stock = []
+    if not emergency and (primary or actor.id==roster.w):
+        stock.append(('Medicine', 1 if policy.medical_stock_enabled else 2))
     if not emergency and actor.id == roster.w and walls:
         damaged = sum(u.health*10 < rules.max_health.get('wall',{}).get(u.level,u.health)*3 for u in walls)
         stock.append(('WallFixer', max(2, damaged+(len(walls)+3)//4)))
-    if not emergency and (primary or actor.id==roster.w):stock.append(('Medicine', 2))
     # Night actions and bag space bound useful explosive reserves. The budget
     # may buy several in one action rather than stopping at the old one-item cap.
+    defence_reserve = sum(world.shop.get(r['name'],0) for r in unfilled
+                          if r['unit'].kind != 'station' and (r['unit'].id,r['level']) not in covered)
     if primary and not emergency:
         stock.extend((('DizzyWeapon', 2), ('Bomb', 60)))
         # Spend smaller residuals on next-wave pressure only after personal
@@ -116,13 +120,14 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
     for name, target in stock:
         price = world.shop.get(name,0)
         if price <= 0: continue
-        count = min(space, available//price, max(0,target-actor.inventory[name]))
+        spendable = max(0,available-defence_reserve) if name in OPTIONAL_STOCK else available
+        count = min(space, spendable//price, max(0,target-actor.inventory[name]-sum(r['name']==name for r in planned)))
         if limits is not None:count=min(count,limits[name])
         if count:
             planned.extend(dict(name=name,rank=4,level=0,unit=None) for _ in range(count))
             available -= count*price;space -= count
     return dict(held=held, planned=planned, reserve=reserve, unspent=available,
-                prepaid=prepaid, stock_targets=stock)
+                prepaid=prepaid, stock_targets=stock, unfunded_defence_reserve=defence_reserve)
 
 
 def use_tour(world, actor, entries, start, home, deadline, fields=None):
@@ -167,6 +172,24 @@ def quote(world, actor, clock, rules, policy, deadline, *, home, tail=None, end=
     fields, routes = {}, {}
     def attempt(entries):
         orders = Counter(e['name'] for e in entries)
+        if actor.kind == 'pioneer' and orders:
+            # P has no wall-closing obligation. Apply its coupons on the way
+            # back from checkout, including walls serviced from outside. The
+            # old home->tour->home estimate rejected affordable short trips.
+            costs = {}
+            for point in shops & home.keys():
+                steps = use_tour(world,actor,data['held']+entries,point,home,deadline,fields)
+                if steps is not None:costs[point]=steps+len(orders)
+                if time.monotonic()>=deadline:return None
+            if not costs:return None
+            checkout=weighted_field(world,costs,actor,deadline) or {}
+            sale=(weighted_field(world,{p:checkout[p]+len(sale_stock) for p in
+                  interaction_cells(world,world.zones.get('vendor',()),actor.pos) if p in checkout},actor,deadline)
+                  if sale_stock else checkout) or {}
+            required=sale.get(actor.pos)
+            return dict(data,planned=entries,orders=orders,use_steps=min(costs.values())-len(orders),
+                        checkout=checkout,sale=sale,required=required,
+                        fits=required is not None and required+margin<=clock.until_night)
         use_steps = use_tour(world,actor,data['held']+entries,end,home,deadline,fields)
         if use_steps is None:return None
         delivery = {p:n+use_steps for p,n in tail.items()}
@@ -206,7 +229,8 @@ def quote(world, actor, clock, rules, policy, deadline, *, home, tail=None, end=
         if trial and actor.capacity-len(actor.backpack)>len(selected)+1:
             left_cash=budget-sum(world.shop[e['name']] for e in selected+[entry])
             pending_stock=sum(name not in trial['orders'] and actor.inventory[name]<target
-                              and 0<world.shop.get(name,0)<=left_cash
+                              and 0<world.shop.get(name,0)<=max(0,left_cash-(
+                                  data['unfunded_defence_reserve'] if name in OPTIONAL_STOCK else 0))
                               for name,target in data['stock_targets'])
         if trial and trial['fits'] and trial['required']+margin+pending_stock<=clock.until_night:
             selected.append(entry);best=trial
@@ -214,12 +238,15 @@ def quote(world, actor, clock, rules, policy, deadline, *, home, tail=None, end=
     # Reallocate money released by skipped upgrade detours to useful personal
     # stock. Consumables add checkout actions, not another delivery circuit.
     available = data['unspent']+sum(world.shop[e['name']] for e in planned)-sum(world.shop[e['name']] for e in selected)
+    defence_reserve = data['unfunded_defence_reserve']+sum(world.shop[e['name']] for e in planned
+        if e not in selected and e['unit'] is not None and e['unit'].kind != 'station')
     counts = Counter(e['name'] for e in selected)
     for name,target in data['stock_targets']:
         if time.monotonic() >= deadline:break
         price=world.shop.get(name,0)
         if price<=0:continue
-        count=min(actor.capacity-len(actor.backpack)-len(selected),available//price,
+        spendable=max(0,available-defence_reserve) if name in OPTIONAL_STOCK else available
+        count=min(actor.capacity-len(actor.backpack)-len(selected),spendable//price,
                   max(0,target-actor.inventory[name]-counts[name]))
         if order_limits is not None:count=min(count,max(0,order_limits.get(name,0)-counts[name]))
         if count<=0:continue

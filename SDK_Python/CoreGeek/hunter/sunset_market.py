@@ -77,6 +77,11 @@ class SunsetMarket:
                 reachable = {i for i in free if world.ours[i].pos in distance_field(
                     world, interaction_cells(world,world.zones.get('weaponShop',()),world.ours[i].pos),
                     world.ours[i].pos,deadline)}
+                if (self.upgrade_owner == roster.w and self.caretaker_day.day == clock.day
+                        and self.caretaker_day.phase in {'close','use'}):
+                    # W has left checkout. Its personal vouchers remain
+                    # reserved, but a free P can spend newly received gold.
+                    self.upgrade_owner = None
                 owner = self.upgrade_owner if self.upgrade_owner in reachable else None
                 if owner is None:
                     at_shop = [i for i in reachable if world.near_zone(world.ours[i].pos,'weaponShop')]
@@ -378,7 +383,7 @@ class SunsetMarket:
         choices=[(t['name'],1) for t in demands]
         walls=[u for u in world.ours.values() if u.alive and u.kind=='wall'
                and any(distance(p,u.pos)<=1 for p in stand)]
-        if walls:choices.append(('WallFixer',max(0,2-buyer.inventory['WallFixer'])))
+        if walls and buyer.kind == 'worker':choices.append(('WallFixer',max(0,2-buyer.inventory['WallFixer'])))
         choices.append(('Medicine',max(0,1-buyer.inventory['Medicine'])))
         # One ranged emergency item after local maintenance stock and upgrades.
         if not buyer.inventory['Bomb'] and not buyer.inventory['DizzyWeapon']:
@@ -416,6 +421,11 @@ def permits(world, candidate):
     command=candidate.command;identity=candidate.actor
     allowed=getattr(world,'sunset_actions',{})
     buyer=getattr(world,'sunset_buyer',None)
+    actor=world.ours.get(identity)
+    personal_dose = (command.get('action')=='buy' and command.get('name')=='Medicine'
+        and command.get('num',1)==1 and actor and actor.backpack is not None
+        and not actor.inventory['Medicine']
+        and getattr(getattr(world,'strategy_policy',None),'medical_stock_enabled',False))
     if command in getattr(world,'treasure_actions',{}).get(identity,()):
         return True
     if identity == getattr(world,'caretaker_day_actor',None):
@@ -429,12 +439,12 @@ def permits(world, candidate):
             return phase == 'buy' and command in allowed.get(identity,())
         if command.get('action') == 'use' and 'UpgradeVoucher' in command.get('name',''):
             return phase == 'use' and command in allowed.get(identity,())
-    if (command.get('action')=='buy' and getattr(world,'upgrade_priority_pending',False)
+    if (command.get('action')=='buy' and not personal_dose and getattr(world,'upgrade_priority_pending',False)
             and command.get('name') not in world.upgrade_priority_items):
         return False
     if command.get('action')=='buy' and buyer and identity!=buyer:
         actor=world.ours.get(identity)
-        return bool(command.get('name')=='Medicine' and actor and actor.health<=110)
+        return bool(personal_dose or command.get('name')=='Medicine' and actor and actor.health<=110)
     if identity not in allowed:
         return True
     if command.get('action')=='use' and command.get('name') in {'Medicine','Bomb','DizzyWeapon','WallFixer'}:

@@ -31,8 +31,12 @@ def prepare(state, world, clock, rules, policy, deadline):
     world.gate_worker_duty = dict(round=world.round, gate=gate, worker=roster.w)
     world.ordered_gate_actions = {}
     world.ordered_ingress_due = False
+    from .procurement import upgrade_demand
+    delivery_targets, _, _, _ = upgrade_demand(world, policy, rules=rules)
+    supplying = bool(miner and miner.backpack is not None and any(
+        miner.inventory[r['name']] for r in delivery_targets.values()))
     if (clock.phases == {'day'} and miner and miner.alive
-            and miner.id not in world.night_defenders and miner.pos not in interior):
+            and miner.id not in world.night_defenders and miner.pos not in interior and not supplying):
         # The exit and the harvest route must agree. Otherwise the miner exits
         # on one frame and takes a shortcut back across the empty wall ring on
         # the next, repeating until construction happens to block that shortcut.
@@ -97,11 +101,45 @@ def prepare(state, world, clock, rules, policy, deadline):
                 state.diagnostic['cashout'] = dict(actor=miner.id, stock=stock, done=False)
     if not worker or not worker.alive or not pioneer or not pioneer.alive:
         return result
+    if (clock.phases == {'day'} and supplying and miner.alive
+            and miner.id not in world.night_defenders and miner.id not in state.commands):
+        from .night_resupply import deliver_after_dawn
+        command=deliver_after_dawn(world,miner,rules,policy,deadline)
+        offer(miner,command,'deliver personal prepaid night vouchers after actual dawn cashout')
+        state.diagnostic['day_delivery']=dict(actor=miner.id,route_observed=command is not None)
+
+    # Turn a useful personal ore batch into shared defence money while the
+    # guards can still visit the shop and the daylight gate is open. Dawn's
+    # mandatory liquidation above remains first; neither sale is projected as
+    # spendable cash before its next observed receipt.
+    if (clock.phases == {'day'} and miner and miner.alive and miner.backpack is not None
+            and miner.id not in world.night_defenders and miner.pos not in interior
+            and miner.id not in state.commands and clock.until_night > 18):
+        from .supply_basket import requirements
+        needed = requirements(world,rules,policy)
+        prices = [world.shop[r['name']] for r in needed if world.shop.get(r['name'],0)>0]
+        stock = {k:miner.inventory[k] for k in MINERALS if miner.inventory[k] and world.vendor.get(k,0)>0}
+        if 'stone' in stock:
+            missing_count=len(set(world.wall_targets or ())-walls.keys())
+            stock['stone']=max(0,stock['stone']-max(1,missing_count-worker.inventory['stone']))
+            if not stock['stone']:stock.pop('stone')
+        value=sum(n*world.vendor[k] for k,n in stock.items())
+        if prices and stock and ((world.gold or 0)<prices[0]<=(world.gold or 0)+value or value>=prices[0]
+                or (miner.capacity is not None and len(miner.backpack)>=miner.capacity)):
+            vendors=interaction_cells(world,world.zones.get('vendor',()),miner.pos)
+            route=distance_field(world,vendors,miner.pos,deadline)
+            if route.get(miner.pos,float('inf'))+len(stock)<clock.until_night:
+                name=max(stock,key=lambda k:(stock[k]*world.vendor[k],k))
+                command=(dict(action='sell',name=name,num=stock[name]) if world.near_zone(miner.pos,'vendor')
+                         else step(miner,vendors))
+                if command:
+                    offer(miner,command,'cash out funded defence ore before the guards close the day')
+                    state.diagnostic['day_sale']=dict(actor=miner.id,value=value,item=name,steps=route[miner.pos])
 
     if clock.phases == {'night'}:
         state.stage = 'WORKER_NIGHT'
         # Ordinary return/combat/repair planners own the guards at night.
-        # No night construction, gate removal or miner trading is introduced.
+        # Exterior supply uses its own actual routes; no night gate removal.
         return state._independent_work(world,clock,rules,policy,deadline,result)
     if clock.phases != {'day'}:
         return result
@@ -121,7 +159,7 @@ def prepare(state, world, clock, rules, policy, deadline):
 
     # Release an interior economy worker before either guard plugs the exit.
     # This also covers the first day's construction, when M has no overnight ore.
-    if (miner and miner.alive and miner.id not in world.night_defenders
+    if (miner and miner.alive and miner.id not in world.night_defenders and not supplying
             and miner.pos in interior and gate not in walls and len(world.weapons)==rules.weapon_limit):
         exits = {q for q in neighbours(gate) if world.inside(q) and q not in interior}
         command = step(miner,exits)

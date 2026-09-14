@@ -21,6 +21,25 @@ def stands(world, identity):
     return {plan['w']} if identity == rotator(world) else set(plan['c_stands']) - {plan['w']}
 
 
+def stand_rank(world, actor, position, walk):
+    """Keep C staffed from the inside of the monster-facing wall.
+
+    This ranks already reachable legal gun cells. Known lethal exposure takes
+    precedence, then wall coverage, then travel; it never invents a free cell.
+    """
+    from .protocol import distance
+    from .robot_threats import active
+    if not enabled(world) or actor.id != caretaker(world):
+        return (walk, position)
+    threats = [r for r in active(world) if r.target_team in (None, world.side)]
+    damage = sum(2*r.attack_power for r in threats
+                 if r.attack_power is not None and r.attack_range is not None
+                 and distance(position, r.pos) <= r.attack_range)
+    front = getattr(world, 'monster_front_walls', set())
+    coverage = sum(distance(position, p) <= 1 for p in front)
+    return (damage >= actor.health, -coverage, damage, walk, position)
+
+
 def ingress_reserve(world, policy, walk):
     """Use the same clearance window for task admission and ordered ingress."""
     from .rules import station_rings

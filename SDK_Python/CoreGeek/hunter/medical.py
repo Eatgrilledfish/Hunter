@@ -40,7 +40,7 @@ class MedicalSupply:
                         key=lambda a: (a.health/(200 if a.kind == 'pioneer' else 220), a.id))
         # Preserve enough current gold for the remaining known weapon slots.
         costs = [r.gold for name in sorted(WEAPONS) if (r := rules.build_rule(world, name)) is not None]
-        reserve = max(policy.reserve_gold, min(costs, default=0)*max(0, rules.weapon_limit-len(world.weapons)))
+        reserve = min(costs, default=0)*max(0, rules.weapon_limit-len(world.weapons))
         budget = min(max(0, (world.gold or 0)-reserve), max(0, policy.medical_gold_limit-self.spent.get(clock.day, 0)))
         self.diagnostic.update(reserve_gold=reserve, available_budget=budget)
         for actor in actors:
@@ -48,7 +48,7 @@ class MedicalSupply:
                 break
             maximum = 200 if actor.kind == 'pioneer' else 220
             treatment = actor.health*2 <= maximum
-            stock = policy.medical_stock_enabled and world.near_zone(actor.pos, 'weaponShop')
+            stock = policy.medical_stock_enabled
             if (not treatment and not stock) or actor.backpack is None:
                 continue
             if actor.inventory['Medicine']:
@@ -64,19 +64,21 @@ class MedicalSupply:
             if actor.id in self.pending or actor.capacity is None or len(actor.backpack) >= actor.capacity:
                 continue
             price = world.shop.get('Medicine')
-            stand = guidance.operator_stands.get(actor.id)
-            if (price is None or price > budget or stand is None or clock.day is None or
+            from .day_schedule import day_endpoints
+            goals = ({guidance.operator_stands[actor.id]} if actor.id in guidance.operator_stands else
+                     day_endpoints(world, actor, guidance.operator_stands)[0])
+            if (price is None or price <= 0 or price > budget or not goals or clock.day is None or
                     not 1 <= clock.day <= 10 or not world.zones.get('weaponShop')):
                 continue
             start = distance_field(world, [actor.pos], actor.pos, deadline)
-            back = distance_field(world, [stand], actor.pos, deadline)
+            back = distance_field(world, goals, actor.pos, deadline)
             shops = interaction_cells(world, world.zones['weaponShop'], actor.pos)
             actions = 2 if treatment else 1
-            # Healthy roles only buy when already passing a shop; no dedicated
-            # healthy shopping trip or unobserved inventory transfer is planned.
+            # An idle role may make a personal trip. The existing task, repair,
+            # construction and return commitments still have to permit it.
+            margin = policy.return_buffer + (8 if actor.id in guidance.operator_stands else 0)
             paths = [(start[p]+back[p]+actions, start[p], p) for p in shops if p in start and p in back
-                     and (treatment or p == actor.pos)
-                     and start[p]+back[p]+actions+policy.return_buffer <= clock.until_night]
+                     and start[p]+back[p]+actions+margin <= clock.until_night]
             if not paths or time.monotonic() >= deadline:
                 continue
             total, length, shop_cell = min(paths)
@@ -88,7 +90,7 @@ class MedicalSupply:
                         [{'action': 'move', 'targetPos': [pos_json(p)]} for p in steps[:4]])
             offers = [Candidate(actor.id, command, 200+(maximum-actor.health)/(total+1)-i*.01,
                                 ('complete low-HP treatment trip before optional daytime work' if treatment else
-                                 'carry one personal emergency Medicine while already adjacent to shop'), gold_reserve=reserve)
+                                 'idle role obtains one personal emergency Medicine before returning'), gold_reserve=reserve)
                       for i, command in enumerate(commands)]
             offers = [c for c in offers if guidance.permit(c)]
             if offers:

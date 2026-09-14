@@ -101,15 +101,15 @@ class RepairSupply:
             if time.monotonic()>=deadline or slots<=0 or price>budget:
                 break
             actor=world.ours.get(identity)
-            if not actor or not actor.alive or identity in excluded or identity in self.pending:
+            if not actor or not actor.alive or actor.kind != 'worker' or identity in excluded or identity in self.pending:
                 continue
             if (actor.backpack is None or actor.capacity is None or len(actor.backpack)>=actor.capacity
                     or actor.inventory['WallFixer']>=1 or actor.health<(220 if actor.kind=='worker' else 200)*.75):
                 continue
             if identity in guidance.urgent_upgrades or identity in guidance.recovery_actions or identity in guidance.site_clear_actions:
                 continue
-            # W stocks a package on an existing shop visit. P may make a
-            # measured daytime trip while no task is active/pending.
+            # Only workers carry maintenance stock; preserve existing duties
+            # and the measured daytime return budget.
             if not enabled(world) and identity==roster.w and not world.near_zone(actor.pos,'weaponShop'):
                 continue
             home=guidance.operator_stands.get(identity)

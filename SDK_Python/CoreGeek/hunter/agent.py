@@ -159,7 +159,7 @@ class Agent:
                     funded |= bool(actor and actor.backpack is not None and actor.capacity is not None
                         and len(actor.backpack)<actor.capacity and any(
                             actor.inventory[name]<limit and 0 < world.shop.get(name,0) <= (world.gold or 0)
-                            for name,limit in (('Medicine',2),('Bomb',60))))
+                            for name,limit in (('Medicine',1 if self.policy.medical_stock_enabled else 2),('Bomb',60))))
                 if draft.sunset_market.upgrade_owner==task_choice['actor'] or waiting and funded:
                     task_choice=dict(actor=task_choice['actor'],selected=None,candidates=[],
                         reason='funded upgrade checkout precedes waiting for a future task')

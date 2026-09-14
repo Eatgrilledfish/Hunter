@@ -105,7 +105,7 @@ def permits(world, clock, candidate):
     actor = world.ours.get(candidate.actor)
     if (clock.phases == {'night'} and actor and actor.id in getattr(world,'night_economists',())
             and command.get('action') in {'buy','sell'}):
-        return False  # Night stock is liquidated after the observed dawn.
+        return command in getattr(world,'night_resupply_commands',{}).get(actor.id,())
     if clock.phases != {'day'} and actor and actor.kind == 'pioneer':
         if command.get('action') in {'acceptTask','collect','sell','buy','summonTreasure','drop'}:
             return False
@@ -209,7 +209,7 @@ def _fixed_stands(world, deadline, include_pioneer=True, task_actor=None, allow_
         field = distance_field(world, [actor.pos], actor.pos, deadline)
         reachable = goals & field.keys()
         if reachable:
-            result[actor.id] = min(reachable, key=lambda p: (field[p], p))
+            result[actor.id] = min(reachable, key=lambda p: defence_duties.stand_rank(world, actor, p, field[p]))
     return result if time.monotonic() < deadline else {}
 
 

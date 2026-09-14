@@ -17,7 +17,8 @@ def propose(world, clock, rules, policy, deadline, *, keep_economy=False):
     m=world.ours.get(roster.m)
     blue,yellow=station_rings(plan['anchor'])
     interior=blue|yellow|world.stations[0].cells
-    if not m or not m.alive or m.id in world.night_defenders or m.pos in interior or m.backpack is None:
+    if (not m or not m.alive or m.id in world.night_defenders or m.backpack is None
+            or m.pos in interior and (dusk or not policy.pioneer_rotation_enabled)):
         return None,{}
     report={'actor':m.id,'independent':True,'gate':plan['gate']}
     threats=active(world)
@@ -25,7 +26,7 @@ def propose(world, clock, rules, policy, deadline, *, keep_economy=False):
         return None,dict(report,reason='unknown robot kind prevents safe route')
     if any(r.attack_power>0 and distance(m.pos,r.pos)<=r.attack_range for r in threats):
         return None,dict(report,hold=True,reason='current tile exposed; escape takes priority')
-    blocked=world.occupied|interior|world.navigation_avoided.get(m.pos,set())
+    blocked=world.occupied|world.navigation_avoided.get(m.pos,set())
     for robot in threats:
         if robot.attack_power<=0:continue
         radius=robot.attack_range
@@ -34,6 +35,24 @@ def propose(world, clock, rules, policy, deadline, *, keep_economy=False):
             for y in range(max(0,robot.pos[1]-radius),min(world.height,robot.pos[1]+radius+1)):
                 blocked.add((x,y))
     blocked.discard(m.pos)
+    if clock.phases == {'night'} and policy.pioneer_rotation_enabled:
+        from .night_resupply import propose as resupply
+        command, supply_report = resupply(world,clock,rules,policy,m,blocked,deadline)
+        if command:
+            world.night_resupply_commands = {m.id:[command.command]}
+            return command,supply_report
+        if supply_report.get('hold'):return None,supply_report
+        report['supply'] = supply_report
+        if m.pos in interior:
+            outside={(x,y) for x in range(world.width) for y in range(world.height)
+                     if (x,y) not in interior|blocked}
+            exit_route=_field(world,outside,blocked,deadline)
+            steps=sorted(q for q in neighbours(m.pos) if exit_route.get(q,float('inf'))<exit_route.get(m.pos,0))
+            if steps:
+                return Candidate(m.id,dict(action='move',targetPos=[pos_json(steps[0])]),1050,
+                                 'night supplier leaves through observed free path'),dict(report,stage='NIGHT_SUPPLY_EXIT')
+            return None,dict(report,hold=True,reason='no observed safe exit from completed delivery')
+    blocked |= interior-{m.pos}
     reach=_field(world,{m.pos},blocked,deadline)
     def step(goals):
         field=_field(world,set(goals),blocked,deadline)

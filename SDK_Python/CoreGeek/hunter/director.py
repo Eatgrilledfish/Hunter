@@ -460,6 +460,9 @@ def triage(world, clock, task_actor, task, policy=None, risk_memory=None):
                     result.blocked_moves.setdefault(actor.id, set()).add(pos)
                     blocked.append({"pos": pos_json(pos), **destination})
             risk["blocked_lethal_entries"] = blocked
+        if actor.inventory['Medicine'] and actor.health*2 <= (200 if actor.kind == 'pioneer' else 220):
+            result.candidates.append(Candidate(actor.id, {'action':'use','name':'Medicine'},
+                                              1200, 'restore low personal HP before further work'))
         if not upper:
             continue
         critical = upper >= actor.health

@@ -13,7 +13,7 @@
     "return_commitment_enabled": true,
     "return_detour_enabled": true,
     "medical_supply_enabled": true,
-    "medical_stock_enabled": false,
+    "medical_stock_enabled": true,
     "medical_gold_limit": 60,
     "pioneer_defence_enabled": true,
     "construction_commitment_enabled": true,

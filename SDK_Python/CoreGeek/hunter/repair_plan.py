@@ -8,6 +8,7 @@ from .navigation import distance_field, interaction_cells, neighbours
 from .protocol import distance, pos_json
 from .night_roles import defender_ids
 from . import defence_duties
+from .robot_threats import active as active_robots
 
 
 def damaged_walls(world, rules):
@@ -18,8 +19,8 @@ def damaged_walls(world, rules):
 
 def pressure(world, wall):
     """Observed two-opportunity bound, not a forecast of the robot's target."""
-    threats = [u for u in world.robots.values() if u.alive and u.abnormal != 'dizzy'
-               and u.target_team in (None, world.side)]
+    threats = [u for u in active_robots(world)
+               if u.target_team in (None, world.side)]
     if any(u.attack_power is None or u.attack_range is None for u in threats):
         return None
     return 2 * sum(u.attack_power for u in threats if distance(u.pos, wall.pos) <= u.attack_range)
@@ -72,8 +73,8 @@ class RepairPlan:
         maintenance_mode = defence_duties.enabled(world)
         walls = ([u for u in world.ours.values() if u.alive and u.kind=='wall']
                  if maintenance_mode else damaged_walls(world, rules))
-        threats = [u for u in world.robots.values() if u.alive and u.abnormal != 'dizzy'
-                   and u.target_team in (None,world.side)]
+        threats = [u for u in active_robots(world)
+                   if u.target_team in (None,world.side)]
         if any(u.attack_range is None or u.attack_power is None for u in threats):
             self.diagnostic={'status':'UNKNOWN_ROBOT_ATTACK'}
             return []
@@ -99,7 +100,7 @@ class RepairPlan:
                 continue
             if actor.abnormal == 'dizzy':
                 continue
-            if identity in world.roster_yielding or roster.handoff_requested:
+            if identity in world.roster_yielding or roster.handoff_requested or roster.traffic or roster.exit_pending:
                 continue
             is_task = bool(world.phase_task and identity == roster.p)
             if is_task and (not task or task.answer is not None or
@@ -175,16 +176,21 @@ class RepairPlan:
                 if current and wall.id != current['wall']:
                     continue
                 maximum=rules.max_health.get('wall',{}).get(wall.level)
+                wall_pressure = exposure[wall.pos]
                 item = None
                 if maintenance_mode and wall.level in (1,2) and actor.inventory[f'WallUpgradeVoucher{wall.level}']:
                     from .procurement import upgrade_allowed
                     if upgrade_allowed(world,wall,policy,rules):item=f'WallUpgradeVoucher{wall.level}'
                 if item is None and actor.inventory['WallFixer'] and maximum and wall.health < maximum:
-                    item='WallFixer'
+                    # A full-health restoration must recover meaningful HP.
+                    # Keep early cooldown maintenance at <=70%, or act sooner
+                    # when observed pressure threatens the next service window.
+                    if (not maintenance_mode or wall.health*10<=maximum*7
+                            or wall.health<=wall_pressure*(max(1,window or 1)+1)):
+                        item='WallFixer'
                 if item is None:
                     continue
-                emergency = pressure(world, wall)
-                emergency = emergency is not None and emergency >= wall.health
+                emergency = wall_pressure >= wall.health
                 stands = interaction_cells(world, [wall.pos], actor.pos)
                 if identity == defence_duties.rotator(world) or is_task:
                     stands &= {actor.pos}
@@ -198,7 +204,7 @@ class RepairPlan:
                     no_target = (known_service and not any(distance(g.pos,r.pos)<=g.attack_range+1
                         for g in guns for r in threats))
                     maintenance = defence_duties.enabled(world) and (no_target or stand==actor.pos
-                        or (pressure(world,wall) or 0)*actions>=wall.health*2)
+                        or wall_pressure*actions>=wall.health*2)
                     # Use an observed idle cooldown to prevent damage, not
                     # only after the wall has fallen below the day threshold.
                     # Light damage does not justify abandoning a ready gun.
@@ -211,7 +217,8 @@ class RepairPlan:
                         continue
                     if 2*sum(u.attack_power for u in threats if distance(u.pos,stand)<=u.attack_range) >= actor.health:
                         continue
-                    options.append((delayed, actions, wall.health, wall.id, stand, wall, item))
+                    options.append((delayed, wall.pos not in getattr(world,'monster_front_walls',()),
+                                    actions, wall.health, wall.id, stand, wall, item))
             if time.monotonic() >= deadline:
                 break
             if not options:
@@ -219,7 +226,7 @@ class RepairPlan:
                     current['phase'] = 'RETURN_C'
                     result.extend(self._return(actor, home, current, world, service_context))
                 continue
-            delayed, actions, _, _, stand, wall, item = min(options, key=lambda r:r[:5])
+            delayed, _, actions, _, _, stand, wall, item = min(options, key=lambda r:r[:6])
             why = ('maintenance of damaged wall permits delayed fire' if delayed and defence_duties.enabled(world)
                    else 'observed wall pressure permits delayed fire' if delayed else 'fits observed remaining cooldown')
             if stand == actor.pos:
