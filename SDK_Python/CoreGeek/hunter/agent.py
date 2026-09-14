@@ -124,6 +124,7 @@ class Agent:
                 world,clock,self.rules,self.policy,budget_end,
                 task_busy=bool(task_actor or draft.tasks.active or draft.tasks.accept_pending),defer_regular_night=True),
                 min(start+self.policy.planning_seconds,time.monotonic()+.06))
+            evasion=[]
             evasion_report={'status':'emergency gate plan active'}
             if not draft.external_gate.emergency_active and not draft.external_gate.deferred_night:
                 evasion,evasion_report=world.duty_budget.run('exterior_evasion', lambda budget_end:
@@ -168,6 +169,8 @@ class Agent:
                 admit_task_departure(world, clock, task_choice, budget_end), min(deadline,time.monotonic()+.02))
             guidance = director.propose(world, clock, task_actor, draft.tasks.active, min(deadline, time.monotonic()+0.12), self.policy, draft.risk,
                                         failed_steps=draft.failed_move_steps(world) if self.policy.return_detour_enabled else None)
+            from .wall_policy import purchase_permitted
+            guidance.purchase_permit = lambda candidate: purchase_permitted(world,self.rules,candidate)
             from . import return_recovery
             recovery_moves, return_recovery_report = return_recovery.propose(
                 world,clock,self.policy,min(deadline,time.monotonic()+.04))
@@ -211,6 +214,8 @@ class Agent:
                     draft.external_gate.commands[identity]=[c.command for c in evasion]
                     world.night_forage_commands.pop(identity,None)
                     world.forage_contract=None
+            if evasion:
+                guidance.survival_actions[evasion[0].actor] = [c.command for c in evasion]
             if draft.external_gate.commands:
                 if self.policy.pioneer_rotation_enabled:
                     for identity, commands in draft.external_gate.commands.items():
@@ -321,6 +326,27 @@ class Agent:
             for c in clearing:
                 guidance.site_clear_actions.setdefault(c.actor,[]).append(c.command)
             guidance.candidates.extend(clearing)
+            # Finish a selected task approach before switching to another
+            # ordinary trip. Revalidate availability, route and return time
+            # every frame; this is not a reservation of an unaccepted task.
+            approach_key = None
+            selected_task = task_choice and task_choice.get('selected')
+            if selected_task:
+                offer = selected_task['task']
+                approach_key = (offer.get('taskType'), tuple(sorted(world.task_cells(offer))))
+                identity = task_choice['actor']
+                prior = draft.task_approach
+                if (prior.get('round') == world.round-1 and prior.get('actor') == identity
+                        and prior.get('key') == approach_key and offer.get('isValid') is True
+                        and offer.get('coldDownRounds') == 0 and not world.critical_base_ids
+                        and identity not in clearing_ids and identity not in draft.external_gate.commands
+                        and not guidance.return_routes.get(identity, {}).get('due')):
+                    approach = task_choice['candidates'] + draft.tasks.candidates(world, choice=task_choice)
+                    approach = [c for c in draft.filter_failures(approach, world.round) if guidance.permit(c)]
+                    if approach:
+                        guidance.work_plans[identity] = dict(owner='task_approach', phase='approach_or_accept',
+                            commands=[c.command for c in approach])
+                        candidates.extend(approach)
             world.treasure_actions = {}
             world.treasure_reserved_gold = 0
             if not draft.tasks.active and not draft.tasks.accept_pending:
@@ -329,7 +355,8 @@ class Agent:
                 treasure = [c for c in draft.filter_failures(treasure,world.round) if guidance.permit(c)]
                 report = draft.intelligence.diagnostic
                 identity = report.get('actor')
-                waiting = (report.get('stage')=='wait_open' and identity not in clearing_ids
+                waiting = (report.get('stage')=='wait_open' and identity not in guidance.work_plans
+                           and identity not in clearing_ids
                            and identity not in guidance.roster_transit_actions
                            and identity not in draft.external_gate.commands
                            and not guidance.return_routes.get(identity,{}).get('due'))
@@ -342,7 +369,19 @@ class Agent:
                     candidates = [c for c in candidates if not (c.actor==identity and c.command.get('action')=='acceptTask')]
                     if task_choice and task_choice.get('actor')==identity:task_choice=None
                     candidates.extend(treasure)
-            market_excluded = {task_actor} | clearing_ids | set(draft.external_gate.commands) | set(world.treasure_actions)
+            helpers = {i:j for i,j in build_jobs.items() if j.get('helper')}
+            if helpers:
+                helper_choices = economy.ready_construction(world,clock,self.rules,self.policy,
+                    min(deadline,time.monotonic()+.04),jobs=helpers)
+                helper_choices = [c for c in draft.filter_failures(helper_choices,world.round)
+                                  if c.actor in helpers and guidance.permit(c)]
+                for identity in helpers:
+                    commands = [c.command for c in helper_choices if c.actor==identity]
+                    if commands:
+                        guidance.work_plans[identity] = dict(owner='mine_batch',
+                            phase='harvest' if helpers[identity].get('helper_collect') else 'build',commands=commands)
+                candidates.extend(helper_choices)
+            market_excluded = {task_actor} | clearing_ids | set(draft.external_gate.commands) | set(world.treasure_actions) | set(helpers) | set(guidance.work_plans)
             if draft.external_gate.stage.startswith('BACKUP_'):
                 market_excluded.update(u.id for u in world.movers)
             if draft.night_roster.traffic:
@@ -553,6 +592,12 @@ class Agent:
                     joint_report = {"status": "failed", "error": type(exc).__name__}
                     module_errors.append({"module": "joint_lookahead", "error": type(exc).__name__})
                     LOG.exception("joint rollout failed; keeping current validated selection")
+            draft.task_approach = {}
+            if task_choice and task_choice.get('selected') and approach_key is not None:
+                identity = task_choice['actor']
+                if any(c.actor == identity and c.reason == 'approach reward-ranked feasible task'
+                       for c in decision.selected):
+                    draft.task_approach = dict(actor=identity, key=approach_key, round=world.round)
             draft.tasks.finalize(world, decision.response)
             draft.intelligence.finalize(world, clock, draft, decision.response, self.policy)
             draft.opponent.finalize(decision.response, world)
@@ -617,6 +662,7 @@ class Agent:
                       "external_gate":draft.external_gate.diagnostic,
                       "duty_budget":world.duty_budget.diagnostic(),
                       "exterior_evasion":evasion_report,
+                      "work_plans":guidance.work_plans,
                       "repair":draft.repair.diagnostic,
                       "repair_supply":draft.repair_supply.diagnostic,
                       "night_roster": {"w":draft.night_roster.w, "p":draft.night_roster.p,

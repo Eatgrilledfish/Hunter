@@ -367,6 +367,56 @@ class Diagnostics(logging.Handler):
                     token_hash=llm_trace.digest(value['token']) if isinstance(value,dict) and isinstance(value.get('token'),str) else None,
                     answer_type=type(value).__name__)))
 
+    def _work_item_events(self, state, raw, response, decision, units, number):
+        """Never sample away item identity or confuse an offer with a receipt."""
+        feedback = obj(raw.get('lastRoundRoleActionResults'))
+        for pending in state.pop('item_pending', []):
+            actor = obj(units.get(pending['actor']))
+            target = obj(units.get(pending.get('target'))) if pending.get('target') else actor
+            bag = actor.get('backpack')
+            self._write_compact('item_receipt', actor=pending['actor'], item=pending['item'],
+                sent=pending['round'], consecutive=number==pending['round']+1,
+                accepted=feedback.get(pending['actor']) if number==pending['round']+1 else None,
+                hp_after=target.get('health'),level_after=target.get('level'),
+                stock_after=bag.count(pending['item']) if isinstance(bag,list) else None)
+        reasons = {str(r.get('actor')):r.get('reason') for r in decision.get('selected',[])}
+        prices = {r.get('name'):r.get('price') for r in array(raw.get('weaponShopList')) if isinstance(r,dict)}
+        for identity,command in response.get('roleCommandMap',{}).items():
+            if command.get('action') not in ('use','buy'):continue
+            item=command.get('name','')
+            if command['action']=='use' and not (item in ('Medicine','WallFixer') or 'UpgradeVoucher' in item):continue
+            actor=obj(units.get(str(identity)));target=actor;target_id=None
+            points=command.get('targetPos',[])
+            if points:
+                target_id=next((i for i,u in units.items() if u.get('pos')==points[0]),None)
+                target=obj(units.get(target_id))
+            maximum=getattr(self,'max_health',{}).get(target.get('roleType'),{}).get(target.get('level'))
+            if target.get('roleType') in ('worker','pioneer'):
+                maximum=220 if target['roleType']=='worker' else 200
+            bag=actor.get('backpack')
+            self._write_compact('item_use' if command['action']=='use' else 'item_buy',
+                actor=str(identity)[:32],item=item,target=target_id,
+                hp_before=target.get('health'),max_hp=maximum,level_before=target.get('level'),
+                stock_before=bag.count(item) if isinstance(bag,list) else None,
+                quantity=command.get('num',1),price=prices.get(item) if command['action']=='buy' else None,
+                gold=obj(raw.get('teamOur')).get('goldNum'),
+                reason=self._brief(reasons.get(str(identity)),120),
+                escape={k:obj(decision.get('exterior_evasion')).get(k) for k in ('decision','to','known_damage_after')}
+                       if str(identity)==str(obj(decision.get('night_roster')).get('m')) else None)
+            state.setdefault('item_pending',[]).append(dict(actor=str(identity),item=item,
+                target=target_id,round=number))
+        previous=state.setdefault('work_stages',{})
+        plans=obj(decision.get('work_plans'))
+        for identity,plan in plans.items():
+            marker=(plan.get('owner'),plan.get('phase'))
+            if previous.get(identity)==marker:continue
+            daily=obj(obj(decision.get('sunset_market')).get('worker_day'))
+            self._write_compact('work_stage',actor=identity,previous=previous.get(identity),
+                owner=marker[0],phase=marker[1],left=daily.get('left') if daily.get('actor')==identity else None,
+                tail=daily.get('required') if daily.get('actor')==identity else None)
+            previous[identity]=marker
+        for identity in set(previous)-set(plans):previous.pop(identity,None)
+
     def _compact_turn(self, raw, response, elapsed):
         raw = obj(raw)
         team = obj(raw.get("teamOur"))
@@ -389,6 +439,7 @@ class Diagnostics(logging.Handler):
                         self._write_compact("callback_error",count=count,outcome=self.local.outcome,
                                             issue=getattr(self.local,"issues",[])[:2])
                 return
+            self._work_item_events(state,raw,response,obj(getattr(self.local,"decision",{})),units,number)
             previous_round = state["round"]
             state["calls"] += 1
             state["stats"].update(c.get("action","?") for c in response.get("roleCommandMap",{}).values())

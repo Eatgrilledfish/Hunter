@@ -7,14 +7,12 @@ from .arbitration import Candidate
 from .navigation import distance_field, interaction_cells, neighbours
 from .protocol import distance, pos_json
 from .night_roles import defender_ids
-from . import defence_duties
+from . import defence_duties, repair_decision
 from .robot_threats import active as active_robots
 
 
 def damaged_walls(world, rules):
-    return [u for u in world.ours.values() if u.alive and u.kind == 'wall'
-            and (maximum := rules.max_health.get('wall', {}).get(u.level))
-            and u.health * 10 < maximum * 3]
+    return [u for u in world.ours.values() if repair_decision.eligible(world, u, rules)]
 
 
 def pressure(world, wall):
@@ -181,13 +179,10 @@ class RepairPlan:
                 if maintenance_mode and wall.level in (1,2) and actor.inventory[f'WallUpgradeVoucher{wall.level}']:
                     from .procurement import upgrade_allowed
                     if upgrade_allowed(world,wall,policy,rules):item=f'WallUpgradeVoucher{wall.level}'
-                if item is None and actor.inventory['WallFixer'] and maximum and wall.health < maximum:
-                    # A full-health restoration must recover meaningful HP.
-                    # Keep early cooldown maintenance at <=70%, or act sooner
-                    # when observed pressure threatens the next service window.
-                    if (not maintenance_mode or wall.health*10<=maximum*7
-                            or wall.health<=wall_pressure*(max(1,window or 1)+1)):
-                        item='WallFixer'
+                if item is None and actor.inventory['WallFixer'] and repair_decision.eligible(
+                        world, wall, rules, policy, service_steps=max(1, window or 1)+1,
+                        pressure=wall_pressure):
+                    item = 'WallFixer'
                 if item is None:
                     continue
                 emergency = wall_pressure >= wall.health
@@ -208,7 +203,7 @@ class RepairPlan:
                     # Use an observed idle cooldown to prevent damage, not
                     # only after the wall has fallen below the day threshold.
                     # Light damage does not justify abandoning a ready gun.
-                    if maintenance_mode and maximum and wall.health*10>=maximum*3 and delayed and not emergency and not no_target:
+                    if maintenance_mode and maximum and wall.health > maximum*policy.wall_repair_health_fraction and delayed and not emergency and not no_target:
                         continue
                     if delayed and not emergency and not maintenance:
                         continue

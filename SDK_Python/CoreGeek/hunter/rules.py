@@ -353,7 +353,7 @@ class Policy:
     economy_first_enabled: bool = True
     staged_walls_enabled: bool = True
     construction_site_coordination_enabled: bool = True
-    wall_repair_health_fraction: float = 0.30
+    wall_repair_health_fraction: float = 0.50
     defence_procurement_enabled: bool = False
     defence_gold_limit: int = 200
     joint_lookahead_enabled: bool = False

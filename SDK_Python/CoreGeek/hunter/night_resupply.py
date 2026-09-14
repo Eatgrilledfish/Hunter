@@ -72,8 +72,9 @@ def propose(world, clock, rules, policy, actor, blocked, deadline):
     planned = [r for r in data['planned'] if r['unit'] is not None]
     # Reserve one dose personally, without turning an exterior trip into a
     # purchase of the guards' repair packs or an unlimited explosive stockpile.
-    wants_medicine = policy.medical_stock_enabled and not actor.inventory['Medicine']
-    medicine = wants_medicine and 0 < world.shop.get('Medicine',0) <= world.gold-data['reserve']
+    from .wall_policy import investment_fund
+    wants_medicine = policy.medical_stock_enabled and not actor.inventory['Medicine'] and world.near_zone(actor.pos,'weaponShop')
+    medicine = wants_medicine and 0 < world.shop.get('Medicine',0) <= world.gold-max(data['reserve'],investment_fund(world)[0])
     options=[]
     if actor.capacity > len(actor.backpack):
         for entry in planned:
@@ -133,8 +134,10 @@ def propose(world, clock, rules, policy, actor, blocked, deadline):
         if dose:return dose
     # Sell owned surplus as soon as a useful upgrade/dose lacks funds. The
     # next frame must show actual gold before any resulting purchase.
+    from .wall_policy import priority_units
+    priority_ids={u.id for u in priority_units(world)}
     prices = [world.shop[r['name']] for r in supply_basket.requirements(view,rules,policy)
-              if r['level']==r['unit'].level and world.shop.get(r['name'],0)>0]
+              if r['unit'].id in priority_ids and r['level']==r['unit'].level and world.shop.get(r['name'],0)>0]
     if wants_medicine and world.shop.get('Medicine',0)>0:prices.append(world.shop['Medicine'])
     stock={k:actor.inventory[k] for k in ('iron','copper','stone') if world.vendor.get(k,0)>0 and actor.inventory[k]}
     if 'stone' in stock:

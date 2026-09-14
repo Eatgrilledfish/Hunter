@@ -5,7 +5,7 @@ Actual builds still pass LayoutGuard, and actual moves use current occupancy.
 """
 from collections import Counter
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import time
 from .navigation import distance_field, neighbours, interaction_cells
 from .protocol import distance, pos_json
@@ -22,6 +22,7 @@ class DayDivision:
     supplier: str | None = None
     gate: tuple | None = None
     building: bool = False
+    helper_batches: dict = field(default_factory=dict)
 
     @staticmethod
     def reconcile_assistance(world, jobs):
@@ -31,6 +32,7 @@ class DayDivision:
             if supplier in jobs:
                 jobs[supplier]['stock_target'] += len(reserved)
             world.helper_wall_targets = frozenset()
+            world.batch_mine_owners = {}
             world.wall_assistance.update(active=False,reason='helper has prior movement or dawn trade duty')
 
     def assign(self, world, clock, rules, policy, jobs, deadline):
@@ -51,6 +53,7 @@ class DayDivision:
             self.day = clock.day
             self.supplier = self.gate = None
             self.building = False
+            self.helper_batches.clear()
         fixed_gate = planned_gate(world)
         enclosing = getattr(world, "wall_stage", None) != "front10"
         if fixed_gate is not None:
@@ -128,12 +131,14 @@ class DayDivision:
             deficit = max(0, len(missing)-actor.inventory['stone'])
             rescue = bool(getattr(world, 'critical_base_ids', ()))
             late = tour is None or tour['steps']+deficit+policy.return_buffer >= clock.until_night
-            if deficit or late or rescue:
+            if late or rescue or (deficit and other.inventory['stone']) or other.id in self.helper_batches:
                 helper = self.assistance(world,clock,policy,other,missing,ring,job,guard,deadline)
                 if helper:
                     result[other.id] = helper
-                    job['stock_target'] -= 1
-                    world.helper_wall_targets = frozenset({helper['target']})
+                    job['stock_target'] -= len(helper['helper_targets'])
+                    world.helper_wall_targets = frozenset(helper['helper_targets'])
+                    if helper.get('helper_collect'):
+                        world.batch_mine_owners = {helper['helper_mine']:other.id}
                     world.wall_assistance = dict(active=True,worker=other.id,target=helper['target'],
                         supplier=self.supplier,deficit=deficit,late=late,critical=rescue,
                         steps=helper['construction_steps'])
@@ -164,14 +169,23 @@ class DayDivision:
         return result
 
     def assistance(self, world, clock, policy, actor, missing, ring, job, guard, deadline):
-        """One feasible exterior wall per observation; W alone keeps the gate.
+        """Finish the observed ore batch, then spend personal stone in one tour.
 
-        The miner uses its own stone, or budgets one actual collection and
-        return to the work stand. It never needs to enter W/P's corridor.
+        Ore remainder is unknown. Only disappearance, capacity, danger or the
+        actual wall-work deadline can interrupt an already started batch.
         """
         blocked = ring | world.build_interior | world.stations[0].cells
         start = distance_field(world, {actor.pos}, actor.pos, deadline, extra_blocked=blocked)
         options = []
+        batch = self.helper_batches.get(actor.id)
+        if batch and batch.get('last_round') not in (world.round-1,world.round):
+            self.helper_batches.pop(actor.id,None)
+            batch = None
+        if batch and batch.get('mine') not in world.zones.get('stone', ()):
+            batch['phase'] = 'build'
+        if batch and batch['phase'] == 'build' and not actor.inventory['stone']:
+            self.helper_batches.pop(actor.id, None)
+            batch = None
         for target in sorted(missing-{self.gate, job['target']}):
             if time.monotonic() >= deadline:
                 break
@@ -182,11 +196,12 @@ class DayDivision:
                 continue
             goals = interaction_cells(world,[target],actor.pos)-blocked
             work = distance_field(world,goals,actor.pos,deadline,extra_blocked=blocked)
-            if actor.inventory['stone']:
+            if actor.inventory['stone'] and (not batch or batch['phase'] == 'build'):
                 required = work.get(actor.pos, float('inf'))+1
                 mine = None
             else:
-                mining = [(start[p]+1+work[p]+1,m) for m in world.zones.get('stone',())
+                mines = [batch['mine']] if batch and batch['phase'] == 'harvest' else world.zones.get('stone',())
+                mining = [(start[p]+1+work[p]+1,m) for m in mines
                           for p in interaction_cells(world,[m],actor.pos) if p in start and p in work]
                 if not mining:
                     continue
@@ -197,10 +212,56 @@ class DayDivision:
         if not options:
             return None
         _,required,target,mine,goals = min(options,key=lambda x:x[:3])
-        return dict(job,target=target,stock_target=1,gate=False,economy_first=False,
-                    helper=True,helper_mine=mine,helper_goals=sorted(goals),
+        if batch is None:
+            batch = self.helper_batches[actor.id] = dict(mine=mine, phase='harvest' if mine is not None else 'build')
+        # Budget the complete funded batch from the next mining position.
+        # All future walls stay blocked; each build and every exterior walk
+        # is counted. A mine's unknown remainder never becomes owned stock.
+        view = copy(world)
+        view.occupied = world.occupied | blocked
+        candidate_targets = {o[2] for o in options}
+        count = max(1, actor.inventory['stone'])
+        point = actor.pos
+        mining_steps = 0
+        if batch['phase'] == 'harvest' and mine is not None:
+            stands = interaction_cells(world, [mine], actor.pos) & start.keys()
+            if not stands:
+                return None
+            point = min(stands, key=lambda p: (start[p], p))
+            mining_steps = start[point] + 1
+        total = mining_steps
+        timed_targets = []
+        # Reserve one additional stone's work before admitting that collection.
+        for _ in range(min(len(candidate_targets), count + (batch['phase'] == 'harvest'))):
+            reach = distance_field(view, {point}, point, deadline)
+            choices = [(reach[p], q, p) for q in candidate_targets
+                       for p in interaction_cells(world, [q], point)-blocked if p in reach]
+            if not choices or time.monotonic() >= deadline:
+                break
+            steps, q, point = min(choices)
+            total += steps + 1
+            timed_targets.append((q, total))
+            candidate_targets.remove(q)
+        required = total if timed_targets else float('inf')
+        danger = any(r.alive and r.attack_range is not None and distance(actor.pos,r.pos)<=r.attack_range
+                     for r in world.robots.values())
+        stop = ('danger' if danger else 'capacity' if actor.capacity is not None and len(actor.backpack)>=actor.capacity
+                else 'construction deadline' if required+policy.return_buffer+1>=clock.until_night else None)
+        if stop and actor.inventory['stone']:
+            batch['phase'] = 'build'
+        collect = batch['phase'] == 'harvest' and mine is not None and not danger
+        targets = [q for q, _ in timed_targets[:count]]
+        if not targets:
+            return None
+        target = targets[0]
+        goals = interaction_cells(world, [target], actor.pos)-blocked
+        batch['last_round'] = world.round
+        batch['reason'] = stop or ('current mine still present' if collect else 'mine batch complete')
+        return dict(job,target=target,stock_target=len(targets),gate=False,economy_first=False,
+                    helper=True,helper_mine=mine,helper_collect=collect,helper_targets=targets,
+                    helper_batch_reason=batch['reason'],helper_goals=sorted(goals),
                     construction_steps=required,construction_endpoint='exterior',
-                    defer_build=False)
+                    defer_build=collect)
 
     def tour(self, world, actor, missing, ring, deadline, occupied=()):
         """Budget all remaining build actions, outside walk, entry and closure.

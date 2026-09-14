@@ -1,4 +1,6 @@
 """Staged construction and spending policy; legal build masks stay unchanged."""
+from collections import Counter
+
 from .rules import station_rings
 
 
@@ -107,3 +109,55 @@ def priority_units(world):
     if not permanent <= observed:
         return []  # A destroyed/unbuilt front wall has not completed its upgrade tier.
     return [u for u in world.stations if u.level != 3]
+
+
+def investment_fund(world):
+    """Observed next-priority quote, without spending hypothetical sale income."""
+    if not getattr(getattr(world, 'strategy_policy', None), 'upgrade_commitment_enabled', True):
+        return 0, None
+    # Held vouchers already fund their own tiers. Reserving their price again
+    # can reject the basket's last stock item and strand the carrier at checkout.
+    held = Counter()
+    for actor in world.movers:
+        if actor.backpack is not None:
+            held.update(actor.inventory)
+    quotes = []
+    for unit in sorted(priority_units(world), key=lambda u: (u.level, u.id)):
+        prefix = 'Weapon' if unit.kind in {'rocket', 'gatling', 'railgun'} else 'Wall' if unit.kind == 'wall' else 'Station'
+        for level in range(unit.level, 3):
+            name = f'{prefix}UpgradeVoucher{level}'
+            if held[name]:
+                held[name] -= 1
+                continue
+            price = world.shop.get(name)
+            if price is None or price <= 0:
+                return max(0, world.gold or 0), None
+            quotes.append((level, price, name))
+    if not quotes:
+        return 0, None
+    _, price, name = min(quotes)
+    return price, name
+
+
+def purchase_permitted(world, rules, candidate):
+    """One investment gate for all day/night and personal supply producers."""
+    command=candidate.command
+    if (command.get('action') != 'buy' or not getattr(world, 'staged_walls', False)
+            or not getattr(getattr(world, 'strategy_policy', None), 'upgrade_commitment_enabled', True)):
+        return True
+    name=command.get('name','');actor=world.ours.get(candidate.actor)
+    if not actor:return False
+    if 'UpgradeVoucher' in name:
+        prefix=name.split('UpgradeVoucher')[0]
+        allowed={'Weapon' if u.kind in {'rocket','gatling','railgun'} else 'Wall' if u.kind=='wall' else 'Station'
+                 for u in priority_units(world)}
+        return prefix in allowed
+    # Genuine treatment can interrupt investment; healthy stock cannot.
+    if name=='Medicine' and actor.health <= (200 if actor.kind=='pioneer' else 220)*.5:
+        return True
+    if name=='WallFixer' and getattr(world,'critical_base_ids',()):return True
+    reserve,item=investment_fund(world)
+    candidate.gold_reserve=max(candidate.gold_reserve,reserve)
+    candidate.gold_reserve_item=item
+    price=world.shop.get(name)
+    return price is not None and (world.gold or 0)-price*command.get('num',1)>=reserve

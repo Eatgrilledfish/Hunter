@@ -1,5 +1,6 @@
 """Executable route economics, returning operators, and verified-rule construction."""
 import time
+from . import repair_decision
 from collections import Counter
 
 from .arbitration import Candidate
@@ -291,7 +292,7 @@ def ready_construction(world, clock, rules, policy, deadline, *, jobs=None):
             from .rules import station_rings
             blue, yellow = station_rings(world.stations[0].pos)
             blocked = blue | yellow | world.stations[0].cells
-            if actor.inventory['stone']:
+            if actor.inventory['stone'] and not job.get('helper_collect', False):
                 goals = set(job['helper_goals'])
                 action = dict(action='build',name='wall',targetPos=[pos_json(job['target'])])
             else:
@@ -319,6 +320,8 @@ def ready_construction(world, clock, rules, policy, deadline, *, jobs=None):
             if deficit and (clock.until_night > deficit+5 or not actor.inventory['stone']):
                 options=[]
                 for mine in world.zones.get('stone',()):
+                    if getattr(world, 'batch_mine_owners', {}).get(mine, identity) != identity:
+                        continue
                     length,steps=route(world,actor,[mine],deadline)
                     back=min((return_field[p] for p in neighbours(mine) if p in return_field),default=None)
                     if length is not None and back is not None and length+1+back+2 < clock.until_night:
@@ -350,6 +353,8 @@ def ready_construction(world, clock, rules, policy, deadline, *, jobs=None):
                 home = distance_field(world, build_goals, actor.pos, deadline)
                 options = []
                 for mine in world.zones.get(mineral, ()):
+                    if getattr(world, 'batch_mine_owners', {}).get(mine, identity) != identity:
+                        continue
                     length, steps = route(world, actor, [mine], deadline)
                     back = min((home[p] for p in interaction_cells(world, [mine], actor.pos) if p in home), default=None)
                     if length is not None and back is not None and length+back+5+policy.return_buffer < clock.until_night:
@@ -392,6 +397,8 @@ def harvest_jobs(world, reserves):
             if not need and price <= 0:
                 continue
             for mine in sorted(world.zones.get(mineral, ())):
+                if getattr(world, 'batch_mine_owners', {}).get(mine, actor.id) != actor.id:
+                    continue
                 length = min((field[p] for p in neighbours(mine) if p in field), default=None)
                 if length is not None:
                     options.append((not need, (mineral, mine) in claimed, (length+6)/max(1, price), mineral, mine))
@@ -459,9 +466,9 @@ def immediate(world, rules, task_actor=None, *, jobs=None, policy=None, local_on
                     result.append(Candidate(actor.id, {"action": "use", "name": name, "targetPos": [pos_json(building.pos)]},
                                             30 if prefix != "Wall" else 12, "use carried level-matched voucher"))
             max_hp = rules.max_health.get(building.kind, {}).get(building.level)
-            if not planned_repairs and building.kind == "wall" and actor.inventory["WallFixer"] and max_hp and building.health is not None and building.health < max_hp * (policy.wall_repair_health_fraction if policy else .30):
+            if not planned_repairs and actor.inventory["WallFixer"] and repair_decision.eligible(world, building, rules, policy):
                 result.append(Candidate(actor.id, {"action": "use", "name": "WallFixer", "targetPos": [pos_json(building.pos)]},
-                                        (max_hp-building.health)*0.05, "repair wall only below 30% verified maximum HP"))
+                                        (max_hp-building.health)*0.05, "repair wall at configured verified HP threshold"))
     return result
 
 

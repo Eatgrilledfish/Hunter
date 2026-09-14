@@ -48,7 +48,7 @@ class MedicalSupply:
                 break
             maximum = 200 if actor.kind == 'pioneer' else 220
             treatment = actor.health*2 <= maximum
-            stock = policy.medical_stock_enabled
+            stock = policy.medical_stock_enabled and world.near_zone(actor.pos, 'weaponShop')
             if (not treatment and not stock) or actor.backpack is None:
                 continue
             if actor.inventory['Medicine']:
@@ -61,6 +61,10 @@ class MedicalSupply:
                 if offers:
                     self.diagnostic['plans'][actor.id] = {'stage': 'heal'}
                 continue
+            if not treatment:
+                from .wall_policy import investment_fund
+                reserve=max(reserve,investment_fund(world)[0])
+                budget=min(budget,max(0,(world.gold or 0)-reserve))
             if actor.id in self.pending or actor.capacity is None or len(actor.backpack) >= actor.capacity:
                 continue
             price = world.shop.get('Medicine')

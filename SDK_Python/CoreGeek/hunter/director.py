@@ -36,8 +36,11 @@ def exposure(world, clock, pos):
 
 @dataclass
 class Directive:
+    work_plans: dict = field(default_factory=dict)
+    survival_actions: dict = field(default_factory=dict)
     duty_permit: object = None
     market_permit: object = None
+    purchase_permit: object = None
     candidates: list = field(default_factory=list)
     task_moves: set = field(default_factory=set)
     allow_task_control: bool = False
@@ -71,6 +74,11 @@ class Directive:
         Medical/combat triage may override it. Reaching a stand permits stationary
         work, while ordinary movement cannot spend an already exhausted buffer.
         """
+        if self.purchase_permit is not None and not self.purchase_permit(candidate):
+            return False
+        identity = candidate.command.get('controllerId') if candidate.command.get('action')=='attack' else candidate.actor
+        if identity in self.survival_actions:
+            return candidate.command in self.survival_actions[identity]
         if self.market_permit is not None and not self.market_permit(candidate):
             return False
         if self.duty_permit is not None:
@@ -81,6 +89,13 @@ class Directive:
             targets = candidate.command.get("targetPos", [])
             if len(targets) == 1 and (targets[0].get("x"), targets[0].get("y")) in self.blocked_moves.get(candidate.actor, set()):
                 return False
+        plan = self.work_plans.get(identity)
+        if plan and plan.get('at_duty'):
+            return candidate.command.get('action') in {'attack', 'use'}
+        if plan and plan['commands']:
+            triage = (candidate.command.get('action')=='use' and candidate.command.get('name')=='Medicine'
+                      and any(candidate is c for c in self.candidates))
+            return triage or candidate.command in plan['commands']
         if candidate.actor in self.roster_transit_actions:
             return candidate.command in self.roster_transit_actions[candidate.actor] or (
                 candidate.command.get('action') == 'use'

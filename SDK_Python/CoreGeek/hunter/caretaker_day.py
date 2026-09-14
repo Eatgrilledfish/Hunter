@@ -23,6 +23,7 @@ class CaretakerDay:
     phase: str = 'harvest'
     last_required: int | None = None
     use_budget: int = 0
+    construction_only: bool = False
     diagnostic: dict = field(default_factory=dict)
 
     def wall_tour(self, world, actor, missing, ring, rule, deadline):
@@ -54,14 +55,11 @@ class CaretakerDay:
                 or len(world.weapons) != rules.weapon_limit or actor.id in excluded):
             return None
         walls = {u.pos for u in world.ours.values() if u.alive and u.kind == 'wall'}
-        if clock.day == 1 and not set(world.wall_targets or ()) <= walls:
-            # The opening construction project creates the initial defence;
-            # subsequent daily maintenance must not replace that bootstrap.
-            return None
         if (self.day, self.identity) != (clock.day, actor.id):
             self.day, self.identity, self.phase = clock.day, actor.id, 'harvest'
             self.last_required = None
             self.use_budget = 0
+            self.construction_only = False
         world.caretaker_day_actor = actor.id
         world.caretaker_day_phase = self.phase
         # Generic voucher proposals must not create a second, conflicting
@@ -173,19 +171,20 @@ class CaretakerDay:
         if ready:
             _,length,_,target = min(ready,key=lambda t:t[:3])
             if length != float('inf'):deliveries[actor.id]=(target,length)
+        if self.construction_only:
+            # Paid coupons may still be used after construction, but new
+            # purchases cannot displace the material trip already chosen.
+            checkout = sale = tail
+            required = tail.get(actor.pos)
+            order, count = None, 0
         affordable_upgrade = bool(order and cash >= world.shop[order['name']])
         self.use_budget = use_steps
         if required is not None:
             self.last_required = required + margin
         self.diagnostic = dict(required=None if required is None else required+margin,
             left=clock.until_night,reserved_stone=stone,use_steps=use_steps,
-            missing_walls=len(missing),planned_walls=len(planned_walls),
+            missing_walls=len(missing),planned_walls=len(planned_walls),construction_only=self.construction_only,
             basket=dict(trip['orders']) if trip else {})
-        if (self.phase == 'harvest' and affordable_upgrade and trip is not None and trip['fits']
-                and not max(0, stone-actor.inventory['stone'])):
-            # Once defence is funded, convert the money now. More mining must
-            # not postpone checkout until movement/closure consumes the window.
-            self.phase = 'sell'
         if self.phase == 'harvest':
             repairs = getattr(world, 'repair_commands', {}).get(actor.id, [])
             repair_steps = getattr(world, 'day_repair_steps', {}).get(actor.id, 1)
@@ -195,12 +194,12 @@ class CaretakerDay:
             start = distance_field(world, {actor.pos}, actor.pos, deadline)
             options = []
             deficit = max(0, stone - actor.inventory['stone'])
-            for name in (('stone',) if deficit else sorted(MINERALS)):
-                if not deficit and world.vendor.get(name, 0) <= 0:
+            for name in (('stone',) if self.construction_only and deficit else () if self.construction_only else sorted(MINERALS)):
+                if not (deficit and name == 'stone') and world.vendor.get(name, 0) <= 0:
                     continue
                 # Reserve the sale interaction for a newly collected ore type.
                 future = dict(stock)
-                future[name] = future.get(name, 0) + (0 if deficit else 1)
+                future[name] = future.get(name, 0) + (0 if deficit and name == 'stone' else 1)
                 future = {k:n for k,n in future.items() if n}
                 mine_tail = checkout
                 if future and checkout is not None:
@@ -209,11 +208,30 @@ class CaretakerDay:
                 if mine_tail is None:
                     continue
                 for mine in world.zones.get(name, ()):
+                    if getattr(world,'batch_mine_owners',{}).get(mine,actor.id) != actor.id:
+                        continue
                     for p in interaction_cells(world, [mine], actor.pos) & start.keys() & mine_tail.keys():
                         if start[p] + 1 + mine_tail[p] + margin + 2 <= clock.until_night:
-                            options.append((-world.vendor.get(name, 0)/(start[p]+1), start[p], name, mine, p))
+                            options.append((bool(deficit and name != 'stone'), -world.vendor.get(name, 0)/(start[p]+1), start[p], name, mine, p))
+            if deficit and not self.construction_only and not any(o[-3] == 'stone' for o in options):
+                # A shop/use detour can fit from here while making every stone
+                # collection infeasible. Drop new shopping before dropping
+                # necessary wall material; prove the full construction return.
+                material_options = []
+                for mine in world.zones.get('stone', ()):
+                    if getattr(world, 'batch_mine_owners', {}).get(mine, actor.id) != actor.id:
+                        continue
+                    for point in interaction_cells(world, [mine], actor.pos) & start.keys() & tail.keys():
+                        if start[point] + 1 + tail[point] + margin + 2 <= clock.until_night:
+                            material_options.append((False, -world.vendor.get('stone', 0)/(start[point]+1),
+                                                     start[point], 'stone', mine, point))
+                if material_options:
+                    options = material_options
+                    self.construction_only = True
+                    self.diagnostic.update(construction_only=True,
+                        reason='defer shopping to preserve feasible wall-material circuit')
             if options and len(actor.backpack) < actor.capacity and time.monotonic() < deadline:
-                _, length, name, mine, point = min(options)
+                _, _, length, name, mine, point = min(options)
                 choices = ([Candidate(actor.id, dict(action='collect', targetPos=[pos_json(mine)]), 240,
                                       'harvest with sale, checkout, closure and use time reserved')] if not length else
                            DaySchedule.moves(actor, distance_field(world, {point}, actor.pos, deadline),
@@ -221,7 +239,7 @@ class CaretakerDay:
                 return self.finish(world, guidance, jobs, actor, choices, 'harvest')
             if required is None or time.monotonic() >= deadline:
                 return self.finish(world,guidance,jobs,actor,[], 'harvest', reason='wait for an observed complete route')
-            self.phase = 'sell'
+            self.phase = 'close' if self.construction_only else 'sell'
         if self.phase == 'sell':
             if stock and sale is not None and required is not None and required + margin <= clock.until_night:
                 name = max(stock, key=lambda k:(stock[k]*world.vendor[k], k))
@@ -315,4 +333,20 @@ class CaretakerDay:
         world.sunset_actions[actor.id] = [c.command for c in choices]
         guidance.funded_actions[actor.id] = list(world.sunset_actions[actor.id])
         guidance.day_actions[actor.id] = list(world.sunset_actions[actor.id])
+        if choices:
+            guidance.work_plans[actor.id] = dict(owner='caretaker_day',phase=phase,
+                commands=[c.command for c in choices])
+        else:
+            # A blocked plan records its phase but must not intersect every
+            # later movement/return proposal with an empty permission set.
+            world.sunset_actions.pop(actor.id,None)
+            guidance.funded_actions.pop(actor.id,None)
+            guidance.day_actions.pop(actor.id,None)
+            guidance.work_plans.pop(actor.id,None)
+            if phase == 'home' and actor.pos in defence_duties.stands(world, actor.id):
+                guidance.work_plans[actor.id] = dict(owner='caretaker_day', phase='home',
+                    commands=[], at_duty=True)
+                self.diagnostic['completed_return'] = True
+            else:
+                self.diagnostic['blocked'] = True
         return choices

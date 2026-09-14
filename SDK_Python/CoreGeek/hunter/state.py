@@ -40,6 +40,9 @@ class Session:
     failed: dict = field(default_factory=dict)
     failed_moves: dict = field(default_factory=dict)
     last_positions: dict = field(default_factory=dict)
+    task_approach: dict = field(default_factory=dict)
+    wall_observations: dict = field(default_factory=dict)
+    robot_observations: dict = field(default_factory=dict)
     enemy_memory: dict = field(default_factory=dict)
     news: list = field(default_factory=list)
     feedback_counts: dict = field(default_factory=dict)
@@ -79,6 +82,19 @@ class Session:
             self.origin = 0
         clock = Clock(world.round, self.origin)
         world.strategy_clock = clock
+        world.observed_wall_losses = {}
+        world.observed_robot_motion = {}
+        for u in world.ours.values():
+            old = self.wall_observations.get(u.id)
+            if u.kind == 'wall' and old and old[0] == world.round-1 and old[1] == u.level:
+                if u.health is not None and old[2] is not None:
+                    world.observed_wall_losses[u.id] = max(0, old[2]-u.health)
+        for u in world.robots.values():
+            old = self.robot_observations.get(u.id)
+            if old and old[0] == world.round-1:
+                world.observed_robot_motion[u.id] = (u.pos[0]-old[1][0], u.pos[1]-old[1][1])
+        self.wall_observations = {u.id:(world.round,u.level,u.health) for u in world.ours.values() if u.kind=='wall' and u.alive}
+        self.robot_observations = {u.id:(world.round,u.pos) for u in world.robots.values() if u.alive}
         self.risk.observe(world)
         self.joint_risk.observe(world)
         self.recovery.observe(world)

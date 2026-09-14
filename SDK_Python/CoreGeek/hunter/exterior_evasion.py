@@ -1,6 +1,10 @@
-"""Escape actual attack areas, executing one step then replanning from feedback."""
-import heapq
+"""Bounded exterior survival choice, shared by movement and personal treatment.
+
+Damage values are two-opportunity scenarios, not calibrated robot DPS. Recent
+motion is extrapolated only as a labelled scenario, never a game speed rule.
+"""
 import time
+import heapq
 from .arbitration import Candidate
 from .navigation import neighbours
 from .protocol import distance, pos_json
@@ -21,54 +25,98 @@ def propose(world, clock, deadline, trapped=False):
     threats = active(world)
     known = [r for r in threats if r.attack_range is not None and r.attack_power is not None]
     unknown = [r for r in threats if r not in known]
-    # Unknown power does not create an infinite range. Unknown kinds remain
-    # unknown; do not invent a radius or claim a survivable route through them.
+    motion = getattr(world, 'observed_robot_motion', {})
+
+    def projected(r, depth):
+        dx, dy = motion.get(r.id, (0, 0))
+        return r.pos[0]+dx*depth, r.pos[1]+dy*depth
+
     def uncertain(q):
-        return any(r.attack_range is not None and distance(q, r.pos) <= r.attack_range for r in unknown)
-    def damage(q):
-        return 2 * sum(r.attack_power for r in known if distance(q, r.pos) <= r.attack_range)
+        return any(r.attack_range is not None and distance(q,r.pos)<=r.attack_range for r in unknown)
+
+    def damage(q, depth=0):
+        # Keep the stationary scenario too; moving enemies may change target.
+        return 2*sum(r.attack_power for r in known if min(distance(q,r.pos),
+                     distance(q,projected(r,depth))) <= r.attack_range)
+
     current = damage(actor.pos)
-    report = {'known_damage_before': current, 'unknown_sources': len(unknown),
-              'nearest': min((distance(actor.pos,r.pos) for r in threats),default=None),
-              'in_range': sum(distance(actor.pos,r.pos)<=r.attack_range for r in threats if r.attack_range is not None)}
-    plan = getattr(world, 'task_side_plan', None)
-    goals = ({q for q in neighbours(plan['gate']) if world.inside(q) and q not in interior
-              and q not in world.occupied and not damage(q) and not uncertain(q)}
-             if trapped and plan and not current else None)
-    if not current and not uncertain(actor.pos) and not goals:
-        return [], dict(report, status='no observed need to retreat')
+    closing = [r for r in known if motion.get(r.id, (0,0)) != (0,0)
+               and distance(actor.pos,projected(r,1)) < distance(actor.pos,r.pos)
+               and distance(actor.pos,projected(r,1)) <= r.attack_range]
+    report = dict(known_damage_before=current, unknown_sources=len(unknown),
+                  nearest=min((distance(actor.pos,r.pos) for r in threats),default=None),
+                  in_range=sum(distance(actor.pos,r.pos)<=r.attack_range for r in known),
+                  motion_scenario=bool(closing))
+    if not current and not uncertain(actor.pos) and not closing and not trapped:
+        return [], dict(report,status='no observed need to retreat')
+    if time.monotonic() >= deadline:
+        return [], dict(report,status='budget exhausted')
     blocked = world.occupied | interior
-    # This is a risk policy, not an assertion about attack cadence. Two attack
-    # opportunities per tile; whole-route loss <= 25% of current HP. Search
-    # loss first, then distance: a zero-loss detour always wins over taking hits.
-    budget = max(0, actor.health * .25)
-    queue = [(0, 0, actor.pos, ())]
-    best = {actor.pos: (0, 0)}
-    route = None
-    while queue:
-        if time.monotonic() >= deadline:
-            return [], dict(report, status='budget exhausted')
-        loss, steps, origin, path = heapq.heappop(queue)
-        if best.get(origin) != (loss, steps):
-            continue
-        if path and damage(origin) == 0 and not uncertain(origin) and (goals is None or origin in goals):
-            route = path
-            break
-        for point in neighbours(origin):
-            if (not world.inside(point) or point in blocked or uncertain(point)
-                    or point in world.navigation_avoided.get(origin, set())):
-                continue
-            cost = (loss + damage(point), steps + 1)
-            if cost[0] > budget or cost >= best.get(point, (float('inf'), 0)):
-                continue
-            best[point] = cost
-            heapq.heappush(queue, (*cost, point, path + (point,)))
-    if route is None:
-        return [], dict(report, status='no improving legal exterior route', damage_budget=budget)
+    avoided = world.navigation_avoided
+    # Three real legal steps are sufficient for local comparison; never insist
+    # on a complete zero-damage global route before offering an improving step.
+    beam = [(0, (), actor.pos)]
+    options = []
+    for depth in range(3):
+        expanded = []
+        for loss,path,origin in beam:
+            for point in neighbours(origin):
+                if time.monotonic() >= deadline:
+                    break
+                if (not world.inside(point) or point in blocked or uncertain(point)
+                        or point in path or point in avoided.get(origin, ())):
+                    continue
+                route = path+(point,)
+                total = loss+damage(point,depth+1)
+                exits = sum(world.inside(p) and p not in blocked and not uncertain(p)
+                            and damage(p,depth+2)==0 for p in neighbours(point))
+                options.append((total,damage(point,depth+1),-exits,route))
+                expanded.append((total,route,point))
+            if time.monotonic() >= deadline:break
+        beam = sorted(expanded,key=lambda r:(r[0],r[1]))[:32]
+        if not beam or time.monotonic() >= deadline:break
+    # Compare equal-horizon exposure, so a longer route is not penalised merely
+    # for containing additional steps. Once at an endpoint, retain its cost.
+    stay = sum(damage(actor.pos,t) for t in (1,2,3))
+    ranked = []
+    for total,end,exits,path in options:
+        score = total+sum(damage(path[-1],t) for t in range(len(path)+1,4))
+        if score < stay or (not current and trapped and end == 0):
+            ranked.append((score,damage(path[0],1),exits,len(path),path,total))
+    if not ranked or trapped:
+        plan = getattr(world,'task_side_plan',None)
+        goals = ({q for q in neighbours(plan['gate']) if world.inside(q) and q not in blocked
+                  and not damage(q) and not uncertain(q)} if trapped and plan else None)
+        queue = [(0,0,actor.pos,())]
+        best = {actor.pos:(0,0)}
+        while queue and time.monotonic() < deadline:
+            loss,steps,point,path = heapq.heappop(queue)
+            if best.get(point) != (loss,steps):continue
+            if path and damage(point)==0 and (goals is None or point in goals):
+                ranked = [(loss,damage(path[0],1),0,len(path),path,loss)]
+                break
+            for q in neighbours(point):
+                if not world.inside(q) or q in blocked or uncertain(q) or q in avoided.get(point,()):continue
+                cost = (loss+damage(q),steps+1)
+                if cost < best.get(q,(float('inf'),0)):
+                    best[q]=cost
+                    heapq.heappush(queue,(*cost,q,path+(q,)))
+        if not ranked:
+            return [], dict(report,status='no improving legal exterior route')
+    score,first,_,_,route,total = min(ranked)
+    # A strictly safer legal step wins over an independent high-scoring heal.
+    # If even the first step exceeds current HP but a carried dose improves the
+    # stationary scenario, permit healing as the one survival action instead.
+    if first >= actor.health and actor.inventory['Medicine'] and actor.health < 220 and damage(actor.pos,1) < 220:
+        command = dict(action='use',name='Medicine')
+        report.update(status='treat_before_escape',actor=actor.id,decision='Medicine',
+                      rejected_move=list(route[0]),first_step_opportunity_bound=first)
+        return [Candidate(actor.id,command,1200,'exterior survival: treatment before otherwise lethal first step')],report
     point = route[0]
-    report.update(status='retreat', actor=actor.id, **{'from':actor.pos,'to':point},
-                  known_damage_after=damage(point), observed_route=route,
-                  route_end_damage=0, route_damage_bound=loss, damage_budget=budget,
-                  no_observed_exposure=not unknown and damage(point)==0)
-    return [Candidate(actor.id, {'action':'move','targetPos':[pos_json(point)]}, 1200,
-                      'observed exterior economic-worker retreat')], report
+    report.update(status='retreat',actor=actor.id,**{'from':actor.pos,'to':point},
+                  known_damage_after=damage(point),observed_route=route,
+                  route_end_damage=damage(route[-1]),route_damage_bound=total,
+                  damage_budget=actor.health*.25,no_observed_exposure=not unknown and damage(point)==0,
+                  decision='move',hold_scenario=stay,move_scenario=score)
+    return [Candidate(actor.id,dict(action='move',targetPos=[pos_json(point)]),1200,
+                      'exterior survival: improving escape before personal treatment')],report
