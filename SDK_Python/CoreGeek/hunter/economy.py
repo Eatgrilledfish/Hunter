@@ -67,6 +67,9 @@ def prepare_wall_cycle(world, clock, rules, policy=None):
 def open_day_gate(world, clock, rules, deadline):
     if clock.phases != {"day"} or len(world.stations) != 1:
         return []
+    if (getattr(getattr(world,'strategy_policy',None),'pioneer_rotation_enabled',False)
+            and (getattr(world, 'gate_worker_duty', None) or {}).get('round') == world.round):
+        return []  # Ordered worker gate duties own opening; do not divert builders.
     from .rules import station_rings
     blue, yellow = station_rings(world.stations[0].pos)
     rule = rules.build_rule(world, "wall")

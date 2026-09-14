@@ -82,6 +82,11 @@ class CaretakerDay:
                               extra_blocked={plan['w']})
         margin = policy.return_buffer + (8 if set(world.wall_targets or ()) == yellow else 0)
         self.diagnostic = dict(left=clock.until_night,missing_walls=len(missing),reserved_stone=stone)
+        if (self.phase == 'close' and home.get(actor.pos) is not None
+                and clock.until_night <= home[actor.pos] + policy.return_buffer + 1):
+            return self.finish(world, guidance, jobs, actor,
+                DaySchedule.moves(actor, home, 'return before remaining construction can overrun night'),
+                'home', reason='remaining return time insufficient')
         if self.phase == 'harvest':
             repairs = getattr(world,'repair_commands',{}).get(actor.id,[])
             repair_steps = getattr(world,'day_repair_steps',{}).get(actor.id,1)
@@ -121,7 +126,9 @@ class CaretakerDay:
                     cost = 1
                     end = entry
             if entry is None or cost is None:
-                return self.finish(world, guidance, jobs, actor, [], 'close', reason='wall tour unavailable')
+                return self.finish(world, guidance, jobs, actor,
+                    DaySchedule.moves(actor, home, 'return while wall tour is unavailable'),
+                    'home', reason='wall tour unavailable')
             tail = weighted_field(world, {entry:cost}, actor, deadline)
             end = tour['end'] if tour else end
             if job and tour:

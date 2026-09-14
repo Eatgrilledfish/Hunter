@@ -110,7 +110,7 @@ class Agent:
             task_actor = draft.task_actor(world)
             fallback = self._early_base(world, clock, task_actor, draft).response
             draft.task_layout.prepare(world, self.rules, self.policy,
-                                      min(start + self.policy.planning_seconds, time.monotonic() + .04))
+                                      min(start + self.policy.planning_seconds, time.monotonic() + .12))
             world.duty_budget = DutyBudget(start+self.policy.planning_seconds)
             draft.night_roster.prepare(world)
             world.night_foraging_enabled=self.policy.night_foraging_enabled
@@ -354,9 +354,10 @@ class Agent:
                 market_excluded.add(draft.tasks.accept_pending.get('actor'))
             if task_choice and task_choice.get('selected'):
                 market_excluded.add(task_choice['actor'])
-            from .opponent import next_wave_window, SUMMONS
+            from .opponent import next_wave_window, SUMMONS, summon_target_status
             summon_window=next_wave_window(clock)
-            world.summon_use_remaining=(draft.opponent.remaining if summon_window and clock.phases=={'day'} else 0)
+            world.summon_use_remaining=(draft.opponent.remaining if summon_window and clock.phases=={'day'}
+                                        and summon_target_status(world)=='alive' else 0)
             world.summon_purchase_slots=max(0,world.summon_use_remaining-
                 sum(u.inventory[k] for u in world.movers for k in SUMMONS)-
                 sum(p['num'] for p in draft.opponent.pending_buys.values()))

@@ -10,6 +10,16 @@ from .summons import ORDERS, plan
 SUMMONS = ORDERS
 
 
+def summon_target_status(world):
+    """Summons need a surviving enemy base; absent visibility is not death."""
+    bases = [u for u in world.enemies.values() if u.kind == 'station']
+    if any(u.alive for u in bases):
+        return 'alive'
+    if bases and all(u.health is not None and u.health <= 0 for u in bases):
+        return 'defeated'
+    return 'unknown'
+
+
 def next_wave_window(clock):
     """Use opportunities before the earliest next night and quota reset.
 
@@ -90,6 +100,10 @@ class Opponent:
         self.diagnostic = {"belief": self.belief.describe(world), "wave_window": window,
                            "pending_purchases": len(self.pending_buys), "status": "unavailable",
                            "summon_remaining": self.remaining, "quota_known": self.quota_known}
+        target_status = summon_target_status(world)
+        if target_status != 'alive':
+            self.diagnostic['status'] = 'opponent_'+target_status
+            return []
         if not policy.summon_pressure_enabled or not self.remaining or not world.stations:
             return []
         if window is None:

@@ -33,8 +33,8 @@ def _field(world, starts, blocked, deadline, allowed=None):
     return result
 
 
-def templates(anchor):
-    """Eight orientations, each with four non-corner gate choices."""
+def templates(anchor, all_gate_sides=False):
+    """Eight gun orientations; gate placement may use any non-corner side."""
     for reflected in (False, True):
         for rotations in range(4):
             def transform(p):
@@ -44,10 +44,13 @@ def templates(anchor):
                 for _ in range(rotations):
                     u, v = 5-v, u
                 return anchor[0]-2+u, anchor[1]-3+v
-            for i in range(1, 5):
+            gates = [(i,0) for i in range(1,5)]
+            if all_gate_sides:
+                gates += [(i,5) for i in range(1,5)]+[(0,i) for i in range(1,5)]+[(5,i) for i in range(1,5)]
+            for gate in gates:
                 yield dict(a=transform((1, 4)), w=transform((2, 4)),
                            b=transform((3, 4)), c=transform((1, 1)),
-                           p=transform((2, 1)), gate=transform((i, 0)))
+                           p=transform((2, 1)), gate=transform(gate))
 
 
 def _static(world):
@@ -59,7 +62,7 @@ def _static(world):
 def select(world, rules, policy, deadline):
     from .battery import interior_usable
     from .director import exposure
-    from .wall_policy import front_cells
+    from .wall_policy import front_cells, monster_face
     if len(world.stations) != 1 or rules.weapon_limit != 3:
         return None, 'unknown_region'
     anchor = world.stations[0].pos
@@ -114,9 +117,14 @@ def select(world, rules, policy, deadline):
         clock = Clock(world.round, rules.round_origin)
         rows = []
         rejected = Counter()
-        for template in templates(anchor):
+        protect_front = policy.pioneer_rotation_enabled
+        facing = monster_face(world,anchor)
+        for template in templates(anchor, all_gate_sides=protect_front):
             guns = {template[k] for k in ('a', 'b', 'c')}
             w, p, gate = (template[k] for k in ('w', 'p', 'gate'))
+            if protect_front and gate in facing:
+                rejected['monster_facing_gate'] += 1
+                continue
             wall = owned_walls.get(gate)
             if (wall is not None and wall.level != 1
                     or gate in static and wall is None):
@@ -188,7 +196,8 @@ def select(world, rules, policy, deadline):
             row = dict(template, slots=tuple(('rocket', template[k]) for k in ('a', 'b', 'c')),
                        anchor=anchor,
                        task_round_trips=tuple(trips), c_stands=tuple(sorted(c_stands)),
-                       worker_gate_steps=max(0,fallback[gate]-1), construction_travel=min(builder), candidate_count=32,
+                       worker_gate_steps=max(0,fallback[gate]-1), construction_travel=min(builder),
+                       candidate_count=128 if protect_front else 32,
                        gate_detour_rounds=gate_detour, suggested_gate_worker=gate_worker,
                        exposure_upper=sum(r['upper_per_attack_opportunity'] for r in risks),
                        exposure_unknown=any(r['unknown_robot_damage'] for r in risks),

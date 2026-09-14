@@ -948,6 +948,17 @@ class TaskEngine:
                                       if pending["operation"] in {"run_tool", "run_python"} else ""})
         if usable and not failure and pending.get("plan"):
             output = pending['plan'].get('answer_output')
+            # A final successful calculation can arrive after the model's
+            # last useful round. An explicit answer contract lets us submit
+            # its complete JSON now, without guessing from prose or an API
+            # probe and without requiring the model to echo that same JSON.
+            if (output is None and pending['operation'] in {'run_python','run_tool'}
+                    and task.timeout is not None and task.accept_round is not None
+                    and world.round >= task.accept_round+task.timeout-3
+                    and isinstance(data.get('data'),dict)):
+                required = answer_contract(task)
+                if required['json_required'] and (required['required_fields'] or (required['schema'] or {}).get('required')):
+                    output = {'format':'json','selector':['data']}
             if isinstance(output, dict) and data.get('completeness') == 'complete':
                 try:
                     task.answer = evidence_answer(task, {'format':output.get('format'),

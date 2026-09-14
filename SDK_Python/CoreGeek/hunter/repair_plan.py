@@ -69,8 +69,11 @@ class RepairPlan:
         for identity in set(self.active) - {roster.w, roster.p}:
             self.active.pop(identity, None)
         c = next((g for g in world.weapons if g.pos == plan['c']), None)
-        walls = damaged_walls(world, rules)
-        threats = [u for u in world.robots.values() if u.alive and u.abnormal != 'dizzy']
+        maintenance_mode = defence_duties.enabled(world)
+        walls = ([u for u in world.ours.values() if u.alive and u.kind=='wall']
+                 if maintenance_mode else damaged_walls(world, rules))
+        threats = [u for u in world.robots.values() if u.alive and u.abnormal != 'dizzy'
+                   and u.target_team in (None,world.side)]
         if any(u.attack_range is None or u.attack_power is None for u in threats):
             self.diagnostic={'status':'UNKNOWN_ROBOT_ATTACK'}
             return []
@@ -150,7 +153,8 @@ class RepairPlan:
                     break
                 result.extend(self._return(actor, home, current, world, service_context))
                 continue
-            if not actor.inventory['WallFixer']:
+            if not actor.inventory['WallFixer'] and not (maintenance_mode and any(
+                    actor.inventory[name] for name in ('WallUpgradeVoucher1','WallUpgradeVoucher2'))):
                 if current:
                     current['phase'] = 'RETURN_C'
                     home = distance_field(world, c_stands, actor.pos, deadline)
@@ -170,6 +174,15 @@ class RepairPlan:
             for wall in walls:
                 if current and wall.id != current['wall']:
                     continue
+                maximum=rules.max_health.get('wall',{}).get(wall.level)
+                item = None
+                if maintenance_mode and wall.level in (1,2) and actor.inventory[f'WallUpgradeVoucher{wall.level}']:
+                    from .procurement import upgrade_allowed
+                    if upgrade_allowed(world,wall,policy,rules):item=f'WallUpgradeVoucher{wall.level}'
+                if item is None and actor.inventory['WallFixer'] and maximum and wall.health < maximum:
+                    item='WallFixer'
+                if item is None:
+                    continue
                 emergency = pressure(world, wall)
                 emergency = emergency is not None and emergency >= wall.health
                 stands = interaction_cells(world, [wall.pos], actor.pos)
@@ -186,15 +199,19 @@ class RepairPlan:
                         for g in guns for r in threats))
                     maintenance = defence_duties.enabled(world) and (no_target or stand==actor.pos
                         or (pressure(world,wall) or 0)*actions>=wall.health*2)
+                    # Use an observed idle cooldown to prevent damage, not
+                    # only after the wall has fallen below the day threshold.
+                    # Light damage does not justify abandoning a ready gun.
+                    if maintenance_mode and maximum and wall.health*10>=maximum*3 and delayed and not emergency and not no_target:
+                        continue
                     if delayed and not emergency and not maintenance:
                         continue
                     # No repair detour enters an observed lethal exposure.
-                    threats = [u for u in world.robots.values() if u.alive and u.abnormal != 'dizzy']
                     if any(u.attack_range is None or u.attack_power is None for u in threats):
                         continue
                     if 2*sum(u.attack_power for u in threats if distance(u.pos,stand)<=u.attack_range) >= actor.health:
                         continue
-                    options.append((delayed, actions, wall.health, wall.id, stand, wall))
+                    options.append((delayed, actions, wall.health, wall.id, stand, wall, item))
             if time.monotonic() >= deadline:
                 break
             if not options:
@@ -202,11 +219,11 @@ class RepairPlan:
                     current['phase'] = 'RETURN_C'
                     result.extend(self._return(actor, home, current, world, service_context))
                 continue
-            delayed, actions, _, _, stand, wall = min(options, key=lambda r:r[:5])
+            delayed, actions, _, _, stand, wall, item = min(options, key=lambda r:r[:5])
             why = ('maintenance of damaged wall permits delayed fire' if delayed and defence_duties.enabled(world)
                    else 'observed wall pressure permits delayed fire' if delayed else 'fits observed remaining cooldown')
             if stand == actor.pos:
-                command = {'action':'use', 'name':'WallFixer', 'targetPos':[pos_json(wall.pos)]}
+                command = {'action':'use', 'name':item, 'targetPos':[pos_json(wall.pos)]}
                 offered = self._offer(actor, command, wall.id, world, 'USE_PENDING', actions, why,
                                       service_context)
                 result.append(offered)

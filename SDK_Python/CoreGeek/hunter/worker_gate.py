@@ -7,7 +7,7 @@ import time
 from copy import copy
 
 from .arbitration import Candidate
-from .defence_duties import rotator, stands
+from .defence_duties import rotator, stands, ingress_reserve
 from .navigation import distance_field, interaction_cells, neighbours
 from .protocol import MINERALS, distance, pos_json
 from .rules import station_rings
@@ -150,8 +150,8 @@ def prepare(state, world, clock, rules, policy, deadline):
     # reserves its own trip, construction and voucher use. Adding that entire
     # itinerary here recalled P from a nearby shop many turns too early.
     # Reserve P's entry and bounded worker clearance at the actual bottleneck.
-    required = home.get(pioneer.pos,0) + policy.return_buffer + 8
-    if clock.until_night > max(18,required):
+    required = ingress_reserve(world, policy, home.get(pioneer.pos,0))
+    if clock.until_night > required:
         if not missing and getattr(world,'worker_close_requested',False) and pioneer.pos != plan['w']:
             # W has finished the wall tour and is waiting for final closure.
             # Keep the entrance open now: a W blocking C also makes P's

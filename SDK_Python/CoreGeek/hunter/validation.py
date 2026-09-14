@@ -48,6 +48,14 @@ def check_action(world, clock, rules, identity, command, *, task_actor=None, sum
     if not actor.alive:
         return invalid("actor dead")
     action = command["action"]
+    if action in {'buy','use'}:
+        from .opponent import SUMMONS, summon_target_status
+        if command.get('name') in SUMMONS:
+            target_status = summon_target_status(world)
+            if target_status == 'defeated':
+                return invalid('opponent base defeated; no useful summon target')
+            if target_status == 'unknown':
+                return unknown('surviving opponent base not observed')
     if action != "attack" and actor.kind not in MOBILE:
         return invalid("stationary entity cannot perform mobile action")
     targets = [position(p) for p in command.get("targetPos", [])]
@@ -143,6 +151,10 @@ def check_action(world, clock, rules, identity, command, *, task_actor=None, sum
             walls = [u for u in world.ours.values() if u.alive and u.kind == "wall" and u.pos == target]
             if not walls:
                 return invalid("no own wall at target")
+            if getattr(getattr(world,'strategy_policy',None),'pioneer_rotation_enabled',False):
+                from .wall_policy import monster_face
+                if any(target in monster_face(world,base.pos) for base in world.stations):
+                    return invalid('preserve monster-facing wall; use a side or rear gate')
             r.locks.add(walls[0].id)
             r.cells.add(target)
     elif action in {"sell", "buy"}:

@@ -33,15 +33,19 @@ def propose(world, clock, policy, deadline):
     target = min(targets, key=lambda q: max(abs(q[0]-worker.pos[0]), abs(q[1]-worker.pos[1])))
     # A reachable ordinary route needs no demolition. An ongoing recovery owns
     # that route until actual arrival, so builders cannot close its new opening.
-    field = distance_field(world, {target}, worker.pos, deadline)
+    field = distance_field(world, targets, worker.pos, deadline)
     if worker.pos in field and not pending:
         return [], report
     if not pending:
         topology=copy(world)
         topology.occupied=world.occupied-{u.pos for u in world.movers}
-        if worker.pos in distance_field(topology,{target},worker.pos,deadline):
+        if worker.pos in distance_field(topology,targets,worker.pos,deadline):
             return [], {'stage':'traffic','actor':worker.id,'target':target}
     walls = {u.pos:u for u in world.ours.values() if u.alive and u.kind == 'wall'}
+    if policy.pioneer_rotation_enabled:
+        from .wall_policy import monster_face
+        protected = set().union(*(monster_face(world,base.pos) for base in world.stations))
+        walls = {p:u for p,u in walls.items() if p not in protected}
     forbidden = world.occupied - set(walls) - {worker.pos}
     threats = active(world)
     if any(r.attack_range is None or r.attack_power is None for r in threats):
@@ -57,7 +61,8 @@ def propose(world, clock, policy, deadline):
         key = point, removed
         if cost >= best.get(key, float('inf')):continue
         best[key] = cost
-        if point == target:
+        if point in targets:
+            target = point
             if not path:return [], report
             next_cell = path[0]
             command = {'action':'remove' if next_cell in walls else 'move', 'targetPos':[pos_json(next_cell)]}

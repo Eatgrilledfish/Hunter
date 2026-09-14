@@ -35,7 +35,7 @@ def statistics_review(task, answer_only=False):
     if 'oldest_era' not in text:return None
     result = {
         'oldest_era':'按本题定义从本城市完整记录计算。核对 temporal_value_counts 中全部已观察年代、实际数值年份及所需排序依据；响应顺序和字符串 min 不能证明最早。不能把猜测年份、空值默认值或别的城市年代代入。',
-        'execution':'用简短程序完成分页、断言、统计；不要生成通用框架或冗长兜底。统计缺字段应明确失败。最终 stdout 只输出题目要求的完整 JSON，计算最终答案时加 submit_output:true。',
+        'execution':'用简短程序一次完成分页、断言、统计；同题已有完整计算结果时直接提交，不要重复查询。最终 stdout 只输出题目要求的一个完整 JSON 对象；不能夹杂调试、首页响应或说明文字，否则无法提取答案。计算最终答案时必须在cmd同级加 submit_output:true，省去最后一次模型往返。统计缺字段应明确失败。',
         'feedback':'收到官方某字段不符时，定位该字段的记录和转换逻辑并重新运行；保留其他实际计算值，不凭记忆改答案。',
         'coverage':'temporal_value_counts 为有界当前执行观察，标记 partial；须由程序根据实际分页确认全部数据。'}
     if answer_only:

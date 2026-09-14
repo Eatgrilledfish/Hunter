@@ -19,3 +19,14 @@ def caretaker(world):
 def stands(world, identity):
     plan = world.task_side_plan
     return {plan['w']} if identity == rotator(world) else set(plan['c_stands']) - {plan['w']}
+
+
+def ingress_reserve(world, policy, walk):
+    """Use the same clearance window for task admission and ordered ingress."""
+    from .rules import station_rings
+    reserve = walk + policy.return_buffer
+    if enabled(world):
+        _, yellow = station_rings(world.task_side_plan['anchor'])
+        if set(world.wall_targets or ()) == yellow:
+            return max(18, reserve + 8)
+    return reserve
