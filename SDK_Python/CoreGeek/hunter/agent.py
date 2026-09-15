@@ -118,7 +118,7 @@ class Agent:
             from . import day_access
             day_access.prepare(world,clock,min(start+self.policy.planning_seconds,time.monotonic()+.025),draft.day_access_choice)
             economy.prepare_wall_cycle(world, clock, self.rules, self.policy)
-            draft.wall_service.prepare(world)
+            draft.wall_service.prepare(world, self.rules)
             daily = draft.sunset_market.caretaker_day
             worker=draft.night_roster.w
             worker_unit=world.ours.get(worker)
@@ -155,6 +155,8 @@ class Agent:
                                            for command in commands)
             else:
                 draft.day_schedule.division.helper_clearance.clear()
+            gate_candidates=draft.day_schedule.division.prioritize_front_helper(
+                world,clock,draft.external_gate,build_jobs,gate_candidates)
             if draft.external_gate.commands:
                 build_jobs={i:j for i,j in build_jobs.items() if i not in draft.external_gate.commands}
             draft.day_schedule.division.reconcile_assistance(world,build_jobs)
@@ -253,6 +255,9 @@ class Agent:
                         draft.external_gate.commands[identity].extend(commands)
             guidance.candidates.extend(repairs)
             candidates.extend(repairs)
+            cleared_work=draft.night_clear.prepare(world,clock,self.rules,self.policy,guidance,min(deadline,time.monotonic()+.025))
+            candidates.extend(cleared_work)
+            guidance.candidates.extend(cleared_work)
             # A fixed gun site may initially be occupied by an idle pioneer.
             # Keep the site stable and move the role using real free cells.
             if world.battery_plan and clock.phases == {'day'}:
@@ -631,6 +636,7 @@ class Agent:
             draft.defence.finalize(world, decision.response)
             draft.medical.finalize(world, decision.response)
             draft.external_gate.finalize(world,decision.response)
+            draft.night_clear.finalize(world,decision.response)
             draft.repair.finalize(world,decision.response)
             draft.repair_supply.finalize(world,decision.response)
             draft.sunset_market.finalize(world,decision.response)
@@ -655,6 +661,7 @@ class Agent:
                       "rejected": decision.rejected, "module_errors": module_errors,
                       "warnings": world.warnings, "origin": draft.origin,
                       "rule_observation_differences": self.rules.observation_differences(world),
+                      "wall_health_levels": draft.wall_health.levels,
                       "build_region_status": self.rules.build_region_status(world),
                       "risk_scenarios": guidance.observations, "operator_stands": guidance.operator_stands,
                       "operator_plan_status": guidance.operator_plan_status,
@@ -687,6 +694,7 @@ class Agent:
                           for u in world.movers if u.kind=="worker"},
                       "battery_plan": world.battery_plan,
                       "external_gate":draft.external_gate.diagnostic,
+                      "night_clear":draft.night_clear.diagnostic,
                       "duty_budget":world.duty_budget.diagnostic(),
                       "exterior_evasion":evasion_report,
                       "work_plans":guidance.work_plans,

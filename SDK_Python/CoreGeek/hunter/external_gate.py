@@ -176,9 +176,9 @@ class ExternalGate:
             walls={u.pos:u for u in world.ours.values() if u.alive and u.kind=='wall' and u.pos in yellow}
             from .repair_plan import pressure
             for wall in walls.values():
-                maximum=rules.max_health.get('wall',{}).get(wall.level)
+                maximum=rules.health_limit(world,wall)
                 hit=pressure(world,wall)
-                if maximum is None or wall.health*10<maximum*3 or hit is not None and hit>=wall.health:
+                if maximum is None or wall.health*10<=maximum*3 or hit is not None and hit>=wall.health:
                     return candidates
             admission=self.diagnostic.get('admission',{})
             if (yellow-{plan['gate']}<=walls.keys()

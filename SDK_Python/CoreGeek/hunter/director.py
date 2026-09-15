@@ -523,7 +523,8 @@ def triage(world, clock, task_actor, task, policy=None, risk_memory=None):
         largest_hit = max((ROBOT_DAMAGE.get(world.robots[i].kind, world.robots[i].attack_power or 0)
                            for i in risk["sources"]), default=0)
         withdrawal_hp = max(2*largest_hit, 2*observed_loss+largest_hit, (200 if actor.kind == "pioneer" else 220)*0.3)
-        hold_fire = bool(covering) and actor.health > withdrawal_hp
+        hold_fire = (bool(covering) and actor.health > withdrawal_hp
+                     and not (critical and observed_loss > 0))
         risk.update(defence_hold=hold_fire, withdrawal_hp=withdrawal_hp, observed_hp_loss=observed_loss,
                     covering_guns=[gun.id for gun in covering])
         if hold_fire:

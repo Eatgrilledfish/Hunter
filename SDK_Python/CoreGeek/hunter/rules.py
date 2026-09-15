@@ -82,6 +82,14 @@ class Rules:
     building_stats: dict[str, dict[int, BuildingStats]] = field(default_factory=dict)
     build_geometry_source: str | None = None
 
+    def health_limit(self, world, unit):
+        """Use clean restoration evidence for this session, else formal rules."""
+        if unit.kind == 'wall':
+            record = getattr(world,'wall_health_levels',{}).get(unit.level)
+            if record and not record.get('conflict'):
+                return record['hp']
+        return self.max_health.get(unit.kind,{}).get(unit.level)
+
     @staticmethod
     def wall_count(world):
         # A present wall with missing HP still occupies a slot conservatively.
@@ -353,7 +361,7 @@ class Policy:
     economy_first_enabled: bool = True
     staged_walls_enabled: bool = True
     construction_site_coordination_enabled: bool = True
-    wall_repair_health_fraction: float = 0.50
+    wall_repair_health_fraction: float = 0.30
     defence_procurement_enabled: bool = False
     defence_gold_limit: int = 200
     joint_lookahead_enabled: bool = False

@@ -87,7 +87,7 @@ class RepairPlan:
                 if time.monotonic()>=deadline:break
             if time.monotonic()>=deadline:break
         result = []
-        for identity in ((roster.w,) if defence_duties.enabled(world) else (roster.w, roster.p)):
+        for identity in (roster.w, roster.p):
             if time.monotonic() >= deadline:
                 break
             actor = world.ours.get(identity)
@@ -109,11 +109,24 @@ class RepairPlan:
             if world.width * world.height > 41 * 32:
                 continue
             blocked.update(q for q,damage in exposure.items() if damage>=actor.health)
+            if maintenance_mode and identity==defence_duties.rotator(world):
+                physical=active_robots(world)
+                if any(r.attack_range is None or r.attack_power is None for r in physical):continue
+                for r in physical:
+                    if r.attack_power<=0:continue
+                    radius=r.attack_range+1
+                    blocked.update((x,y) for x in range(max(0,r.pos[0]-radius),min(world.width,r.pos[0]+radius+1))
+                                   for y in range(max(0,r.pos[1]-radius),min(world.height,r.pos[1]+radius+1)))
             if time.monotonic() >= deadline:
                 break
-            world.navigation_avoided.setdefault(actor.pos, set()).update(blocked - {actor.pos})
+            routing=world
+            if maintenance_mode and identity==defence_duties.rotator(world):
+                from copy import copy
+                routing=copy(world)
+                routing.navigation_avoided={p:set(cells) for p,cells in world.navigation_avoided.items()}
+            routing.navigation_avoided.setdefault(actor.pos, set()).update(blocked - {actor.pos})
             current = self.active.get(identity)
-            if identity == defence_duties.rotator(world):
+            if identity == defence_duties.rotator(world) and not maintenance_mode:
                 self.active.pop(identity, None)
                 current = None
             guns = ([g for g in world.weapons if g.pos in (plan['a'], plan['b'])]
@@ -146,8 +159,10 @@ class RepairPlan:
                 current['phase'] = 'RETURN_C'
             c_stands = {q for q in plan['c_stands'] if c and distance(q, c.pos) <= 1}
             c_stands -= {plan['w']} | getattr(world, 'operator_excluded_cells', set())
+            if maintenance_mode and identity == defence_duties.rotator(world):
+                c_stands = {plan['w']}
             if current and current['phase'] == 'RETURN_C':
-                home = distance_field(world, c_stands, actor.pos, deadline)
+                home = distance_field(routing, c_stands, actor.pos, deadline)
                 if time.monotonic() >= deadline:
                     break
                 result.extend(self._return(actor, home, current, world, service_context))
@@ -156,24 +171,24 @@ class RepairPlan:
                     actor.inventory[name] for name in ('WallUpgradeVoucher1','WallUpgradeVoucher2'))):
                 if current:
                     current['phase'] = 'RETURN_C'
-                    home = distance_field(world, c_stands, actor.pos, deadline)
+                    home = distance_field(routing, c_stands, actor.pos, deadline)
                     if time.monotonic() >= deadline:
                         break
                     result.extend(self._return(actor, home, current, world, service_context))
                 continue
             self.diagnostic[identity]=dict(phase='WAIT',wall=None,remaining_actions=None,
                 observed_cooldown=window,reason='no damaged wall with a safe service route',stock=actor.inventory['WallFixer'])
-            if identity == defence_duties.rotator(world) and actor.pos != plan['w']:
+            if identity == defence_duties.rotator(world) and actor.pos != plan['w'] and not current:
                 continue
             if identity == defence_duties.caretaker(world) and not current and actor.pos not in c_stands:
                 continue  # An unrelated excursion cannot become a repair commitment.
-            outgoing = distance_field(world, [actor.pos], actor.pos, deadline)
-            home = distance_field(world, c_stands, actor.pos, deadline) if identity == defence_duties.caretaker(world) else {}
+            outgoing = distance_field(routing, [actor.pos], actor.pos, deadline)
+            home = distance_field(routing, c_stands, actor.pos, deadline) if maintenance_mode or identity == defence_duties.caretaker(world) else {}
             options = []
             for wall in walls:
                 if current and wall.id != current['wall']:
                     continue
-                maximum=rules.max_health.get('wall',{}).get(wall.level)
+                maximum=rules.health_limit(world,wall)
                 wall_pressure = exposure[wall.pos]
                 item = None
                 if maintenance_mode and wall.level in (1,2) and actor.inventory[f'WallUpgradeVoucher{wall.level}']:
@@ -186,16 +201,22 @@ class RepairPlan:
                 if item is None:
                     continue
                 emergency = wall_pressure >= wall.health
-                stands = interaction_cells(world, [wall.pos], actor.pos)
-                if identity == defence_duties.rotator(world) or is_task:
+                stands = interaction_cells(routing, [wall.pos], actor.pos)
+                if identity == defence_duties.rotator(world) and not maintenance_mode or is_task:
                     stands &= {actor.pos}
                 stands -= {plan['w']} if identity == defence_duties.caretaker(world) else set()
                 for stand in stands & outgoing.keys():
-                    back = home.get(stand) if identity == defence_duties.caretaker(world) else 0
+                    back = home.get(stand) if maintenance_mode or identity == defence_duties.caretaker(world) else 0
                     if back is None:
                         continue
                     actions = outgoing[stand] + 1 + back
                     delayed = window is None or actions > window
+                    if maintenance_mode and identity==defence_duties.rotator(world):
+                        own_remaining=any(r.alive and r.target_team in (None,world.side) for r in world.robots.values())
+                        observed=isinstance(world.raw.get('robot'),dict) and isinstance(world.raw['robot'].get('roles'),list)
+                        remaining=min(130-(clock.round-o)%130 for o in clock.offsets)
+                        if delayed and (own_remaining or not observed):continue
+                        if not current and actions+policy.return_buffer>remaining:continue
                     no_target = (known_service and not any(distance(g.pos,r.pos)<=g.attack_range+1
                         for g in guns for r in threats))
                     maintenance = defence_duties.enabled(world) and (no_target or stand==actor.pos
@@ -230,7 +251,7 @@ class RepairPlan:
                                       service_context)
                 result.append(offered)
             else:
-                route = distance_field(world, [stand], actor.pos, deadline)
+                route = distance_field(routing, [stand], actor.pos, deadline)
                 if time.monotonic() >= deadline:
                     break
                 result.extend(self._moves(actor, route, wall.id, world, 'GO_REPAIR', actions, why,

@@ -467,7 +467,7 @@ def immediate(world, rules, task_actor=None, *, jobs=None, policy=None, local_on
                 if actor.inventory[name] and procurement.upgrade_allowed(world,building,policy,rules):
                     result.append(Candidate(actor.id, {"action": "use", "name": name, "targetPos": [pos_json(building.pos)]},
                                             30 if prefix != "Wall" else 12, "use carried level-matched voucher"))
-            max_hp = rules.max_health.get(building.kind, {}).get(building.level)
+            max_hp = rules.health_limit(world, building)
             if not planned_repairs and actor.inventory["WallFixer"] and repair_decision.eligible(world, building, rules, policy):
                 result.append(Candidate(actor.id, {"action": "use", "name": "WallFixer", "targetPos": [pos_json(building.pos)]},
                                         (max_hp-building.health)*0.05, "repair wall at configured verified HP threshold"))

@@ -13,6 +13,10 @@ from .robot_targets import opposing, protected_area, line_clear
 
 def threat_weights(world):
     assets = [u.pos for u in world.stations + world.movers]
+    staffed = [g for g in world.weapons if g.attack_range is not None and
+        any(i in world.ours and world.ours[i].alive and distance(world.ours[i].pos,g.pos)<=1
+            for i in getattr(world,'night_defenders',()))]
+    motion = getattr(world,'observed_robot_motion',{})
     weights = {}
     for robot in world.robots.values():
         if not robot.alive:
@@ -27,6 +31,15 @@ def threat_weights(world):
         base_distance = min((distance(robot.pos, p) for p in base_cells), default=30)
         base_pressure = 2.0 if base_distance <= 3 else 1.4 if base_distance <= 5 else 1.0
         weights[robot.id] = intent * (1.0 + 8.0 / (near + 1)) * pressure * base_pressure * (0.6 if robot.abnormal == "dizzy" else 1.0)
+        if staffed and robot.id in motion and base_pressure==1.0 and robot.abnormal!='dizzy':
+            dx,dy=motion[robot.id]
+            previous=(robot.pos[0]-dx,robot.pos[1]-dy)
+            margin=max(g.attack_range-distance(g.pos,robot.pos) for g in staffed)
+            previous_margin=max(g.attack_range-distance(g.pos,previous) for g in staffed)
+            if margin>=0 and margin<previous_margin:
+                # A local priority heuristic, not a robot speed/cooldown rule:
+                # observed targets leaving staffed coverage lose future shots.
+                weights[robot.id]*=2
     return weights
 
 

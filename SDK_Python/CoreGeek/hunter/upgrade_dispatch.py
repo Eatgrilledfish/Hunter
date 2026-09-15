@@ -40,10 +40,15 @@ def prepare(market, world, clock, rules, policy, guidance, jobs, excluded, deadl
             market.diagnostic['blocked']='planning_budget_exhausted'
             break  # An unfinished quote is not evidence that shopping cannot fit.
         if trip is None:
-            market.diagnostic['blocked']='no_return_or_use_route'
-            continue
+            # Paid stock remains useful when a whole shopping/use tour cannot
+            # be quoted (including an unknown/full purchasing capacity). Prove
+            # one observed-level delivery below, independent of new purchases.
+            market.diagnostic['blocked']='no_complete_quote_check_paid_delivery'
+            trip=dict(held=[r for r in supply_basket.requirements(world,rules,policy)
+                            if not r.get('pending') and r['level']==r['unit'].level
+                            and actor.inventory[r['name']]],orders={},required=None,fits=False)
         choices,stage,item,num = [],'upgrade_return',None,0
-        if stock and trip['fits']:
+        if stock and trip['fits'] and not trip.get('delivery_only'):
             item=max(stock,key=lambda k:stock[k]*world.vendor[k]);num=stock[item]
             choices=([Candidate(actor.id,dict(action='sell',name=item,num=num),240,'sell only personally held pioneer ore')]
                      if world.near_zone(actor.pos,'vendor') else DaySchedule.moves(actor,trip['sale'],'sell actual personal ore before checkout'))

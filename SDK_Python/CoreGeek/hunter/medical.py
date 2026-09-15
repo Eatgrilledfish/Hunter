@@ -51,7 +51,7 @@ class MedicalSupply:
             stock = policy.medical_stock_enabled and world.near_zone(actor.pos, 'weaponShop')
             if (not treatment and not stock) or actor.backpack is None:
                 continue
-            permission = guidance.treatment_view(actor.id) if treatment else guidance
+            permission = guidance.treatment_view(actor.id) if treatment or stock else guidance
             if actor.inventory['Medicine']:
                 if not treatment:
                     continue  # Keep one personally carried emergency dose.

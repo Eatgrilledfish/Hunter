@@ -26,6 +26,30 @@ class DayDivision:
     helper_clearance: dict = field(default_factory=dict)
 
     @staticmethod
+    def prioritize_front_helper(world, clock, gate, jobs, candidates):
+        """Defer only an ordinary remote sale for a fully funded front repair."""
+        if clock.phases!={'day'} or gate.emergency_active or world.night_roster.traffic:
+            return candidates
+        identity=world.night_roster.m
+        job=jobs.get(identity,{})
+        actor=world.ours.get(identity)
+        orders=gate.commands.get(identity,[])
+        cashout=gate.diagnostic.get('cashout',{})
+        sale=gate.diagnostic.get('day_sale',{})
+        if (not job.get('helper') or job.get('helper_collect') or not actor or not actor.alive
+                or actor.health<=110 or actor.abnormal=='dizzy' or actor.backpack is None
+                or any(c.get('action')!='move' for c in orders)
+                or not (cashout.get('actor')==identity or sale.get('actor')==identity)
+                or actor.inventory['stone']<len(job['helper_targets'])
+                or job.get('construction_steps',float('inf'))+2>clock.until_night
+                or not set(job['helper_targets']) & set(getattr(world,'monster_front_walls',()))):
+            return candidates
+        gate.commands.pop(identity)
+        gate.diagnostic['sale_deferred_for_front_rebuild']=dict(actor=identity,targets=job['helper_targets'],
+            steps=job['construction_steps'])
+        return [c for c in candidates if c.actor!=identity]
+
+    @staticmethod
     def reconcile_assistance(world, jobs):
         reserved = getattr(world, 'helper_wall_targets', ())
         if reserved and not any(j.get('helper') for j in jobs.values()):
@@ -264,6 +288,30 @@ class DayDivision:
             self.helper_batches.pop(actor.id, None)
             batch = None
         supplier = world.ours.get(job.get('supplier'))
+        if batch and set(batch.get('targets',()))-missing:
+            batch['building_observed']=True
+        if batch and batch.get('topup_goal') is not None and actor.inventory['stone']>=batch['topup_goal']:
+            batch['phase']='build'
+        # Split personal stocks can leave just a small team deficit. Give its
+        # collection to the nearer carrier instead of making the guard cross
+        # the map. Targets below remain limited to observed personal stock;
+        # the next collection still requires the complete construction budget.
+        team_deficit=max(0,len(missing)-actor.inventory['stone']-(supplier.inventory['stone'] if supplier else 0))
+        if (supplier and supplier.inventory['stone'] and actor.inventory['stone'] and team_deficit
+                and not self.helper_clearance
+                and not (batch and (batch.get('topup_goal') is not None or batch.get('building_observed')))):
+            supplier_reach=distance_field(world,{supplier.pos},supplier.pos,deadline)
+            supplier_walk=min((supplier_reach[p] for m in world.zones.get('stone',())
+                for p in interaction_cells(world,[m],supplier.pos) if p in supplier_reach),default=float('inf'))
+            build_walk=min((start[p] for target in missing-{self.gate}
+                for p in interaction_cells(world,[target],actor.pos)-blocked if p in start),default=float('inf'))
+            nearby=[(start[p],m) for m in world.zones.get('stone',())
+                for p in interaction_cells(world,[m],actor.pos)
+                if p in start and start[p]<min(supplier_walk,build_walk)]
+            if nearby and time.monotonic()<deadline:
+                _,mine=min(nearby)
+                batch=self.helper_batches[actor.id]=dict(mine=mine,phase='harvest',
+                    topup_goal=actor.inventory['stone']+team_deficit)
         # A target without personally held material is not an exclusive build
         # commitment. Keep W's last stone for sealing an enclosing perimeter.
         gate_stone = int(self.gate in missing)

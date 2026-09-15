@@ -435,7 +435,9 @@ def permits(world, candidate):
     actor=world.ours.get(identity)
     personal_dose = (command.get('action')=='buy' and command.get('name')=='Medicine'
         and command.get('num',1)==1 and actor and actor.backpack is not None
-        and not actor.inventory['Medicine'] and actor.health <= (200 if actor.kind=='pioneer' else 220)*.5
+        and not actor.inventory['Medicine']
+        and (actor.health <= (200 if actor.kind=='pioneer' else 220)*.5
+             or world.near_zone(actor.pos,'weaponShop'))
         and getattr(getattr(world,'strategy_policy',None),'medical_stock_enabled',False))
     if command in getattr(world,'treasure_actions',{}).get(identity,()):
         return True

@@ -3,11 +3,11 @@ def eligible(world, wall, rules, policy=None, *, service_steps=1, pressure=0):
     restored=getattr(world,'wall_restore_observations',{}).get(wall.id)
     if (restored and restored['level']==wall.level and wall.health is not None
             and wall.health>=restored['hp']):return False
-    maximum = rules.max_health.get('wall', {}).get(wall.level)
+    maximum = rules.health_limit(world, wall)
     if wall.kind != 'wall' or not wall.alive or not maximum or wall.health is None or wall.health >= maximum:
         return False
     policy = policy or getattr(world, 'strategy_policy', None)
-    fraction = getattr(policy, 'wall_repair_health_fraction', .5)
+    fraction = getattr(policy, 'wall_repair_health_fraction', .3)
     if wall.health <= maximum * fraction:
         return True
     loss = getattr(world, 'observed_wall_losses', {}).get(wall.id, 0)

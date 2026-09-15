@@ -208,6 +208,16 @@ def quote(world, actor, clock, rules, policy, deadline, *, home, tail=None, end=
     fields, routes = {}, {}
     def attempt(entries):
         orders = Counter(e['name'] for e in entries)
+        if actor.kind == 'pioneer' and not orders and (data['held'] or not sale_stock):
+            # Checkout has finished. Start delivery at the observed carrier,
+            # not at home followed by a second outward tour of the same walls.
+            use_steps=use_tour(world,actor,data['held'],actor.pos,home,deadline,fields)
+            if use_steps is None:return None
+            # Ore liquidation is a separate optional itinerary once the
+            # already-paid vouchers have been delivered.
+            return dict(data,planned=entries,orders=orders,use_steps=use_steps,
+                        checkout=home,sale={},required=use_steps,delivery_only=True,
+                        fits=use_steps+margin<=clock.until_night)
         if actor.kind == 'pioneer' and orders:
             # P has no wall-closing obligation. Apply its coupons on the way
             # back from checkout, including walls serviced from outside. The

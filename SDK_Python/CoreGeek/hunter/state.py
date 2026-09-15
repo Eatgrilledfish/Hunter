@@ -18,9 +18,11 @@ from .day_schedule import DaySchedule
 from .task_side_layout import TaskSideLayout
 from .external_gate import ExternalGate
 from .night_roles import NightRoster
+from .night_clear import NightClear
 from .repair_plan import RepairPlan
 from .repair_supply import RepairSupply
 from .wall_service import WallService
+from .wall_health import WallHealth
 from .opening_wave import OpeningWave
 from .navigation import neighbours
 from .protocol import pos_json
@@ -68,9 +70,11 @@ class Session:
     task_layout: TaskSideLayout = field(default_factory=TaskSideLayout)
     external_gate: ExternalGate = field(default_factory=ExternalGate)
     night_roster: NightRoster = field(default_factory=NightRoster)
+    night_clear: NightClear = field(default_factory=NightClear)
     repair: RepairPlan = field(default_factory=RepairPlan)
     repair_supply: RepairSupply = field(default_factory=RepairSupply)
     wall_service: WallService = field(default_factory=WallService)
+    wall_health: WallHealth = field(default_factory=WallHealth)
     opening_wave: OpeningWave = field(default_factory=OpeningWave)
 
     def task_actor(self, world):
@@ -91,6 +95,7 @@ class Session:
             self.origin = 0
         clock = Clock(world.round, self.origin)
         world.strategy_clock = clock
+        self.wall_health.observe(world, clock, self)
         self.opening_wave.observe(world,clock)
         world.observed_wall_losses = {}
         world.observed_robot_motion = {}

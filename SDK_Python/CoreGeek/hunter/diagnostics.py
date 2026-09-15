@@ -369,27 +369,49 @@ class Diagnostics(logging.Handler):
 
     def _work_item_events(self, state, raw, response, decision, units, number):
         """Never sample away item identity or confuse an offer with a receipt."""
+        limits=decision.get('wall_health_levels',{})
+        marker=json.dumps(limits,sort_keys=True)
+        if limits and marker!=state.get('wall_health_levels'):
+            self._write_compact('wall_health_evidence',levels=limits,
+                formal_limits=getattr(self,'max_health',{}).get('wall',{}))
+            state['wall_health_levels']=marker
+        robots={str(r.get('id')):r for r in array(obj(raw.get('robot')).get('roles')) if isinstance(r,dict)}
         feedback = obj(raw.get('lastRoundRoleActionResults'))
         for pending in state.pop('item_pending', []):
             actor = obj(units.get(pending['actor']))
-            target = obj(units.get(pending.get('target'))) if pending.get('target') else actor
+            target = ({} if pending.get('area') else
+                      obj(units.get(pending.get('target'))) if pending.get('target') else actor)
             bag = actor.get('backpack')
             self._write_compact('item_receipt', actor=pending['actor'], item=pending['item'],
                 sent=pending['round'], consecutive=number==pending['round']+1,
                 accepted=feedback.get(pending['actor']) if number==pending['round']+1 else None,
                 hp_after=target.get('health'),level_after=target.get('level'),
-                target_id=pending.get('target'),target_pos=target.get('pos'),target_type=target.get('roleType'),
+                target_id=pending.get('target'),target_pos=pending.get('target_pos') or target.get('pos'),target_type=target.get('roleType'),
                 configured_max_hp=getattr(self,'max_health',{}).get(target.get('roleType'),{}).get(target.get('level')),
-                stock_after=bag.count(pending['item']) if isinstance(bag,list) else None)
+                stock_after=bag.count(pending['item']) if isinstance(bag,list) else None,
+                area_observations=[dict(id=r['id'],hp_before=r['hp'],
+                    present=r['id'] in robots,hp_after=obj(robots.get(r['id'])).get('health'),
+                    abnormal_after=obj(robots.get(r['id'])).get('abnormalState'))
+                    for r in pending.get('robots',[])],
+                attribution='joint_turn_observation_not_item_damage' if pending.get('area') else None)
         reasons = {str(r.get('actor')):r.get('reason') for r in decision.get('selected',[])}
         prices = {r.get('name'):r.get('price') for r in array(raw.get('weaponShopList')) if isinstance(r,dict)}
         for identity,command in response.get('roleCommandMap',{}).items():
             if command.get('action') not in ('use','buy'):continue
             item=command.get('name','')
-            if command['action']=='use' and not (item in ('Medicine','WallFixer') or 'UpgradeVoucher' in item):continue
+            if command['action']=='use' and not (item in ('Medicine','WallFixer','Bomb','DizzyWeapon') or 'UpgradeVoucher' in item):continue
             actor=obj(units.get(str(identity)));target=actor;target_id=None
             points=command.get('targetPos',[])
-            if points:
+            area=command['action']=='use' and item in ('Bomb','DizzyWeapon')
+            affected=[]
+            if area and len(points)==1:
+                from .protocol import position, distance
+                centre=position(points[0])
+                if centre is not None:
+                    affected=[dict(id=i,hp=r.get('health')) for i,r in robots.items()
+                        if position(r.get('pos')) is not None and distance(centre,position(r['pos']))<=1]
+                target={}
+            elif points:
                 target_id=next((i for i,u in units.items() if u.get('pos')==points[0]),None)
                 target=obj(units.get(target_id))
             maximum=getattr(self,'max_health',{}).get(target.get('roleType'),{}).get(target.get('level'))
@@ -398,16 +420,19 @@ class Diagnostics(logging.Handler):
             bag=actor.get('backpack')
             self._write_compact('item_use' if command['action']=='use' else 'item_buy',
                 actor=str(identity)[:32],item=item,target=target_id,
-                target_pos=target.get('pos'),target_type=target.get('roleType'),
+                target_pos=points[0] if area and points else target.get('pos'),target_type=target.get('roleType'),
                 hp_before=target.get('health'),max_hp=maximum,level_before=target.get('level'),
                 stock_before=bag.count(item) if isinstance(bag,list) else None,
                 quantity=command.get('num',1),price=prices.get(item) if command['action']=='buy' else None,
+                affected_robot_count=len(affected) if area else None,
+                affected_robots=affected[:12] if area else None,
                 gold=obj(raw.get('teamOur')).get('goldNum'),
                 reason=self._brief(reasons.get(str(identity)),120),
                 escape={k:obj(decision.get('exterior_evasion')).get(k) for k in ('decision','to','known_damage_after')}
                        if str(identity)==str(obj(decision.get('night_roster')).get('m')) else None)
             state.setdefault('item_pending',[]).append(dict(actor=str(identity),item=item,
-                target=target_id,round=number))
+                target=target_id,round=number,area=area,
+                target_pos=points[0] if area and points else None,robots=affected[:12]))
         sites=obj(decision.get('wall_service'))
         marker=tuple((p,r.get('id'),r.get('level'),r.get('state'),r.get('reserved_owner'))
             for p,r in sorted(sites.items()))

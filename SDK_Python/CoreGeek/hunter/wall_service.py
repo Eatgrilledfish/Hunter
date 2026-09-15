@@ -19,7 +19,7 @@ class PendingWall:
 class WallService:
     sites: dict = field(default_factory=dict)
 
-    def prepare(self, world):
+    def prepare(self, world, rules=None):
         from .wall_policy import upgrade_targets
         walls = {u.pos:u for u in world.ours.values() if u.alive and u.kind=='wall'}
         self.sites = {p:self.sites.get(p,{}) for p in upgrade_targets(world)}
@@ -36,6 +36,12 @@ class WallService:
             record.update(id=identity,level=wall.level if wall else None,
                 hp=wall.health if wall else None, builder=None, build_after=None,
                 state='complete' if wall and wall.level==3 else 'upgrade' if wall else 'await_material')
+            if rules:
+                from .repair_decision import eligible
+                maximum=rules.health_limit(world,wall) if wall else None
+                record.update(level_complete=bool(wall and wall.level==3),max_hp=maximum,
+                    health_fraction=wall.health/maximum if maximum and wall and wall.health is not None else None,
+                    repair_needed=eligible(world,wall,rules) if wall else None)
             if wall and wall.level>=2:record.pop('reserved_owner',None)
         world.wall_service = self.sites
 

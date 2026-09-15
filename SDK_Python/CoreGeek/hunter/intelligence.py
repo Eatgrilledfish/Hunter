@@ -44,6 +44,8 @@ class Intelligence:
     llm_status: str = "idle"
     llm_diagnostic: dict = field(default_factory=dict)
     unresolved: list = field(default_factory=list)
+    execution: dict = field(default_factory=dict)
+    offered_plan: dict = field(default_factory=dict)
 
     @staticmethod
     def news_id(entry):
@@ -251,17 +253,23 @@ class Intelligence:
         return False
 
     def candidates(self, world, clock, policy, deadline):
-        self.diagnostic={'stage':'inactive'}
+        self.offered_plan={}
+        self.diagnostic={'stage':'inactive','retained_plan':dict(self.execution)}
         if (self.terminal or world.phase_task or not world.phase_task_observed or not policy.treasure_enabled
                 or not self.treasure_complete or clock.phases!={'day'}):
             if policy.treasure_enabled and not self.terminal:
-                self.diagnostic={'stage':'waiting','reason':'active_task' if world.phase_task else
-                    'unread_folk_sources' if not self.treasure_complete else 'night_or_unknown_phase'}
+                self.diagnostic.update(stage='waiting',reason='active_task' if world.phase_task else
+                    'unread_folk_sources' if not self.treasure_complete else 'night_or_unknown_phase')
             return []
         self.diagnostic={'stage':'waiting','reason':'no_resolved_hypothesis' if not self.treasures else 'no_feasible_circuit',
-                         'hypotheses':len(self.treasures),'unresolved':self.unresolved}
+                         'hypotheses':len(self.treasures),'unresolved':self.unresolved,
+                         'retained_plan':dict(self.execution),'rejections':[]}
         actor = next((u for u in world.movers if u.kind == "pioneer"), None)
         if actor is None or actor.backpack is None or actor.capacity is None:
+            self.diagnostic['reason']='actor_or_personal_inventory_unknown'
+            return []
+        if getattr(world,'critical_base_ids',()):
+            self.diagnostic['reason']='urgent_defence_preempts_treasure'
             return []
         stands=getattr(world,'pioneer_trade_stands',{})
         if actor.id in stands:home_goals={stands[actor.id]}
@@ -272,21 +280,28 @@ class Intelligence:
         start=distance_field(world,[actor.pos],actor.pos,deadline)
         if time.monotonic()>=deadline:return []
         margin=policy.return_buffer+(8 if world.defence_cells else 0)
-        result=[];options=[]
-        for hypothesis in sorted(self.treasures,key=lambda h:(h["closing_round"],h["opening_round"],h["id"])):
+        result=[];options=[];preparations=[]
+        def rejected(h, reason):
+            if len(self.diagnostic['rejections'])<8:
+                self.diagnostic['rejections'].append(dict(hypothesis=h['id'][:12],reason=reason))
+        for hypothesis in sorted(self.treasures,key=lambda h:(h['id']!=self.execution.get('hypothesis'),h["closing_round"],h["opening_round"],h["id"])):
             if world.round>hypothesis['closing_round']:continue
             if any(a['items']==hypothesis['items'] and a.get('result')==3 for a in self.attempts):continue
             if any(a['hypothesis']==hypothesis['id'] for a in self.attempts):continue
             if len(self.attempts)>=policy.treasure_attempt_limit:continue
             needed=Counter(hypothesis['items'])-actor.inventory
             if needed and actor.id in self.pending_purchases:
-                self.diagnostic={'stage':'purchase_pending'};continue
-            if any(name not in world.shop for name in needed):continue
-            if sum(needed.values())+len(actor.backpack)>actor.capacity:continue
+                self.diagnostic.update(stage='purchase_pending',actor=actor.id);continue
+            if any(name not in world.shop for name in needed):
+                rejected(hypothesis,'offering_not_in_current_shop');continue
+            if sum(needed.values())+len(actor.backpack)>actor.capacity:
+                rejected(hypothesis,'personal_capacity');continue
             cost=sum(world.shop[name]*n for name,n in needed.items())
-            if (self.treasure_spent+cost>policy.treasure_gold_limit or world.gold is None
-                    or cost+policy.reserve_gold>world.gold):continue
+            if needed and (self.treasure_spent+cost>policy.treasure_gold_limit or world.gold is None
+                    or cost+policy.reserve_gold>world.gold):
+                rejected(hypothesis,'observed_gold_or_attempt_budget');continue
             altars=interaction_cells(world,[hypothesis['position']],actor.pos)&home.keys()
+            if not altars:rejected(hypothesis,'altar_or_return_unreachable')
             for stand in sorted(altars):
                 altar=distance_field(world,[stand],actor.pos,deadline)
                 if time.monotonic()>=deadline:return []
@@ -300,11 +315,42 @@ class Intelligence:
                 # Include every buy, walking leg, opening wait, summon action,
                 # and the real return leg. No invisible gate opening is assumed.
                 required=summon-world.round+1+home[stand]+margin
-                if summon>hypothesis['closing_round'] or required>clock.until_night:continue
+                if summon>hypothesis['closing_round'] or required>clock.until_night:
+                    rejected(hypothesis,'summon_and_return_exceed_today')
+                    # Prepare on a prior day only if the current map also has
+                    # a complete future daylight execution window. This is a
+                    # route estimate, revalidated against actual walls later.
+                    future_start=world.round+clock.until_night+60
+                    future_walk=min((altar[p] for p in home_goals if p in altar),default=None)
+                    future_ok=False
+                    if future_walk is not None and clock.day is not None:
+                        for day_offset in range(1,11-clock.day):
+                            begin=future_start+(day_offset-1)*130
+                            moment=max(begin+future_walk,hypothesis['opening_round'])
+                            if (moment<=hypothesis['closing_round']
+                                    and moment+1+home[stand]+margin<=begin+70):
+                                future_ok=True;break
+                    if not future_ok:continue
+                    if needed:
+                        prep_paths=[(start[q]+len(needed)+home[q]+margin,start[q],q)
+                            for q in shops & start.keys() & home.keys()
+                            if start[q]+len(needed)+home[q]+margin<=clock.until_night]
+                    else:
+                        prep_paths=[(home[actor.pos]+margin,0,None)] if actor.pos in home else []
+                    if prep_paths:
+                        prep_required,prep_walk,prep_shop=min(prep_paths)
+                        preparations.append((hypothesis['closing_round'],cost,prep_required,hypothesis['id'],
+                            stand,prep_shop,prep_walk,home,hypothesis,needed))
+                    continue
                 options.append((summon,cost,required,hypothesis['id'],stand,shop,to_shop,altar,hypothesis,needed))
             if options:break  # One complete feasible hypothesis is enough for this turn.
-        if not options:return []
-        _,cost,required,_,stand,shop,to_shop,altar,hypothesis,needed=min(options,key=lambda o:o[:5])
+        preparing=not options and bool(preparations)
+        if preparing:options=preparations
+        if not options:
+            if time.monotonic()>=deadline:self.diagnostic['reason']='planning_budget_exhausted'
+            return []
+        _,cost,required,_,stand,shop,to_shop,altar,hypothesis,needed=min(options,
+            key=lambda o:(o[3]!=self.execution.get('hypothesis'),o[:5]))
         reason='priority treasure circuit fits offerings, opening time and defence return'
         if needed:
             if to_shop==0:
@@ -316,6 +362,17 @@ class Intelligence:
                 steps=[p for p in neighbours(actor.pos) if field.get(p,float('inf'))<field.get(actor.pos,0)]
                 result=movement(actor,steps,220,reason)
             stage='procure'
+        elif preparing:
+            if home.get(actor.pos)==0:
+                self.execution=dict(hypothesis=hypothesis['id'],actor=actor.id,phase='prepare',
+                    stage='prepared_observed',observed_round=world.round,
+                    opening=hypothesis['opening_round'],closing=hypothesis['closing_round'])
+            prepared=(self.execution.get('hypothesis')==hypothesis['id']
+                      and self.execution.get('stage')=='prepared_observed')
+            steps=[] if prepared else [p for p in neighbours(actor.pos)
+                if home.get(p,float('inf'))<home.get(actor.pos,0)]
+            result=movement(actor,steps,220,'return with confirmed offerings; resume in a later daylight window')
+            stage='prepare_return' if result else 'wait_future_day'
         elif actor.pos==stand and world.round>=hypothesis['opening_round']:
             result=[Candidate(actor.id,{'action':'summonTreasure','targetPos':[pos_json(hypothesis['position'])],
                                         'item':hypothesis['items']},220,reason)]
@@ -328,10 +385,19 @@ class Intelligence:
         if time.monotonic()>=deadline:return []
         self.diagnostic={'stage':stage,'actor':actor.id,'hypothesis':hypothesis['id'][:12],
                          'target':hypothesis['position'],'items':hypothesis['items'],'required':required,'cost':cost,
-                         'opening':hypothesis['opening_round'],'closing':hypothesis['closing_round']}
+                         'opening':hypothesis['opening_round'],'closing':hypothesis['closing_round'],
+                         'phase':'prepare' if preparing else 'execute',
+                         'held_offerings':dict(Counter(hypothesis['items']) & actor.inventory),
+                         'retained_plan':dict(self.execution)}
+        self.offered_plan=dict(hypothesis=hypothesis['id'],actor=actor.id,stage=stage,
+            phase=self.diagnostic['phase'],opening=hypothesis['opening_round'],closing=hypothesis['closing_round'])
         return result
 
     def finalize(self, world, clock, session, response, policy):
+        identity=self.offered_plan.get('actor')
+        if (identity in getattr(world,'treasure_actions',{}) and
+                response['roleCommandMap'].get(identity) in world.treasure_actions[identity]):
+            self.execution=dict(self.offered_plan,selected_round=world.round)
         for identity, action in response["roleCommandMap"].items():
             actor = world.ours[identity]
             if action["action"] == "summonTreasure":

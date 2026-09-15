@@ -283,7 +283,7 @@ def assess(world, rules, policy, deadline, *, open_exit=None):
     for point,wall in sorted(walls.items()):
         if point not in yellow:continue
         if time.monotonic()>=deadline:raise BudgetExpired
-        maximum=rules.max_health.get('wall',{}).get(wall.level)
+        maximum=rules.health_limit(world,wall)
         if maximum is None:
             report['reason']='wall maximum health unknown'
             return report

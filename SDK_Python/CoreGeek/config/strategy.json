@@ -36,7 +36,7 @@
     "economy_first_enabled": true,
     "staged_walls_enabled": true,
     "construction_site_coordination_enabled": true,
-    "wall_repair_health_fraction": 0.5,
+  "wall_repair_health_fraction": 0.3,
     "defence_procurement_enabled": false,
     "defence_gold_limit": 200,
     "joint_lookahead_enabled": false,

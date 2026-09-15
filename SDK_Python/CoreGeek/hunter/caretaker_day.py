@@ -28,6 +28,25 @@ class CaretakerDay:
     front_rebuild_pending: bool = False
     diagnostic: dict = field(default_factory=dict)
 
+    @staticmethod
+    def adjacent_paid(world, actor, rules, policy):
+        from .wall_policy import upgrade_rank
+        from .wall_service import service_key, use_permitted
+        choices=[]
+        for target in world.ours.values():
+            if (not target.alive or target.level not in (1,2)
+                    or not procurement.upgrade_allowed(world,target,policy,rules)
+                    or max(abs(actor.pos[0]-target.pos[0]),abs(actor.pos[1]-target.pos[1]))>1):
+                continue
+            prefix='Weapon' if target in world.weapons else 'Wall' if target.kind=='wall' else None
+            name=f'{prefix}UpgradeVoucher{target.level}'
+            if not prefix or not actor.inventory[name]:continue
+            candidate=Candidate(actor.id,dict(action='use',name=name,targetPos=[pos_json(target.pos)]),240,
+                'apply paid adjacent voucher from the observed duty stand')
+            if use_permitted(world,candidate):
+                choices.append((upgrade_rank(world,target),service_key(world,target),candidate))
+        return [min(choices,key=lambda t:t[:2])[2]] if choices else []
+
     def wall_tour(self, world, actor, missing, ring, rule, deadline):
         """Reserve work funded by personal stone, plus the next harvest action.
 
@@ -135,6 +154,12 @@ class CaretakerDay:
         # Add the return uncertainty once; P's ingress has its own shared clock.
         margin = policy.return_buffer + defence_duties.seal_service_steps(world)
         self.diagnostic = dict(left=clock.until_night,missing_walls=len(missing),reserved_stone=stone)
+        if (self.phase in {'close','home','use'} and home.get(actor.pos)==0
+                and (not missing or not actor.inventory['stone']) and clock.until_night>0):
+            immediate=self.adjacent_paid(world,actor,rules,policy)
+            if immediate:
+                return self.finish(world,guidance,jobs,actor,immediate,'use',
+                    reason='already at duty: adjacent paid use needs no return buffer')
         if (self.phase == 'close' and home.get(actor.pos) is not None
                 and clock.until_night <= home[actor.pos] + policy.return_buffer + 1):
             return self.finish(world, guidance, jobs, actor,
@@ -150,24 +175,9 @@ class CaretakerDay:
             if home.get(actor.pos)==0 and not actor.inventory['stone']:
                 # An unfunded gap must not block a one-action improvement
                 # already paid for and usable from the actual duty stand.
-                immediate=[]
-                for target in world.ours.values():
-                    if (target.alive and target.level in (1,2) and
-                            procurement.upgrade_allowed(world,target,policy,rules) and
-                            max(abs(actor.pos[0]-target.pos[0]),abs(actor.pos[1]-target.pos[1]))<=1):
-                        prefix='Weapon' if target in world.weapons else 'Wall' if target.kind=='wall' else None
-                        name=f'{prefix}UpgradeVoucher{target.level}'
-                        if prefix and actor.inventory[name]:
-                            from .wall_policy import upgrade_rank
-                            from .wall_service import service_key,use_permitted
-                            candidate=Candidate(actor.id,dict(action='use',name=name,targetPos=[pos_json(target.pos)]),240,'paid wall service')
-                            if use_permitted(world,candidate):
-                                immediate.append((upgrade_rank(world,target),service_key(world,target),name,target))
+                immediate=self.adjacent_paid(world,actor,rules,policy)
                 if immediate:
-                    _,_,name,target=min(immediate,key=lambda t:t[:2])
-                    return self.finish(world,guidance,jobs,actor,[Candidate(actor.id,
-                        dict(action='use',name=name,targetPos=[pos_json(target.pos)]),240,
-                        'apply paid adjacent voucher after repair while remaining gaps lack material')],'use')
+                    return self.finish(world,guidance,jobs,actor,immediate,'use')
             # Repair yesterday's breach with already held stone before starting
             # a new economic trip. Keep a separate final-seal stone when needed.
             front_missing = (missing & set(getattr(world,'monster_front_walls',()))) - {plan['gate']}
@@ -313,6 +323,25 @@ class CaretakerDay:
         if (self.phase == 'harvest' and missing-{plan['gate']}
                 and actor.inventory['stone'] >= stone and self.front_rebuild_pending):
             self.phase = 'close'
+        if (self.phase=='harvest' and not self.construction_only
+                and actor.inventory['stone']>=stone and funded_checkout
+                and checkout is not None
+                and checkout.get(actor.pos,float('inf'))+margin<=clock.until_night):
+            investment=(getattr(world,'upgrade_checkout_actor',None)==actor.id
+                        and any('UpgradeVoucher' in name for name in trip['orders']))
+            from .repair_decision import eligible
+            repair_gap=(actor.inventory['WallFixer']==0 and trip['orders'].get('WallFixer',0)>0
+                        and any(u.kind=='wall' and eligible(world,u,rules,policy) for u in world.ours.values()))
+            if investment or repair_gap:
+                # A fully funded executable investment no longer waits until
+                # all remaining harvesting time has been consumed. Material,
+                # use, closure and return are already in this very quote.
+                self.phase=('sell' if stock and world.near_zone(actor.pos,'vendor')
+                            and required is not None and required+margin<=clock.until_night else 'buy')
+                required=(required if self.phase=='sell' else checkout[actor.pos])
+                self.last_required=required+margin
+                self.diagnostic.update(required=self.last_required,
+                    harvest_released='funded investment' if investment else 'empty personal repair stock')
         if self.phase == 'harvest':
             repairs = getattr(world, 'repair_commands', {}).get(actor.id, [])
             repair_steps = getattr(world, 'day_repair_steps', {}).get(actor.id, 1)
