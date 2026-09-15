@@ -227,9 +227,11 @@ def discover_precondition(task, path, after=-1):
         if not record.get("usable") or record.get("source") != "sandbox":
             continue
         data = record["data"]
-        if data.get("operation") == "list_dir":
-            listings[data.get("path", ".")] = data
-            listing_rounds[data.get("path", ".")] = record.get("round", -1)
+        complete_root = data.get("operation") == "bootstrap" and data.get("root_listing_complete") is True
+        if data.get("operation") == "list_dir" or complete_root:
+            parent = "." if complete_root else data.get("path", ".")
+            listings[parent] = dict(data, has_more=False) if complete_root else data
+            listing_rounds[parent] = record.get("round", -1)
             for entry in data.get("entries", []):
                 if isinstance(entry, dict) and isinstance(entry.get("path"), str):
                     known[entry["path"]] = entry.get("kind")

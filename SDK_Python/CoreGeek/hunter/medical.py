@@ -51,12 +51,13 @@ class MedicalSupply:
             stock = policy.medical_stock_enabled and world.near_zone(actor.pos, 'weaponShop')
             if (not treatment and not stock) or actor.backpack is None:
                 continue
+            permission = guidance.treatment_view(actor.id) if treatment else guidance
             if actor.inventory['Medicine']:
                 if not treatment:
                     continue  # Keep one personally carried emergency dose.
                 offers = [Candidate(actor.id, {'action': 'use', 'name': 'Medicine'},
                                     250+maximum-actor.health, 'treat observed low HP before optional daytime work')]
-                offers = [c for c in offers if guidance.permit(c)]
+                offers = [c for c in offers if permission.permit(c)]
                 result.extend(offers)
                 if offers:
                     self.diagnostic['plans'][actor.id] = {'stage': 'heal'}
@@ -96,7 +97,7 @@ class MedicalSupply:
                                 ('complete low-HP treatment trip before optional daytime work' if treatment else
                                  'idle role obtains one personal emergency Medicine before returning'), gold_reserve=reserve)
                       for i, command in enumerate(commands)]
-            offers = [c for c in offers if guidance.permit(c)]
+            offers = [c for c in offers if permission.permit(c)]
             if offers:
                 result.extend(offers)
                 budget -= price  # Personal plans may not jointly overspend the daily allocation.

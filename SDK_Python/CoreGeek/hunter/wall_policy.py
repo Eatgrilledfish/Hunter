@@ -19,7 +19,11 @@ def upgrade_rank(world, unit):
     if (critical and any(u.id in critical and u.level == 3 for u in world.stations)
             and unit.kind == 'wall' and unit.pos in upgrade_targets(world)):
         return .5
-    return 1 if unit.kind in {'rocket', 'gatling', 'railgun'} else 2 if unit.kind == 'wall' else 3
+    if unit.kind=='wall':
+        loss = getattr(world,'observed_wall_losses',{}).get(unit.id,0)
+        if loss>0 and unit.health is not None and unit.health<=loss*2:return 1.5
+        return 2+(unit.level-1)*.1
+    return 1 if unit.kind in {'rocket', 'gatling', 'railgun'} else 3
 
 
 def planned_gate(world):
@@ -122,7 +126,15 @@ def investment_fund(world):
         if actor.backpack is not None:
             held.update(actor.inventory)
     quotes = []
-    for unit in sorted(priority_units(world), key=lambda u: (u.level, u.id)):
+    units = list(priority_units(world))
+    # Funding continues into the wall stage when the weapon stage is prepaid.
+    # A destroyed position still owes its reconstruction upgrade; it must not
+    # become optional cash merely because there is no current building ID.
+    if not getattr(world,'critical_base_ids',()):
+        ids = {u.id for u in units}
+        units += [u for u in world.ours.values() if u.alive and u.kind=='wall'
+                  and u.pos in upgrade_targets(world) and u.level in (1,2) and u.id not in ids]
+    for unit in sorted(units, key=lambda u: (upgrade_rank(world,u),u.level,u.id)):
         prefix = 'Weapon' if unit.kind in {'rocket', 'gatling', 'railgun'} else 'Wall' if unit.kind == 'wall' else 'Station'
         for level in range(unit.level, 3):
             name = f'{prefix}UpgradeVoucher{level}'
@@ -132,11 +144,76 @@ def investment_fund(world):
             price = world.shop.get(name)
             if price is None or price <= 0:
                 return max(0, world.gold or 0), None
-            quotes.append((level, price, name))
+            quotes.append((upgrade_rank(world,unit),level,price,name))
+    observed = {u.pos for u in world.ours.values() if u.alive and u.kind=='wall'}
+    if not getattr(world,'critical_base_ids',()):
+        for point in sorted(upgrade_targets(world)-observed):
+            for level in (1,2):
+                name = f'WallUpgradeVoucher{level}'
+                if held[name]:
+                    held[name] -= 1
+                    continue
+                price = world.shop.get(name)
+                if price is None or price<=0:return max(0,world.gold or 0),None
+                quotes.append((2,level,price,name))
     if not quotes:
         return 0, None
-    _, price, name = min(quotes)
+    _, _, price, name = min(quotes)
     return price, name
+
+
+def pressure_ready(world):
+    """An observed defence milestone, independent of unspent voucher prices."""
+    if not getattr(world,'staged_walls',False):return True
+    if len(world.weapons)!=3 or any(g.level!=3 for g in world.weapons):return False
+    walls = {u.pos:u for u in world.ours.values() if u.alive and u.kind=='wall'}
+    if any(p not in walls or walls[p].level!=3 for p in upgrade_targets(world)):return False
+    missing = set(getattr(world,'wall_targets',()) or ())-walls.keys()
+    gate = planned_gate(world)
+    roster = getattr(world,'night_roster',None)
+    worker = world.ours.get(roster.w) if roster else None
+    if missing:
+        from .day_access import gate as access_gate
+        opening=access_gate(world)
+        clock=getattr(world,'strategy_clock',None)
+        if (missing!={opening} or opening in upgrade_targets(world) or not clock
+                or clock.phases!={'day'} or world.phase_task or not worker
+                or worker.backpack is None or worker.inventory['stone']<1):return False
+        # A deliberate daytime doorway is not an unfunded breach. Verify
+        # personal stone and both return walks before releasing optional cash.
+        from .navigation import distance_field, neighbours
+        from .rules import station_rings
+        from copy import copy
+        import time
+        deadline=time.monotonic()+.01
+        view=copy(world);view.occupied=world.occupied-{u.pos for u in world.movers}
+        blue,_=station_rings(world.task_side_plan['anchor'])
+        entries=(set(neighbours(opening))&blue)-{world.task_side_plan['w']}
+        wwalk=distance_field(view,entries,worker.pos,deadline).get(worker.pos)
+        pioneer=world.ours.get(roster.p)
+        pwalk=(distance_field(view,{world.task_side_plan['w']},pioneer.pos,deadline).get(pioneer.pos)
+               if pioneer and pioneer.alive else None)
+        if (time.monotonic()>=deadline or wwalk is None or pwalk is None
+                or wwalk+pwalk+2+world.strategy_policy.return_buffer>clock.until_night):return False
+    if world.shop.get('WallFixer',0)>0 and (not worker or worker.backpack is None or not worker.inventory['WallFixer']):
+        return False
+    return True
+
+
+def purchase_units(world):
+    """Allow next-stage checkout once weapon purchases are fully funded."""
+    current = priority_units(world)
+    if getattr(world,'critical_base_ids',()):return current
+    held = Counter()
+    for actor in world.movers:
+        if actor.backpack is not None:held.update(actor.inventory)
+    needed = Counter(f'WeaponUpgradeVoucher{level}' for g in world.weapons for level in range(g.level,3))
+    if len(world.weapons)<3 or any(held[n]<count for n,count in needed.items()):return current
+    from .wall_service import pending_targets
+    front = [u for u in world.ours.values() if u.alive and u.kind=='wall'
+             and u.pos in upgrade_targets(world) and u.level in (1,2)]
+    front += pending_targets(world)
+    return front or current
 
 
 def purchase_permitted(world, rules, candidate):
@@ -150,12 +227,13 @@ def purchase_permitted(world, rules, candidate):
     if 'UpgradeVoucher' in name:
         prefix=name.split('UpgradeVoucher')[0]
         allowed={'Weapon' if u.kind in {'rocket','gatling','railgun'} else 'Wall' if u.kind=='wall' else 'Station'
-                 for u in priority_units(world)}
+                 for u in purchase_units(world)}
         return prefix in allowed
     # Genuine treatment can interrupt investment; healthy stock cannot.
     if name=='Medicine' and actor.health <= (200 if actor.kind=='pioneer' else 220)*.5:
         return True
     if name=='WallFixer' and getattr(world,'critical_base_ids',()):return True
+    if name.endswith('SummonOrder') and not pressure_ready(world):return False
     reserve,item=investment_fund(world)
     candidate.gold_reserve=max(candidate.gold_reserve,reserve)
     candidate.gold_reserve_item=item

@@ -92,13 +92,23 @@ def select(world, clock, rules, policy, candidates, deadline, *, task_actor=None
         else:
             checked.append((candidate, check.resources))
 
+    from .fire_budget import deferred_bomb_actors
+    deferred_bombs = deferred_bomb_actors(world, checked)
+    from .robot_targets import opposing
+    work_scale = (2*max((r.health for r in world.robots.values()
+                       if r.alive and not opposing(world,r)),default=0)
+                  if deferred_bombs else 0)
     yielding = movement_yielders(checked) | getattr(world, 'move_yielding', set())
     def admitted(candidate):
+        if (candidate.actor in deferred_bombs and candidate.command.get('action')=='use'
+                and candidate.command.get('name')=='Bomb'):
+            return False
         return candidate.actor not in yielding or candidate.command.get('action') != 'move'
     for candidate, _ in checked:
         if not admitted(candidate):
-            rejected.append({'actor':candidate.actor,'action':'move','verdict':'yielding',
-                             'reason':'stable movement priority; wait for one actor to pass'})
+            rejected.append({'actor':candidate.actor,'action':candidate.command.get('action'),
+                             'verdict':'yielding' if candidate.command.get('action')=='move' else 'deferred_bomb',
+                             'reason':'stable movement priority; wait for one actor to pass' if candidate.command.get('action')=='move' else 'preserve bomb while an exclusive ready gun can fire safely'})
     checked = [(c,r) for c,r in checked if admitted(c)]
 
     if getattr(world, 'forage_contract', None):
@@ -119,7 +129,13 @@ def select(world, clock, rules, policy, candidates, deadline, *, task_actor=None
             if robot is None or not robot.alive:
                 continue
             weight = weights.get(identity, 1.0)
-            total += weight * min(robot.health, amount)
+            progress = min(robot.health, amount)
+            if work_scale:
+                # Reduction in squared remaining health, normalized back to
+                # damage units. In a safe firing window this avoids leaving
+                # one untouched high-health target until all other work ends.
+                progress *= (2*robot.health-progress)/work_scale
+            total += weight * progress
             if amount >= robot.health:
                 total += weight * 12
         # A future control opportunity is counted once across the whole bundle.

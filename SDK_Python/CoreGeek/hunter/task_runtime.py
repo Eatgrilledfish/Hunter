@@ -29,6 +29,16 @@ def _hunter_event(**record):
     elif record.get('error') or isinstance(record.get('status'), int) and record['status'] >= 400:
         _hunter_events[-1] = record  # A late failed page must survive the log cap.
 def _hunter_report():
+    audit=globals().get('HUNTER_STATISTICS_AUDIT')
+    if isinstance(audit,dict):
+        allowed=('field','definition','records_count','pages_complete','raw_time','sort_key','selected_name','output_value')
+        record=dict(kind='statistics_audit',program_report=True,
+            values={k:_hunter_sample(audit[k]) for k in allowed if k in audit})
+        if len(_hunter_events)<4:_hunter_events.append(record)
+        else:
+            # Keep interface errors and the complete paging observation.
+            replace=next((i for i,e in enumerate(_hunter_events) if e.get('kind')=='http' and e.get('status')==200),None)
+            if replace is not None:_hunter_events[replace]=record
     if _hunter_events:
         print('\nHUNTER_RUNTIME:' + _hj.dumps(_hunter_events, ensure_ascii=True), file=_hsys.stderr, flush=True)
 _ha.register(_hunter_report)

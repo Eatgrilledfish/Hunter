@@ -20,6 +20,8 @@ from .external_gate import ExternalGate
 from .night_roles import NightRoster
 from .repair_plan import RepairPlan
 from .repair_supply import RepairSupply
+from .wall_service import WallService
+from .opening_wave import OpeningWave
 from .navigation import neighbours
 from .protocol import pos_json
 
@@ -40,9 +42,14 @@ class Session:
     failed: dict = field(default_factory=dict)
     failed_moves: dict = field(default_factory=dict)
     last_positions: dict = field(default_factory=dict)
+    mover_walk_history: dict = field(default_factory=dict)
     task_approach: dict = field(default_factory=dict)
     wall_observations: dict = field(default_factory=dict)
+    wall_restore_observations: dict = field(default_factory=dict)
+    day_access_choice: dict = field(default_factory=dict)
     robot_observations: dict = field(default_factory=dict)
+    mover_health_observations: dict = field(default_factory=dict)
+    recent_mover_injuries: dict = field(default_factory=dict)
     enemy_memory: dict = field(default_factory=dict)
     news: list = field(default_factory=list)
     feedback_counts: dict = field(default_factory=dict)
@@ -63,6 +70,8 @@ class Session:
     night_roster: NightRoster = field(default_factory=NightRoster)
     repair: RepairPlan = field(default_factory=RepairPlan)
     repair_supply: RepairSupply = field(default_factory=RepairSupply)
+    wall_service: WallService = field(default_factory=WallService)
+    opening_wave: OpeningWave = field(default_factory=OpeningWave)
 
     def task_actor(self, world):
         if not world.phase_task_observed and self.tasks.active:
@@ -82,8 +91,56 @@ class Session:
             self.origin = 0
         clock = Clock(world.round, self.origin)
         world.strategy_clock = clock
+        self.opening_wave.observe(world,clock)
         world.observed_wall_losses = {}
         world.observed_robot_motion = {}
+        world.observed_collect_targets = {}
+        if world.round == self.last_round+1:
+            receipts=obj(world.raw.get('lastRoundRoleActionResults'))
+            for identity,command in self.last_response.get('roleCommandMap',{}).items():
+                points=command.get('targetPos',[])
+                target=position(points[0]) if len(points)==1 else None
+                if command.get('action')=='collect' and receipts.get(identity) is True and target is not None:
+                    world.observed_collect_targets[identity]=target
+        world.observed_mover_cycles = {}
+        histories = {}
+        for actor in world.movers:
+            if not actor.alive:continue
+            command=self.last_response.get('roleCommandMap',{}).get(actor.id,{})
+            points=command.get('targetPos',[])
+            target=position(points[0]) if len(points)==1 else None
+            confirmed=(world.round==self.last_round+1 and command.get('action')=='move'
+                and obj(world.raw.get('lastRoundRoleActionResults')).get(actor.id) is True
+                and target==actor.pos and actor.id in self.last_positions)
+            previous=self.mover_walk_history.get(actor.id,[self.last_positions.get(actor.id)])
+            history=(previous+[actor.pos])[-4:] if confirmed else [actor.pos]
+            histories[actor.id]=history
+            if len(history)==4 and history[0]==history[2] and history[1]==history[3] and history[0]!=history[1]:
+                world.observed_mover_cycles[actor.id]=history[-2]
+        self.mover_walk_history=histories
+        world.observed_mover_losses = {}
+        for u in world.movers:
+            old = self.mover_health_observations.get(u.id)
+            if old and old[0] == world.round-1 and u.alive and old[1] is not None and u.health is not None:
+                world.observed_mover_losses[u.id] = max(0, old[1]-u.health)
+        injuries = {}
+        if clock.phases == {'night'} and world.round == self.last_round+1:
+            for u in world.movers:
+                old = self.mover_health_observations.get(u.id)
+                if not u.alive or not old or old[0] != world.round-1:
+                    continue
+                loss = world.observed_mover_losses.get(u.id,0)
+                previous = self.recent_mover_injuries.get(u.id)
+                if loss:
+                    injuries[u.id] = dict(round=world.round,loss=loss)
+                elif (previous and u.health == old[1]
+                        and 0 <= world.round-previous['round'] <= 2):
+                    injuries[u.id] = previous
+        # This is short-lived injury evidence, not fresh damage. Gaps,
+        # recovery, death and leaving the observed night clear the record.
+        self.recent_mover_injuries = injuries
+        world.recent_mover_injuries = injuries
+        self.mover_health_observations = {u.id:(world.round,u.health) for u in world.movers if u.alive}
         for u in world.ours.values():
             old = self.wall_observations.get(u.id)
             if u.kind == 'wall' and old and old[0] == world.round-1 and old[1] == u.level:
@@ -93,6 +150,28 @@ class Session:
             old = self.robot_observations.get(u.id)
             if old and old[0] == world.round-1:
                 world.observed_robot_motion[u.id] = (u.pos[0]-old[1][0], u.pos[1]-old[1][1])
+        # A confirmed restoration with no visible damage interference must not
+        # trigger another fixer solely because the local max-HP table differs.
+        # This is a restoration receipt, not an inferred new global maximum.
+        self.wall_restore_observations={i:r for i,r in self.wall_restore_observations.items()
+            if i in world.ours and world.ours[i].alive and world.ours[i].level==r['level']
+            and world.ours[i].health is not None and world.ours[i].health>=r['hp']}
+        if world.round==self.last_round+1:
+            feedback=obj(world.raw.get('lastRoundRoleActionResults'))
+            for identity,command in self.last_response.get('roleCommandMap',{}).items():
+                if (command.get('action')!='use' or feedback.get(identity) is not True
+                        or command.get('name') not in ('WallFixer','WallUpgradeVoucher1','WallUpgradeVoucher2')):continue
+                points=command.get('targetPos',[])
+                point=position(points[0]) if len(points)==1 else None
+                wall=next((u for u in world.ours.values() if u.alive and u.kind=='wall' and u.pos==point),None)
+                interference=wall and any(r.alive and (r.attack_range is None or r.attack_power is None
+                    or r.attack_power>0 and distance(r.pos,wall.pos)<=r.attack_range+1) for r in world.robots.values())
+                prior=self.wall_observations.get(wall.id) if wall else None
+                expected=(prior[1]+1 if command['name']!='WallFixer' else prior[1]) if prior else None
+                changed_as_requested=bool(prior and prior[0]==world.round-1 and wall.level==expected)
+                if wall and wall.health is not None and not interference and changed_as_requested:
+                    self.wall_restore_observations[wall.id]=dict(round=world.round,level=wall.level,hp=wall.health)
+        world.wall_restore_observations=self.wall_restore_observations
         self.wall_observations = {u.id:(world.round,u.level,u.health) for u in world.ours.values() if u.kind=='wall' and u.alive}
         self.robot_observations = {u.id:(world.round,u.pos) for u in world.robots.values() if u.alive}
         self.risk.observe(world)

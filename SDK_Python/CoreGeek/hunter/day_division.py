@@ -4,7 +4,7 @@ The tour is a conservative static route, not a prediction of mobile collisions.
 Actual builds still pass LayoutGuard, and actual moves use current occupancy.
 """
 from collections import Counter
-from copy import copy
+from copy import copy, deepcopy
 from dataclasses import dataclass, field
 import time
 from .navigation import distance_field, neighbours, interaction_cells
@@ -23,6 +23,7 @@ class DayDivision:
     gate: tuple | None = None
     building: bool = False
     helper_batches: dict = field(default_factory=dict)
+    helper_clearance: dict = field(default_factory=dict)
 
     @staticmethod
     def reconcile_assistance(world, jobs):
@@ -39,6 +40,7 @@ class DayDivision:
         world.economy_first = False
         world.helper_wall_targets = frozenset()
         world.wall_assistance = {'active': False}
+        world.helper_clearance_commands = {}
         if (not policy.economy_first_enabled or not policy.day_schedule_enabled
                 or not policy.construction_commitment_enabled or not world.build_interior
                 or world.firing_ports or len(world.weapons) != rules.weapon_limit
@@ -54,7 +56,9 @@ class DayDivision:
             self.supplier = self.gate = None
             self.building = False
             self.helper_batches.clear()
-        fixed_gate = planned_gate(world)
+            self.helper_clearance.clear()
+        from .day_access import gate as access_gate
+        fixed_gate = access_gate(world)
         enclosing = getattr(world, "wall_stage", None) != "front10"
         if fixed_gate is not None:
             self.gate = fixed_gate if enclosing else None
@@ -78,6 +82,10 @@ class DayDivision:
         actor = world.ours[self.supplier]
         topology = copy(world)
         topology.occupied = world.occupied - {u.pos for u in world.movers}
+        if defence_duties.enabled(world) and getattr(world,'task_side_plan',None):
+            # Match the caretaker's construction budget: its return tour
+            # cannot consume the pioneer's reserved rotation position.
+            topology.occupied |= {world.task_side_plan['w']}
         ring = rules.build_rule(world, 'wall').cells
         outside = {p for q in ring for p in neighbours(q) if world.inside(p) and p not in ring|world.build_interior}
         enclosing = getattr(world, "wall_stage", None) != "front10"
@@ -130,18 +138,48 @@ class DayDivision:
         if defence_duties.enabled(world):
             deficit = max(0, len(missing)-actor.inventory['stone'])
             rescue = bool(getattr(world, 'critical_base_ids', ()))
-            late = tour is None or tour['steps']+deficit+policy.return_buffer >= clock.until_night
+            material_steps = 0
+            if deficit and tour:
+                start = distance_field(topology, {actor.pos}, actor.pos, deadline)
+                entry = distance_field(topology, {tour['entry']}, actor.pos, deadline)
+                material_steps = min((start[p]+entry[p]+tour['tail']+deficit
+                    for mine in world.zones.get('stone', ())
+                    for p in interaction_cells(topology,[mine],actor.pos) if p in start and p in entry),
+                    default=float('inf'))
+            late = tour is None or max(tour['steps'],material_steps)+policy.return_buffer >= clock.until_night
             if late or rescue or (deficit and other.inventory['stone']) or other.id in self.helper_batches:
                 helper = self.assistance(world,clock,policy,other,missing,ring,job,guard,deadline)
                 if helper:
+                    clearance = self.helper_clearance
+                    if (clearance.get('worker') == actor.id and actor.pos == clearance.get('position')
+                            and clearance.get('last_round') == world.round-1):
+                        home = distance_field(world,defence_duties.stands(world,actor.id),actor.pos,deadline)
+                        if home.get(actor.pos,float('inf'))+policy.return_buffer+1 < clock.until_night:
+                            world.helper_clearance_commands = {actor.id: []}
+                            clearance['last_round'] = world.round
+                        else:
+                            self.helper_clearance.clear()
                     result[other.id] = helper
                     job['stock_target'] -= len(helper['helper_targets'])
                     world.helper_wall_targets = frozenset(helper['helper_targets'])
+                    remaining = missing-world.helper_wall_targets
+                    supplier_tour=self.tour(topology,actor,remaining,ring,deadline,world.occupied) if remaining else None
+                    for name in ('steps','entry','tail','endpoint','end'):
+                        job['construction_'+name]=supplier_tour[name] if supplier_tour else None
+                    if job['target'] in world.helper_wall_targets:
+                        targets = remaining-{self.gate} or remaining
+                        if targets:
+                            job['target'] = min(targets,key=lambda p:(distance(actor.pos,p),p))
+                            job['gate'] = remaining == {self.gate}
+                        else:
+                            result.pop(self.supplier,None)
                     if helper.get('helper_collect'):
                         world.batch_mine_owners = {helper['helper_mine']:other.id}
                     world.wall_assistance = dict(active=True,worker=other.id,target=helper['target'],
                         supplier=self.supplier,deficit=deficit,late=late,critical=rescue,
                         steps=helper['construction_steps'])
+                elif not getattr(world,'ordered_ingress_due',False):
+                    self.clear_helper_corridor(world,clock,policy,actor,other,missing,ring,job,deadline)
             return result
         share = min(other.inventory['stone'], max(0,len(missing)-1))
         if share and not defence_duties.enabled(world):
@@ -168,6 +206,45 @@ class DayDivision:
                 job['stock_target'] -= share
         return result
 
+    def clear_helper_corridor(self, world, clock, policy, worker, helper, missing, ring, job, deadline):
+        """Move the blocking worker first; reserve no build on imagined occupancy."""
+        self.helper_clearance.clear()
+        if (not policy.pioneer_rotation_enabled or not helper.inventory['stone']
+                or any(r.alive for r in world.robots.values())):
+            return
+        blocked = ring | world.build_interior | world.stations[0].cells
+        if helper.pos in blocked:
+            return
+        best = None
+        # Only an adjacent, currently empty step can start this transaction.
+        for point in sorted(neighbours(worker.pos)):
+            if (not world.inside(point) or point in world.occupied
+                    or point in world.navigation_avoided.get(worker.pos,set())):
+                continue
+            if time.monotonic() >= deadline:
+                return
+            preview = copy(world)
+            preview.occupied = (world.occupied-{worker.pos})|{point}
+            trial = deepcopy(self)
+            planned = trial.assistance(preview,clock,policy,helper,missing,ring,job,
+                                       LayoutGuard(preview,deadline),deadline)
+            if not planned or planned.get('helper_collect'):
+                continue
+            home = distance_field(preview,defence_duties.stands(world,worker.id),point,deadline)
+            required = planned['construction_steps']+home.get(point,float('inf'))+policy.return_buffer+1
+            if required >= clock.until_night or time.monotonic() >= deadline:
+                continue
+            rank = (-len(planned['helper_targets']),required,point)
+            if best is None or rank < best[0]:best = (rank,point,planned)
+        if best is not None:
+            _,point,planned = best
+            self.helper_clearance = dict(worker=worker.id,position=point,last_round=world.round)
+            world.helper_clearance_commands = {
+                worker.id:[dict(action='move',targetPos=[pos_json(point)])], helper.id:[]}
+            world.wall_assistance = dict(active=False,reason='await observed worker corridor clearance',
+                worker=helper.id,supplier=worker.id,clearance=list(point),steps=planned['construction_steps'])
+            return
+
     def assistance(self, world, clock, policy, actor, missing, ring, job, guard, deadline):
         """Finish the observed ore batch, then spend personal stone in one tour.
 
@@ -186,7 +263,13 @@ class DayDivision:
         if batch and batch['phase'] == 'build' and not actor.inventory['stone']:
             self.helper_batches.pop(actor.id, None)
             batch = None
-        for target in sorted(missing-{self.gate, job['target']}):
+        supplier = world.ours.get(job.get('supplier'))
+        # A target without personally held material is not an exclusive build
+        # commitment. Keep W's last stone for sealing an enclosing perimeter.
+        gate_stone = int(self.gate in missing)
+        exclusive = {job['target']} if supplier and supplier.inventory['stone'] > gate_stone else set()
+        if batch:exclusive-=set(batch.get('targets',()))
+        for target in sorted(missing-{self.gate}-exclusive):
             if time.monotonic() >= deadline:
                 break
             if target in world.occupied:
@@ -206,7 +289,7 @@ class DayDivision:
                 if not mining:
                     continue
                 required,mine = min(mining)
-            if required+policy.return_buffer <= clock.until_night:
+            if required+2 <= clock.until_night:
                 facing = target in getattr(world,'monster_front_walls',())
                 options.append((not facing,required,target,mine,goals))
         if not options:
@@ -246,11 +329,12 @@ class DayDivision:
         danger = any(r.alive and r.attack_range is not None and distance(actor.pos,r.pos)<=r.attack_range
                      for r in world.robots.values())
         stop = ('danger' if danger else 'capacity' if actor.capacity is not None and len(actor.backpack)>=actor.capacity
-                else 'construction deadline' if required+policy.return_buffer+1>=clock.until_night else None)
+                else 'construction deadline' if required+3>=clock.until_night else None)
         if stop and actor.inventory['stone']:
             batch['phase'] = 'build'
         collect = batch['phase'] == 'harvest' and mine is not None and not danger
         targets = [q for q, _ in timed_targets[:count]]
+        batch['targets']=list(targets)
         if not targets:
             return None
         target = targets[0]

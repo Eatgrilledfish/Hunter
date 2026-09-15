@@ -5,6 +5,7 @@ Income is only a timing estimate until the next observed sale receipt.
 """
 from copy import copy
 from dataclasses import dataclass, field
+from math import ceil
 import time
 
 from . import defence_duties, procurement
@@ -24,6 +25,7 @@ class CaretakerDay:
     last_required: int | None = None
     use_budget: int = 0
     construction_only: bool = False
+    front_rebuild_pending: bool = False
     diagnostic: dict = field(default_factory=dict)
 
     def wall_tour(self, world, actor, missing, ring, rule, deadline):
@@ -37,8 +39,10 @@ class CaretakerDay:
             return set(), None
         planned_stock = actor.inventory['stone'] + (self.phase == 'harvest' and len(actor.backpack) < actor.capacity)
         count = min(len(missing), planned_stock // cost)
-        gate = world.task_side_plan['gate']
-        subset = set(sorted(missing-{gate},key=lambda p:(max(abs(actor.pos[0]-p[0]),abs(actor.pos[1]-p[1])),p))[:count])
+        from .day_access import gate as access_gate
+        gate = None if getattr(world,'wall_stage',None) == 'front10' else access_gate(world)
+        ordered = sorted(missing-{gate},key=lambda p:(max(abs(actor.pos[0]-p[0]),abs(actor.pos[1]-p[1])),p))
+        subset = set(ordered[:count])
         if count == len(missing):
             subset = set(missing)
         if not subset:
@@ -46,6 +50,17 @@ class CaretakerDay:
         topology = copy(world)
         topology.occupied = (world.occupied - {u.pos for u in world.movers}) | {world.task_side_plan['w']}
         tour = DayDivision(gate=gate).tour(topology,actor,subset,ring,deadline,world.occupied)
+        # A teammate may occupy the nearest missing wall. That blocks this
+        # subset, not the material trip for every other unfinished wall.
+        # Keep the same funded work count and validate an alternative tour.
+        if tour is None and count < len(missing):
+            for offset in range(1,len(ordered)):
+                if time.monotonic() >= deadline:break
+                alternative = set((ordered[offset:]+ordered[:offset])[:count])
+                candidate = DayDivision(gate=gate).tour(
+                    topology,actor,alternative,ring,deadline,world.occupied)
+                if candidate is not None:
+                    return alternative,candidate
         return subset,tour
 
     def prepare(self, world, clock, rules, policy, guidance, jobs, excluded, deadline):
@@ -60,7 +75,11 @@ class CaretakerDay:
             self.last_required = None
             self.use_budget = 0
             self.construction_only = False
+            self.front_rebuild_pending = bool(actor.inventory['stone'] and clock.day > 1
+                and set(getattr(world,'monster_front_walls',()))-walls)
         world.caretaker_day_actor = actor.id
+        if getattr(world,'worker_checkout_wait',False) and self.phase in {'close','home'}:
+            self.phase = 'harvest'
         world.caretaker_day_phase = self.phase
         # Generic voucher proposals must not create a second, conflicting
         # worker itinerary. The free-pioneer dispatcher uses its own view.
@@ -68,22 +87,53 @@ class CaretakerDay:
         job = jobs.get(actor.id, {})
         if job and job.get('name') != 'wall':
             return None
-        plan = world.task_side_plan
+        from .day_access import gate as access_gate
+        plan = dict(world.task_side_plan,gate=(None if getattr(world,'wall_stage',None) == 'front10'
+                                              else access_gate(world)))
         _, yellow = station_rings(plan['anchor'])
         missing = set(world.wall_targets or ()) - walls - set(getattr(world,'helper_wall_targets',()))
         rule = rules.build_rule(world, 'wall')
         stone = len(missing) * rule.items.get('stone', 0) if rule else 0
-        stock = {k:max(0, actor.inventory[k] - (stone if k == 'stone' else 0))
+        retained_stone = stone
+        if (clock.day is not None and clock.day<10 and set(world.wall_targets or ())==yellow
+                and missing<={plan['gate']} and len(world.weapons)==rules.weapon_limit
+                and all(u.level==3 for u in world.weapons) and rule):
+            # The daily door consumes personal stone again tomorrow. Keep
+            # already collected surplus instead of selling it and travelling
+            # back to a distant deposit for one stone on each following day.
+            # Current upgrade funding wins over this future material reserve.
+            from .wall_policy import investment_fund
+            price=world.vendor.get('stone',0)
+            other_income=sum(actor.inventory[k]*world.vendor.get(k,0)
+                             for k in MINERALS if k!='stone')
+            cash=max(0,(world.gold or 0)-getattr(world,'treasure_reserved_gold',0))
+            shortfall=max(0,investment_fund(world)[0]-cash-other_income)
+            sell_needed=ceil(shortfall/price) if price>0 else 0
+            future=(10-clock.day)*rule.items.get('stone',0)
+            retained_stone=max(stone,min(stone+future,actor.inventory['stone']-sell_needed))
+        stock = {k:max(0, actor.inventory[k] - (retained_stone if k == 'stone' else 0))
                  for k in MINERALS if world.vendor.get(k, 0) > 0}
         stock = {k:n for k,n in stock.items() if n}
+        # A finished batch is not a finished wall project. Reopen material work
+        # only while gaps assigned to this worker still lack personal stone;
+        # the complete route checks below decide whether another trip fits.
+        if missing and actor.inventory['stone'] < stone and self.phase in {'close','home'}:
+            self.phase = 'harvest'
+            self.construction_only = True
+        if self.construction_only and actor.inventory['stone'] >= stone:
+            # A material commitment ends once its personal stock is observed.
+            # Requote checkout before closure rather than locking the whole day.
+            self.construction_only = False
+            self.phase = 'harvest'
         # Daytime use tours may pass through either side of C. Restricting
         # their starting endpoint to the final front stand can hide a gun
         # behind P's occupied tile and omit its otherwise deliverable coupon.
         # The normal return planner still selects the front stand for night.
         home_cells = defence_duties.stands(world, actor.id)
-        home = distance_field(world, home_cells, actor.pos, deadline,
-                              extra_blocked={plan['w']})
-        margin = policy.return_buffer + (8 if set(world.wall_targets or ()) == yellow else 0)
+        home = distance_field(world, home_cells, actor.pos, deadline)
+        # The wall tour already contains walking, building, entry and closure.
+        # Add the return uncertainty once; P's ingress has its own shared clock.
+        margin = policy.return_buffer + defence_duties.seal_service_steps(world)
         self.diagnostic = dict(left=clock.until_night,missing_walls=len(missing),reserved_stone=stone)
         if (self.phase == 'close' and home.get(actor.pos) is not None
                 and clock.until_night <= home[actor.pos] + policy.return_buffer + 1):
@@ -108,12 +158,30 @@ class CaretakerDay:
                         prefix='Weapon' if target in world.weapons else 'Wall' if target.kind=='wall' else None
                         name=f'{prefix}UpgradeVoucher{target.level}'
                         if prefix and actor.inventory[name]:
-                            immediate.append((prefix!='Weapon',target.id,name,target))
+                            from .wall_policy import upgrade_rank
+                            from .wall_service import service_key,use_permitted
+                            candidate=Candidate(actor.id,dict(action='use',name=name,targetPos=[pos_json(target.pos)]),240,'paid wall service')
+                            if use_permitted(world,candidate):
+                                immediate.append((upgrade_rank(world,target),service_key(world,target),name,target))
                 if immediate:
                     _,_,name,target=min(immediate,key=lambda t:t[:2])
                     return self.finish(world,guidance,jobs,actor,[Candidate(actor.id,
                         dict(action='use',name=name,targetPos=[pos_json(target.pos)]),240,
                         'apply paid adjacent voucher after repair while remaining gaps lack material')],'use')
+            # Repair yesterday's breach with already held stone before starting
+            # a new economic trip. Keep a separate final-seal stone when needed.
+            front_missing = (missing & set(getattr(world,'monster_front_walls',()))) - {plan['gate']}
+            reserve = int(plan['gate'] in missing)
+            if not front_missing:self.front_rebuild_pending = False
+            if self.front_rebuild_pending and front_missing and actor.inventory['stone'] > reserve and job:
+                from .economy import ready_construction
+                emergency_job = dict(job, target=min(front_missing,key=lambda p:(
+                    max(abs(actor.pos[0]-p[0]),abs(actor.pos[1]-p[1])),p)),
+                    defer_build=False,stock_target=actor.inventory['stone']-reserve)
+                choices = ready_construction(world,clock,rules,policy,deadline,jobs={actor.id:emergency_job})
+                if choices and clock.until_night > home.get(actor.pos,float('inf'))+margin+2:
+                    return self.finish(world,guidance,jobs,actor,choices,'rebuild_front',
+                        reason='rebuild observed front breach before new harvesting')
         # The construction planner already budgets every missing wall, walking,
         # final entry and sealing. Add the use tour after that actual endpoint.
         tail = home
@@ -145,7 +213,7 @@ class CaretakerDay:
         # still caps its quantity by the observed balance after receipts.
         from . import supply_basket
         trip_world = copy(world)
-        trip_world.occupied = world.occupied | {plan['w']}
+        trip_world.occupied = world.occupied
         trip = supply_basket.quote(trip_world,actor,clock,rules,policy,deadline,
             home=home,tail=tail,end=end,margin=margin,sale_stock=stock,
             cash=(world.gold or 0)+sum(n*world.vendor[k] for k,n in stock.items()))
@@ -167,7 +235,7 @@ class CaretakerDay:
                     interaction_cells(trip_world,[target['unit'].pos],carrier.pos),carrier.pos,deadline)
             return fields[key]
         ready = [(t['rank'],route(actor,t).get(actor.pos,float('inf')),t['unit'].id,t)
-                 for t in held if t['level']==t['unit'].level]
+                 for t in held if not t.get('pending') and t['level']==t['unit'].level]
         if ready:
             _,length,_,target = min(ready,key=lambda t:t[:3])
             if length != float('inf'):deliveries[actor.id]=(target,length)
@@ -183,8 +251,68 @@ class CaretakerDay:
             self.last_required = required + margin
         self.diagnostic = dict(required=None if required is None else required+margin,
             left=clock.until_night,reserved_stone=stone,use_steps=use_steps,
+            future_gate_stone=max(0,retained_stone-stone),
             missing_walls=len(missing),planned_walls=len(planned_walls),construction_only=self.construction_only,
             basket=dict(trip['orders']) if trip else {})
+        funded_checkout = bool(trip and trip['orders'] and
+            sum(world.shop[name] * amount for name, amount in trip['orders'].items()) <= cash)
+        reopen_checkout = (self.phase == 'close' and not self.construction_only
+            and missing <= {plan['gate']} and funded_checkout
+            and required is not None and required + margin <= clock.until_night
+            and not getattr(world, 'worker_checkout_wait', False))
+        if (self.phase == 'home' or reopen_checkout) and home.get(actor.pos) == 0:
+            # Reaching duty completes the previous trip, not the entire day.
+            # Waiting for the final seal also completes that trip. Reconsider
+            # newly affordable personal stock through the full work circuit.
+            # Re-enter only here; the full circuit proof below prevents an
+            # outbound/return reversal half way through an existing trip.
+            if clock.until_night > margin+2:
+                self.phase = 'harvest'
+        if self.phase in {'harvest','close','use'} and actor.id in deliveries:
+            target,length=deliveries[actor.id]
+            weapon=target['name'].startswith('WeaponUpgradeVoucher')
+            wall=(target['unit'].kind=='wall' and not missing-{plan['gate']})
+            from .wall_policy import priority_units
+            station=(target['unit'].kind=='station' and not missing-{plan['gate']}
+                     and target['unit'].id in {u.id for u in priority_units(world)})
+            if weapon or wall or station:
+                # Paid tiers can need the open passage, including front-wall
+                # corners served from outside. Do not budget them only after
+                # closing the gate, when the same tour may no longer fit.
+                delivery=([entry for entry in held if entry['name'].startswith('WeaponUpgradeVoucher')
+                    and not entry.get('pending') and entry['level']==entry['unit'].level] if weapon else [target])
+                deficit = max(0,stone-actor.inventory['stone'])
+                delivery_tail = home
+                extra_tail = tail.get(actor.pos)
+                if deficit:
+                    # Connect the last coupon use to actual material collection
+                    # and construction, rather than budgeting an empty-handed
+                    # return as though the wall were already funded.
+                    costs = {}
+                    if actor.capacity-len(actor.backpack) >= deficit:
+                        for mine in world.zones.get('stone', ()):
+                            if getattr(world,'batch_mine_owners',{}).get(mine,actor.id)!=actor.id:
+                                continue
+                            for point in interaction_cells(world,[mine],actor.pos) & tail.keys():
+                                costs[point] = deficit + tail[point]
+                    delivery_tail = weighted_field(world,costs,actor,deadline) if costs else {}
+                    extra_tail = 0
+                circuit=supply_basket.use_tour(trip_world,actor,delivery,actor.pos,delivery_tail,deadline)
+                if (circuit is not None and extra_tail is not None
+                        and circuit+extra_tail+margin<=clock.until_night):
+                    choices=([Candidate(actor.id,dict(action='use',name=target['name'],
+                        targetPos=[pos_json(target['unit'].pos)]),240,
+                        'deliver paid weapon before ordinary harvesting and seal' if weapon else
+                        'deliver paid base before final seal' if station else
+                        'deliver paid wall before final seal')]
+                        if not length else DaySchedule.moves(actor,route(actor,target),
+                            'deliver paid weapon while actual daytime passage remains open' if weapon else
+                            'deliver paid base while actual daytime passage remains open' if station else
+                            'deliver paid wall while actual daytime passage remains open'))
+                    return self.finish(world,guidance,jobs,actor,choices,'use')
+        if (self.phase == 'harvest' and missing-{plan['gate']}
+                and actor.inventory['stone'] >= stone and self.front_rebuild_pending):
+            self.phase = 'close'
         if self.phase == 'harvest':
             repairs = getattr(world, 'repair_commands', {}).get(actor.id, [])
             repair_steps = getattr(world, 'day_repair_steps', {}).get(actor.id, 1)
@@ -237,9 +365,38 @@ class CaretakerDay:
                            DaySchedule.moves(actor, distance_field(world, {point}, actor.pos, deadline),
                                              'harvest only inside complete evening circuit budget'))
                 return self.finish(world, guidance, jobs, actor, choices, 'harvest')
+            if (not options and deficit and required is None and not world.phase_task
+                    and len(actor.backpack) < actor.capacity and time.monotonic() < deadline):
+                # A guard at the distant entrance must not prevent the one
+                # material action already available here. This permits no
+                # movement through that guard and claims no completed return.
+                pioneer = world.ours.get(world.night_roster.p)
+                adjacent = [mine for mine in world.zones.get('stone', ())
+                            if actor.pos in interaction_cells(world,[mine],actor.pos)
+                            and getattr(world,'batch_mine_owners',{}).get(mine,actor.id)==actor.id]
+                if adjacent and pioneer and pioneer.alive:
+                    preview = copy(world)
+                    preview.occupied = world.occupied - {pioneer.pos}
+                    back = distance_field(preview,home_cells,actor.pos,deadline).get(actor.pos)
+                    if (back is not None and back + deficit + margin + 2 < clock.until_night
+                            and time.monotonic() < deadline):
+                        command = dict(action='collect',targetPos=[pos_json(min(adjacent))])
+                        return self.finish(world,guidance,jobs,actor,
+                            [Candidate(actor.id,command,240,'collect necessary adjacent stone while entrance clearance is pending')],
+                            'harvest',reason='material collection precedes blocked return')
             if required is None or time.monotonic() >= deadline:
                 return self.finish(world,guidance,jobs,actor,[], 'harvest', reason='wait for an observed complete route')
             self.phase = 'close' if self.construction_only else 'sell'
+        if (self.phase == 'sell' and funded_checkout and checkout is not None
+                and not world.near_zone(actor.pos, 'vendor')
+                and checkout.get(actor.pos, float('inf')) + margin <= clock.until_night):
+            # Sale proceeds are unnecessary for this whole observed basket.
+            # Keep the ore and complete checkout before a distant vendor trip
+            # can consume the time reserved for paid upgrades and the return.
+            self.phase = 'buy'
+            required = checkout[actor.pos]
+            self.last_required = required + margin
+            self.diagnostic.update(required=self.last_required, sale_deferred='basket already funded')
         if self.phase == 'sell':
             if stock and sale is not None and required is not None and required + margin <= clock.until_night:
                 name = max(stock, key=lambda k:(stock[k]*world.vendor[k], k))
@@ -272,6 +429,9 @@ class CaretakerDay:
                 # commitment and re-observe; do not abandon it for early sealing.
                 return self.finish(world,guidance,jobs,actor,[], 'buy', reason='wait for a complete checkout and use route')
             self.phase = 'close'
+        if self.phase=='close' and getattr(world,'worker_checkout_wait',False):
+            return self.finish(world,guidance,jobs,actor,[],'close',
+                reason='no additional complete circuit fits while pioneer checks out')
         if self.phase == 'close' and missing:
             # Actual construction and the pioneer-first gate handshake own
             # funded wall work. Unfunded gaps remain visible in diagnostics.
@@ -280,6 +440,53 @@ class CaretakerDay:
                     DaySchedule.moves(actor, home, 'return before remaining construction can overrun night'),
                     'home', reason='remaining return time insufficient')
             if actor.inventory['stone']:
+                # Follow the complete funded tour used by the time budget.
+                # Replacing it with the cheapest one-wall return on every
+                # frame can leave exterior corners until a second worker is
+                # recalled, despite reserving enough time to build them all.
+                if (tour and planned_walls == missing and actor.inventory['stone'] >= stone
+                        and tour['steps'] + margin <= clock.until_night
+                        and tour['target'] != plan['gate']):
+                    from .layout import LayoutGuard
+                    target, stand = tour['target'], tour['entry']
+                    command = dict(action='build',name='wall',targetPos=[pos_json(target)])
+                    route_world = copy(world)
+                    route_world.occupied = world.occupied | (missing-{plan['gate']})
+                    route = distance_field(route_world,{stand},actor.pos,deadline)
+                    required = route.get(actor.pos,float('inf')) + tour['tail'] + margin
+                    if (required <= clock.until_night and
+                            LayoutGuard(world,deadline).check([Candidate(actor.id,command,240,'funded wall tour')])[0]):
+                        choices = ([Candidate(actor.id,command,240,'complete funded wall tour before partial repairs')]
+                            if actor.pos == stand else DaySchedule.moves(actor,route,
+                                'follow funded wall tour with complete return reserved'))
+                        if choices:
+                            if job:job.update(target=target,defer_build=False)
+                            return self.finish(world,guidance,jobs,actor,choices,'close')
+                # A full perimeter tour may use distant exterior stands. Spend
+                # held material on a reachable front gap when its own build and
+                # observed return fit, without assuming the other gaps close.
+                from .layout import LayoutGuard
+                guard = LayoutGuard(world,deadline)
+                reachable = distance_field(world,{actor.pos},actor.pos,deadline)
+                options = []
+                for target in sorted((missing-{plan['gate']}) & set(getattr(world,'monster_front_walls',()))):
+                    if target in world.occupied:continue
+                    command = dict(action='build',name='wall',targetPos=[pos_json(target)])
+                    if not guard.check([Candidate(actor.id,command,240,'funded front repair')])[0]:continue
+                    after = copy(world)
+                    after.occupied = (world.occupied-{actor.pos})|{target}
+                    for stand in interaction_cells(world,[target],actor.pos) & reachable.keys():
+                        back = distance_field(after,home_cells,stand,deadline)
+                        total = reachable[stand]+1+back.get(stand,float('inf'))+policy.return_buffer
+                        if total <= clock.until_night and time.monotonic()<deadline:
+                            options.append((total,reachable[stand],target,stand,command))
+                if options:
+                    _,length,target,stand,command=min(options)
+                    if job:job.update(target=target,defer_build=False,stock_target=1)
+                    choices=([Candidate(actor.id,command,240,'build funded front gap before returning')]
+                        if not length else DaySchedule.moves(actor,distance_field(world,{stand},actor.pos,deadline),
+                            'approach funded front gap with actual return reserved'))
+                    return self.finish(world,guidance,jobs,actor,choices,'close')
                 choices = DaySchedule.moves(actor, home, 'return before the worker closes the final gap')
                 if missing - {plan['gate']} and job:
                     from .economy import ready_construction
@@ -315,6 +522,7 @@ class CaretakerDay:
                 and home.get(actor.pos,float('inf'))+policy.return_buffer+1 < clock.until_night):
             return self.finish(world,guidance,jobs,actor,[Candidate(actor.id,
                 dict(action='use',name=orders[0]),240,'use personal next-wave order after maintenance')],'use')
+        self.phase='home'
         return self.finish(world, guidance, jobs, actor, DaySchedule.moves(actor, home, 'return to single turret after daily work'), 'home')
 
     def finish(self, world, guidance, jobs, actor, choices, phase, **details):
@@ -343,8 +551,9 @@ class CaretakerDay:
             guidance.funded_actions.pop(actor.id,None)
             guidance.day_actions.pop(actor.id,None)
             guidance.work_plans.pop(actor.id,None)
-            if phase == 'home' and actor.pos in defence_duties.stands(world, actor.id):
-                guidance.work_plans[actor.id] = dict(owner='caretaker_day', phase='home',
+            waiting_for_seal=phase=='close' and jobs.get(actor.id,{}).get('gate') and actor.inventory['stone']>0
+            if (phase == 'home' or waiting_for_seal) and actor.pos in defence_duties.stands(world, actor.id):
+                guidance.work_plans[actor.id] = dict(owner='caretaker_day', phase=phase,
                     commands=[], at_duty=True)
                 self.diagnostic['completed_return'] = True
             else:

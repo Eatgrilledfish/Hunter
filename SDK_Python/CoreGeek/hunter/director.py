@@ -68,6 +68,17 @@ class Directive:
     roster_transit_actions: dict = field(default_factory=dict)
     repair_actions: dict = field(default_factory=dict)
 
+    def treatment_view(self, actor):
+        """Replace only optional economic steps for a proven treatment trip."""
+        view = copy(self)
+        view.medical_actions = {i: actions for i, actions in self.medical_actions.items() if i != actor}
+        for name in ('funded_actions', 'day_actions'):
+            commitments = getattr(self, name)
+            actions = commitments.get(actor, ())
+            if all(command.get('action') in {'move', 'collect', 'sell'} for command in actions):
+                setattr(view, name, {i: commands for i, commands in commitments.items() if i != actor})
+        return view
+
     def permit(self, candidate):
         """A due return is a macro commitment, not a price-dependent bid.
 
@@ -77,6 +88,12 @@ class Directive:
         if self.purchase_permit is not None and not self.purchase_permit(candidate):
             return False
         identity = candidate.command.get('controllerId') if candidate.command.get('action')=='attack' else candidate.actor
+        # A survival planner owns the actor, but cannot override an independently
+        # established lethal destination. Apply this before its exclusive lock.
+        if candidate.command.get('action') == 'move':
+            targets = candidate.command.get('targetPos', [])
+            if len(targets) == 1 and (targets[0].get('x'), targets[0].get('y')) in self.blocked_moves.get(candidate.actor, set()):
+                return False
         if identity in self.survival_actions:
             return candidate.command in self.survival_actions[identity]
         if self.market_permit is not None and not self.market_permit(candidate):
@@ -119,6 +136,12 @@ class Directive:
         if candidate.actor in self.treasure_actions:
             medical = candidate.command['action']=='use' and candidate.command.get('name') in {'Medicine','Bomb','DizzyWeapon'}
             return medical or candidate.command in self.treasure_actions[candidate.actor]
+        if candidate.actor in self.medical_actions:
+            if candidate.command in self.medical_actions[candidate.actor]:
+                return self.treatment_view(candidate.actor).permit(candidate)
+            triage = candidate.command.get('action') == 'use' and candidate.command.get('name') in {'Medicine', 'Bomb', 'DizzyWeapon'}
+            if not triage and not any(candidate is c for c in self.candidates):
+                return False
         if candidate.actor in self.funded_actions:
             medical = candidate.command['action']=='use' and candidate.command.get('name') in {'Medicine','Bomb','DizzyWeapon'}
             return medical or candidate.command in self.funded_actions[candidate.actor]
@@ -575,8 +598,10 @@ def _pioneer_return_due(world, clock, policy, deadline):
         relaxed = copy(world)
         relaxed.occupied = world.occupied-{u.pos for u in world.movers}
         length = distance_field(relaxed,goals-relaxed.occupied,pioneer.pos,deadline).get(pioneer.pos)
+    from .defence_duties import enabled, ingress_reserve
     return (time.monotonic() < deadline and length is not None
-            and clock.until_night <= length+policy.return_buffer+(8 if world.defence_cells else 0))
+            and clock.until_night <= (ingress_reserve(world,policy,length) if enabled(world)
+                else length+policy.return_buffer+(8 if world.defence_cells else 0)))
 
 
 def propose(world, clock, task_actor, task, deadline, policy=None, risk_memory=None, *, failed_steps=None):
@@ -697,6 +722,13 @@ def propose(world, clock, task_actor, task, deadline, policy=None, risk_memory=N
             if actor.pos not in field:
                 continue
             carrying_upgrade = any('UpgradeVoucher' in name and count > 0 for name,count in actor.inventory.items())
+            if (getattr(policy,'pioneer_rotation_enabled',False)
+                    and actor.id == getattr(getattr(world,'night_roster',None),'w',None)
+                    and not getattr(world,'worker_close_requested',False)):
+                # Stock left from yesterday does not make a harvesting worker
+                # an inbound courier. Otherwise P is evicted from a task cell
+                # every other frame while W continues walking elsewhere.
+                carrying_upgrade = False
             if clock.until_night > field[actor.pos]+policy.return_buffer+8 and not carrying_upgrade:
                 continue  # An outbound worker has no current right-of-way to return.
             path, cursor = [], actor.pos
@@ -728,6 +760,22 @@ def propose(world, clock, task_actor, task, deadline, policy=None, risk_memory=N
                         candidate.reason = ("clear gate outward before returning teammate arrives" if outward is not None
                                             else "clear teammate's blocked gate return route")
                     result.return_routes.update(yielding[0]);result.candidates.extend(yielding[1])
+                    # A blocked entrance need not stop a distant returner.
+                    # Approach only the observed empty prefix, stopping before
+                    # the first occupied cell; no teammate move is assumed.
+                    prefix=[]
+                    for point in path:
+                        if point in world.occupied:break
+                        prefix.append(point)
+                    if prefix and actor.id not in result.return_routes:
+                        approach=return_plan(world,clock,{actor.id:prefix[-1]},policy,deadline,
+                                             failed_steps=failed_steps,force_due=True)
+                        if approach is not None:
+                            approach[0][actor.id].update(partial=True,waiting_for=blocker.id)
+                            for candidate in approach[1]:
+                                candidate.reason='approach blocked entrance along observed empty path'
+                            result.return_routes.update(approach[0])
+                            result.candidates.extend(approach[1])
     # Daytime outbound traffic needs the same cooperation as night return.
     # Use a relaxed path only to identify a blocker, then issue a real legal
     # step off that path. Do not dismantle more walls for a temporary role jam.
@@ -742,13 +790,30 @@ def propose(world, clock, task_actor, task, deadline, policy=None, risk_memory=N
         for actor in world.movers:
             if actor.id == task_actor or actor.pos not in blue or actor.pos not in free_field:
                 continue
-            if actor.pos in distance_field(world,outside,actor.pos,deadline):
-                continue
+            actual_field = distance_field(world,outside,actor.pos,deadline)
+            route_field = actual_field if actor.pos in actual_field else free_field
             path, cursor = [], actor.pos
-            while free_field[cursor] > 0:
-                cursor = min((p for p in neighbours(cursor) if p in free_field and free_field[p]<free_field[cursor]),
-                             key=lambda p:(free_field[p],p))
+            while route_field[cursor] > 0:
+                cursor = min((p for p in neighbours(cursor) if p in route_field and route_field[p]<route_field[cursor]),
+                             key=lambda p:(route_field[p],p))
                 path.append(cursor)
+            if actor.pos in actual_field:
+                # A real exterior-only coupon delivery has an open route now.
+                # Do not let an idle teammate's return-to-stand move reoccupy
+                # that route before the carrier has crossed the blue ring.
+                exterior_walls = {tuple(row['pos']) for row in
+                    (getattr(world,'task_side_plan',None) or {}).get('wall_access',())
+                    if row.get('outside_only')}
+                delivering = any(u.alive and u.kind=='wall' and u.pos in exterior_walls
+                    and u.level in (1,2) and actor.inventory[f'WallUpgradeVoucher{u.level}']
+                    for u in world.ours.values())
+                if delivering and not any(r.alive for r in world.robots.values()):
+                    for other in world.movers:
+                        if (other.kind == 'pioneer' and other.id not in (actor.id,task_actor) and other.pos not in path
+                                and not any(n and 'UpgradeVoucher' in name
+                                            for name,n in other.inventory.items())):
+                            result.blocked_moves.setdefault(other.id,set()).update(path)
+                continue
             for blocker in world.movers:
                 if blocker.id == task_actor or blocker.pos not in path:
                     continue
@@ -756,8 +821,14 @@ def propose(world, clock, task_actor, task, deadline, policy=None, risk_memory=N
                     continue  # A delivery must not be pushed back out of the gate.
                 forward = [p for p in neighbours(blocker.pos) if p not in world.occupied
                            and p in free_field and free_field[p] < free_field[blocker.pos]]
-                available = forward or [p for p in neighbours(blocker.pos) if world.inside(p)
-                             and p not in world.occupied and p not in path and p != actor.pos]
+                aside = [p for p in neighbours(blocker.pos) if world.inside(p)
+                         and p not in world.occupied and p not in path and p != actor.pos]
+                # Vacate the courier's path when a real side step exists.
+                # Walking forward along that same path can push a guard into
+                # the gate, where its standby return immediately blocks it again.
+                # Worker substitutes retain their outbound route so revival
+                # does not create a new obstruction at the fixed C stand.
+                available = (aside or forward) if blocker.kind == 'pioneer' else (forward or aside)
                 if not available:
                     continue
                 stand = min(available,key=lambda p:(p not in outside,free_field.get(p,999),p))

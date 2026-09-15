@@ -122,6 +122,12 @@ class SunsetMarket:
                 goals = ({guidance.operator_stands[actor.id]} if actor.id in guidance.operator_stands else set())
                 if actor.kind=='worker':
                     goals,_ = day_endpoints(world,actor,guidance.operator_stands)
+                elif actor.kind=='pioneer' and not goals and not policy.pioneer_defence_enabled:
+                    # Disabling automatic night defence does not remove the
+                    # daytime trader's physical home route.
+                    from .pioneer_trade import home_field
+                    home_fields[actor.id] = home_field(world,actor,deadline)
+                    return home_fields[actor.id]
                 home_fields[actor.id] = distance_field(world,goals,actor.pos,deadline)
             return home_fields[actor.id]
         def circuits(actor, zone, actions):
@@ -237,6 +243,11 @@ class SunsetMarket:
         # strand a fresh batch. Builders can still finish their reserved walls.
         for identity in sorted(self.settled-set(rows)-set(excluded)-({buyer.id} if buyer else set())):
             if getattr(world,'task_side_plan',None) and identity==world.night_roster.m:continue
+            # The due route already prevents restarting economic work. Its
+            # gate staging/yield destination can differ from day_endpoints;
+            # an empty market home lock must not cancel that real movement.
+            if guidance.return_routes.get(identity,{}).get('due'):
+                continue
             actor=world.ours.get(identity)
             if (actor and actor.alive and actor.kind=='worker'
                     and not any('UpgradeVoucher' in k and n for k,n in actor.inventory.items())):

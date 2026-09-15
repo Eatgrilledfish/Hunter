@@ -47,6 +47,30 @@ def propose(world, clock, deadline, trapped=False):
                   nearest=min((distance(actor.pos,r.pos) for r in threats),default=None),
                   in_range=sum(distance(actor.pos,r.pos)<=r.attack_range for r in known),
                   motion_scenario=bool(closing))
+    # Recent confirmed injury makes the immediate range edge a poor place
+    # to stop, even when a pursuing robot pauses for one observation. The
+    # short-lived record never changes the current damage observation.
+    hit = getattr(world,'observed_mover_losses',{}).get(actor.id,0)
+    injury = getattr(world,'recent_mover_injuries',{}).get(actor.id)
+    edge = [r for r in known if r.attack_power > 0
+            and distance(actor.pos,r.pos) == r.attack_range+1]
+    if ((hit > 0 or injury) and actor.health <= 110 and not actor.inventory['Medicine']
+            and not current and not unknown and edge):
+        choices=[]
+        for q in neighbours(actor.pos):
+            if time.monotonic() >= deadline:break
+            if (not world.inside(q) or q in world.occupied or q in interior
+                    or q in world.navigation_avoided.get(actor.pos,())):continue
+            if all(min(distance(q,r.pos),distance(q,projected(r,1))) > r.attack_range+1
+                   for r in known if r.attack_power > 0):
+                choices.append(q)
+        if choices:
+            point=min(choices)
+            return [Candidate(actor.id,dict(action='move',targetPos=[pos_json(point)]),1200,
+                'exterior survival: clear pursuit edge after observed injury')],dict(
+                report,status='post_hit_clearance',actor=actor.id,observed_loss=hit,
+                injury_age=world.round-injury['round'] if injury else 0,
+                decision='move',to=point,precaution=True)
     if not current and not uncertain(actor.pos) and not closing and not trapped:
         return [], dict(report,status='no observed need to retreat')
     if time.monotonic() >= deadline:
@@ -65,6 +89,10 @@ def propose(world, clock, deadline, trapped=False):
                     break
                 if (not world.inside(point) or point in blocked or uncertain(point)
                         or point in path or point in avoided.get(origin, ())):
+                    continue
+                # A lower three-step total is useless if its first step is
+                # already lethal under one observed attack opportunity.
+                if not path and damage(point,1)/2 >= actor.health:
                     continue
                 route = path+(point,)
                 total = loss+damage(point,depth+1)
@@ -97,13 +125,27 @@ def propose(world, clock, deadline, trapped=False):
                 break
             for q in neighbours(point):
                 if not world.inside(q) or q in blocked or uncertain(q) or q in avoided.get(point,()):continue
+                if not path and damage(q,1)/2 >= actor.health:continue
                 cost = (loss+damage(q),steps+1)
                 if cost < best.get(q,(float('inf'),0)):
                     best[q]=cost
                     heapq.heappush(queue,(*cost,q,path+(q,)))
         if not ranked:
+            if actor.inventory['Medicine'] and actor.health < 220 and damage(actor.pos,1) < 220:
+                return [Candidate(actor.id,dict(action='use',name='Medicine'),1200,
+                    'exterior survival: restore HP when no survivable first step exists')],dict(
+                    report,status='treat_before_escape',actor=actor.id,decision='Medicine')
             return [], dict(report,status='no improving legal exterior route')
-    score,first,_,_,route,total = min(ranked)
+    # Preserve exposure, immediate risk and escape-exit ordering. Only tied
+    # routes prefer observed staffed fire coverage, so a pursuing robot is
+    # less likely to be led away from the defenders' usable weapons.
+    staffed = [g for g in world.weapons if g.attack_range is not None and
+        any(i in world.ours and world.ours[i].alive and distance(world.ours[i].pos,g.pos)<=1
+            for i in world.night_defenders)]
+    def support(row):
+        return sum(distance(g.pos,row[4][-1]) <= g.attack_range for g in staffed)
+    score,first,_,_,route,total = min(
+        ranked,key=lambda r:(r[0],r[1],r[2],-support(r),r[3],r[4]))
     # A strictly safer legal step wins over an independent high-scoring heal.
     # If even the first step exceeds current HP but a carried dose improves the
     # stationary scenario, permit healing as the one survival action instead.

@@ -29,11 +29,12 @@ def valid_seal(world, builds):
     plan = getattr(world,'task_side_plan',None)
     if permit.get('ordered'):
         from .defence_duties import enabled, rotator
+        from .day_access import gate as access_gate
         rotation = world.ours.get(permit.get('rotator'))
         return bool(enabled(world) and w and w.alive and w.kind=='worker' and actor==w.id
             and rotation and rotation.alive and rotation.id==rotator(world) and rotation.id!=w.id
             and rotation.pos==plan['w'] and w.pos in blue and distance(w.pos,target)==1
-            and w.inventory['stone']>=1 and target==plan['gate'] and target not in world.occupied
+            and w.inventory['stone']>=1 and target==access_gate(world) and target not in world.occupied
             and all(u.id in world.night_defenders or u.pos not in blue|yellow|world.stations[0].cells
                     for u in world.movers)
             and not any(u.alive and u.pos in blue|world.stations[0].cells for u in world.robots.values())
@@ -68,6 +69,7 @@ class ExternalGate:
     inner_backup: bool = False
     cashout_day: int | None = None
     cashout_done: bool = False
+    cashout_loop_avoid: tuple | None = None
     cashout_committed: bool = False
     cashout_report: dict = field(default_factory=dict)
     mining_report: dict = field(default_factory=dict)
@@ -80,6 +82,10 @@ class ExternalGate:
     firearms: dict = field(default_factory=dict)
     diagnostic: dict = field(default_factory=dict)
     deferred_night: bool = False
+    interior_clearance_day: int | None = None
+    miner_exit_clearer: str | None = None
+    pioneer_exit_clearance_day: int | None = None
+    pioneer_return_clearance_day: int | None = None
     gate_assignment: dict = field(default_factory=dict)
     gate_offer: dict = field(default_factory=dict)
     gate_before: dict = field(default_factory=dict)
@@ -136,7 +142,7 @@ class ExternalGate:
         from .defence_duties import enabled
         if enabled(world):
             from .worker_gate import prepare
-            return prepare(self,world,clock,rules,policy,deadline)
+            return prepare(self,world,clock,rules,policy,deadline,task_busy=task_busy)
         candidates=self._cycle(world,clock,rules,policy,deadline,task_busy,plan,
                                defer_regular_night=defer_regular_night)
         if clock.phases=={'day'} and not task_busy:
@@ -158,6 +164,27 @@ class ExternalGate:
 
     def _independent_work(self,world,clock,rules,policy,deadline,candidates):
         if self.emergency_active:return candidates
+        # Preserve a real joint service decision, not a blanket recall caused
+        # by a guard-health threshold or an unmodelled external task.
+        if clock.phases == {'night'} and not policy.pioneer_rotation_enabled:
+            if getattr(world,'forage_contract',None):return candidates
+            plan=world.task_side_plan;roster=world.night_roster
+            w,p=(world.ours.get(i) for i in (roster.w,roster.p))
+            if not (w and p and w.alive and p.alive and w.pos==plan['w']
+                    and p.pos in plan['c_stands']):return candidates
+            _,yellow=station_rings(plan['anchor'])
+            walls={u.pos:u for u in world.ours.values() if u.alive and u.kind=='wall' and u.pos in yellow}
+            from .repair_plan import pressure
+            for wall in walls.values():
+                maximum=rules.max_health.get('wall',{}).get(wall.level)
+                hit=pressure(world,wall)
+                if maximum is None or wall.health*10<maximum*3 or hit is not None and hit>=wall.health:
+                    return candidates
+            admission=self.diagnostic.get('admission',{})
+            if (yellow-{plan['gate']}<=walls.keys()
+                    and admission.get('reason')!='guards unavailable'
+                    and self.stage!='SEAL_FAILED'):
+                return candidates
         if clock.phases=={'day'}:
             _,yellow=station_rings(world.task_side_plan['anchor'])
             walls={u.pos for u in world.ours.values() if u.alive and u.kind=='wall'}
@@ -574,7 +601,24 @@ class ExternalGate:
                 world.night_economy_active=True
                 remaining=min(130-(world.round-o)%130 for o in clock.offsets)
                 self.stage='RETURN_TO_GATE'
-                if (policy.night_foraging_enabled and not self.return_committed and (gate in walls or open_exit is not None) and guard_ok and safe and admission['allowed']
+                # Already at a valid exterior return cell: a stationary sale
+                # consumes no return movement and must not start another trip.
+                # Keep the ordinary guard-service and observed-price checks.
+                stock=self._saleable(world,m,reserve_gate=clock.day<10)
+                if (policy.night_foraging_enabled and home[m.pos]==0
+                        and (self.return_committed or remaining<=1+policy.return_buffer)
+                        and world.near_zone(m.pos,'vendor') and stock
+                        and (len(m.backpack)>=m.capacity or not options or clock.day==10
+                             or remaining<=1+policy.return_buffer)
+                        and (gate in walls or open_exit is not None)
+                        and guard_ok and safe and admission['allowed']):
+                    name=max(stock,key=lambda k:(stock[k]*world.vendor[k],k))
+                    command={'action':'sell','name':name,'num':stock[name]}
+                    self.stage='NIGHT_CASHOUT'
+                    self.cashout_committed=True;self.return_committed=False
+                    self.cashout_report=dict(status='sell at observed return cell',required=1,
+                        remaining=remaining,quoted_stock_value=sum(n*world.vendor[k] for k,n in stock.items()))
+                elif (policy.night_foraging_enabled and not self.return_committed and (gate in walls or open_exit is not None) and guard_ok and safe and admission['allowed']
                         and m.capacity and m.backpack is not None):
                     saleable=self._saleable(world,m,reserve_gate=clock.day<10)
                     if not saleable:self.cashout_committed=False

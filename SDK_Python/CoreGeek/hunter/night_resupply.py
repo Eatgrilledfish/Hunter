@@ -47,18 +47,38 @@ def propose(world, clock, rules, policy, actor, blocked, deadline):
         if (actor.inventory['Medicine'] or len(actor.backpack)>=actor.capacity
                 or not 0<world.shop.get('Medicine',0)<=world.gold-data['reserve']):
             return None
-        choices=sorted((reach[p],p) for p in shops if reach[p]+1<=remaining)
+        medical_view = view
+        medical_reach = reach
+        medical_shops = shops
+        if actor.health <= 110 and not world.near_zone(actor.pos,'weaponShop'):
+            # A treatment route must not repeatedly skim the attack boundary
+            # while the patient cannot afford pursuit. One tile is a planning
+            # precaution, not an assumed robot movement rule.
+            from .robot_threats import active
+            medical_view = copy(view)
+            medical_view.occupied = set(view.occupied)
+            for robot in active(world):
+                if robot.attack_range is None or robot.attack_power is None:return None
+                if robot.attack_power <= 0:continue
+                radius = robot.attack_range + 1
+                medical_view.occupied.update((x,y)
+                    for x in range(max(0,robot.pos[0]-radius),min(world.width,robot.pos[0]+radius+1))
+                    for y in range(max(0,robot.pos[1]-radius),min(world.height,robot.pos[1]+radius+1)))
+            medical_view.occupied.discard(actor.pos)
+            medical_reach = distance_field(medical_view,{actor.pos},actor.pos,deadline)
+            medical_shops = interaction_cells(medical_view,world.zones.get('weaponShop',()),actor.pos) & medical_reach.keys()
+        choices=sorted((medical_reach[p],p) for p in medical_shops if medical_reach[p]+1<=remaining)
         if not choices:return None
         _,shop=choices[0]
         command=(dict(action='buy',name='Medicine',num=1) if actor.pos==shop else
-                 move(distance_field(view,{shop},actor.pos,deadline)))
+                 move(distance_field(medical_view,{shop},actor.pos,deadline)))
         if command and time.monotonic()<deadline:
             return offer(command,'NIGHT_UPGRADE_BUY',item='Medicine',quantity=1,shop=shop)
         return None
     if policy.medical_supply_enabled and actor.health*2<=220:
         treatment=personal_dose()
         if treatment:return treatment
-    held = [r for r in data['held'] if r['unit'] is not None and r['level']==r['unit'].level
+    held = [r for r in data['held'] if not r.get('pending') and r['unit'] is not None and r['level']==r['unit'].level
             and actor.pos in field(r['unit'])]
     held.sort(key=lambda r:(field(r['unit'])[actor.pos] != 0, r['rank'], field(r['unit'])[actor.pos],r['unit'].id))
     # Actually usable stock wins immediately; elsewhere finish checkout before
@@ -100,7 +120,9 @@ def propose(world, clock, rules, policy, actor, blocked, deadline):
         count=min(count,actor.capacity-len(actor.backpack),(world.gold-data['reserve'])//world.shop[name])
         command=(dict(action='buy',name=name,num=count) if actor.pos==shop else move(route))
         if count>0 and command and time.monotonic()<deadline:
-            return offer(command,'NIGHT_UPGRADE_BUY',item=name,quantity=count,shop=shop)
+            return offer(command,'NIGHT_UPGRADE_BUY',item=name,quantity=count,shop=shop,
+                         delivery_steps=reach[shop]+1+use_steps+policy.return_buffer,
+                         night_remaining=remaining)
     if held and time.monotonic()<deadline:
         entry=held[0];command=move(field(entry['unit']))
         if command:return offer(command,'NIGHT_UPGRADE_DELIVER',target=entry['unit'].id,item=entry['name'])
@@ -141,10 +163,20 @@ def propose(world, clock, rules, policy, actor, blocked, deadline):
     if wants_medicine and world.shop.get('Medicine',0)>0:prices.append(world.shop['Medicine'])
     stock={k:actor.inventory[k] for k in ('iron','copper','stone') if world.vendor.get(k,0)>0 and actor.inventory[k]}
     if 'stone' in stock:
-        missing=len(set(getattr(world,'wall_targets',()))-{u.pos for u in world.ours.values() if u.alive and u.kind=='wall'})
-        stock['stone']=max(0,stock['stone']-max(1,missing))
+        # Night material work already prepares the next full ring. Selling
+        # against day one's front10 target would liquidate that same stock.
+        targets=yellow if getattr(world,'staged_walls',False) else set(getattr(world,'wall_targets',()))
+        missing=len(targets-{u.pos for u in world.ours.values() if u.alive and u.kind=='wall'})
+        worker=world.ours.get(world.night_roster.w)
+        worker_stock=worker.inventory['stone'] if worker and worker.backpack is not None else 0
+        rule=rules.build_rule(world,'wall')
+        stone_cost=rule.items.get('stone',0) if rule else 0
+        reserve=max(0,missing*stone_cost-worker_stock,stone_cost-worker_stock if clock.day<10 else 0)
+        stock['stone']=max(0,stock['stone']-reserve)
         if not stock['stone']:stock.pop('stone')
     vendors=interaction_cells(view,world.zones.get('vendor',()),actor.pos)&reach.keys()
+    if clock.day>=10:
+        vendors={p for p in vendors if reach[p]+1<=remaining}
     value=sum(n*world.vendor[k] for k,n in stock.items())
     useful_sale = bool(prices and (any(world.gold < p <= world.gold+value for p in prices)
                                   or value>=min(prices)))

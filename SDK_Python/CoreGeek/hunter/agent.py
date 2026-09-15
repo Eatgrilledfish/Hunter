@@ -13,6 +13,7 @@ from .protocol import parse_request, fingerprint, empty_response, validate_respo
 from .rules import Rules, Policy, Clock
 from .state import Session
 from .duty_budget import DutyBudget
+from . import defence_duties
 
 LOG = logging.getLogger("hunter")
 
@@ -114,12 +115,21 @@ class Agent:
             world.duty_budget = DutyBudget(start+self.policy.planning_seconds)
             draft.night_roster.prepare(world)
             world.night_foraging_enabled=self.policy.night_foraging_enabled
+            from . import day_access
+            day_access.prepare(world,clock,min(start+self.policy.planning_seconds,time.monotonic()+.025),draft.day_access_choice)
             economy.prepare_wall_cycle(world, clock, self.rules, self.policy)
+            draft.wall_service.prepare(world)
             daily = draft.sunset_market.caretaker_day
+            worker=draft.night_roster.w
+            worker_unit=world.ours.get(worker)
+            paid_weapon_delivery=bool(worker_unit and any(n and name.startswith('WeaponUpgradeVoucher')
+                for name,n in worker_unit.inventory.items()))
             world.worker_close_requested = bool(self.policy.pioneer_rotation_enabled
-                and daily.day == clock.day and daily.phase in {'close','use'}
+                and daily.day == clock.day and daily.phase in {'close','use'} and not paid_weapon_delivery
                 and not (world.phase_task or draft.tasks.active or draft.tasks.accept_pending))
             world.worker_upgrade_use_steps = daily.use_budget if world.worker_close_requested else 0
+            world.worker_material_return = bool(daily.day == clock.day
+                and daily.phase == 'home' and daily.construction_only)
             gate_candidates=world.duty_budget.run('gate', lambda budget_end: draft.external_gate.prepare(
                 world,clock,self.rules,self.policy,budget_end,
                 task_busy=bool(task_actor or draft.tasks.active or draft.tasks.accept_pending),defer_regular_night=True),
@@ -136,41 +146,46 @@ class Agent:
                     world.night_forage_commands.pop(identity,None)
             build_jobs = economy.construction_jobs(world, self.rules, self.policy)
             build_jobs = draft.day_schedule.division.assign(world,clock,self.rules,self.policy,build_jobs,time.monotonic()+.25)
+            from .arbitration import Candidate
+            clearance = getattr(world,'helper_clearance_commands',{})
+            if clearance and not any(i in draft.external_gate.commands for i in clearance):
+                for identity, commands in clearance.items():
+                    draft.external_gate.commands[identity] = commands
+                    gate_candidates.extend(Candidate(identity,command,1100,'clear exterior wall helper corridor')
+                                           for command in commands)
+            else:
+                draft.day_schedule.division.helper_clearance.clear()
             if draft.external_gate.commands:
                 build_jobs={i:j for i,j in build_jobs.items() if i not in draft.external_gate.commands}
             draft.day_schedule.division.reconcile_assistance(world,build_jobs)
+            draft.wall_service.assign(world,clock,build_jobs)
             immediate = draft.filter_failures(economy.immediate(world, self.rules, task_actor, jobs=build_jobs, policy=self.policy), world.round)
+            from .wall_service import build_permitted, use_permitted
+            immediate=[candidate for candidate in immediate
+                       if build_permitted(world,candidate) and use_permitted(world,candidate)]
             incumbent = self._base(world, clock, task_actor, immediate)
             fallback = incumbent.response
             candidates = list(immediate)
             deadline = start + self.policy.planning_seconds
             task_choice = task_schedule.choose(world,clock,self.policy,min(deadline,time.monotonic()+.04),draft.tasks.timing)
             if (self.policy.pioneer_rotation_enabled and clock.phases=={'day'} and task_choice
-                    and task_choice.get('selected') and not draft.tasks.active and not draft.tasks.accept_pending):
-                selected=task_choice['selected'];offer=selected.get('task',{})
-                waiting=offer.get('isValid') is not True or offer.get('coldDownRounds',0)>0
-                demands,rank,restricted,_=economy.procurement.upgrade_demand(world,self.policy,rules=self.rules)
-                funded=any((not restricted or d['rank']==rank) and d['name'] in world.shop
-                    and (world.gold or 0)>=world.shop[d['name']] for d in demands.values())
-                if waiting and not funded:
-                    from .supply_basket import requirements
-                    funded=any(0 < world.shop.get(r['name'],0) <= (world.gold or 0)
-                               for r in requirements(world,self.rules,self.policy))
-                    actor=world.ours.get(task_choice['actor'])
-                    funded |= bool(actor and actor.backpack is not None and actor.capacity is not None
-                        and len(actor.backpack)<actor.capacity and any(
-                            actor.inventory[name]<limit and 0 < world.shop.get(name,0) <= (world.gold or 0)
-                            for name,limit in (('Medicine',1 if self.policy.medical_stock_enabled else 2),('Bomb',60))))
-                if draft.sunset_market.upgrade_owner==task_choice['actor'] or waiting and funded:
-                    task_choice=dict(actor=task_choice['actor'],selected=None,candidates=[],
-                        reason='funded upgrade checkout precedes waiting for a future task')
+                    and task_choice.get('selected') and not draft.tasks.active and not draft.tasks.accept_pending
+                    and draft.sunset_market.upgrade_owner in (None,task_choice['actor'])):
+                actor=world.ours[task_choice['actor']]
+                committed=draft.sunset_market.upgrade_owner==actor.id
+                if task_schedule.checkout_before_task(world,clock,self.rules,self.policy,
+                        task_choice['selected'],actor,committed,min(deadline,time.monotonic()+.04)):
+                    task_choice=dict(actor=actor.id,selected=None,candidates=[],
+                        reason='verified checkout and delivery fits before selected task')
             from .night_roles import admit_task_departure
             task_choice = world.duty_budget.run('task_handoff', lambda budget_end:
                 admit_task_departure(world, clock, task_choice, budget_end), min(deadline,time.monotonic()+.02))
             guidance = director.propose(world, clock, task_actor, draft.tasks.active, min(deadline, time.monotonic()+0.12), self.policy, draft.risk,
                                         failed_steps=draft.failed_move_steps(world) if self.policy.return_detour_enabled else None)
             from .wall_policy import purchase_permitted
-            guidance.purchase_permit = lambda candidate: purchase_permitted(world,self.rules,candidate)
+            from .wall_service import use_permitted
+            guidance.purchase_permit = lambda candidate: (purchase_permitted(world,self.rules,candidate)
+                and use_permitted(world,candidate) and build_permitted(world,candidate))
             from . import return_recovery
             recovery_moves, return_recovery_report = return_recovery.propose(
                 world,clock,self.policy,min(deadline,time.monotonic()+.04))
@@ -353,9 +368,15 @@ class Agent:
                 world.pioneer_trade_stands = guidance.operator_stands
                 treasure = draft.intelligence.candidates(world,clock,self.policy,min(deadline,time.monotonic()+.15))
                 treasure = [c for c in draft.filter_failures(treasure,world.round) if guidance.permit(c)]
+                task_reserved = bool(task_choice and task_choice.get('selected'))
+                if task_reserved:
+                    # The bounded task plan has a stated score and deadline.
+                    # Treasure observation still runs, but must not erase that
+                    # feasible plan or reserve its funds for an unknown payoff.
+                    treasure = []
                 report = draft.intelligence.diagnostic
                 identity = report.get('actor')
-                waiting = (report.get('stage')=='wait_open' and identity not in guidance.work_plans
+                waiting = (not task_reserved and report.get('stage')=='wait_open' and identity not in guidance.work_plans
                            and identity not in clearing_ids
                            and identity not in guidance.roster_transit_actions
                            and identity not in draft.external_gate.commands
@@ -492,9 +513,15 @@ class Agent:
                 excluded.add(draft.tasks.accept_pending.get('actor'))
             medical = draft.medical.candidates(world, clock, self.rules, self.policy,
                                                min(deadline, time.monotonic()+0.08), guidance, excluded)
-            medical = [c for c in draft.filter_failures(medical, world.round) if guidance.permit(c)]
+            medical = draft.filter_failures(medical, world.round)
+            # A validated treatment trip supersedes optional economic steps.
+            # Register its exact commands before rechecking final permissions.
             for candidate in medical:
                 guidance.medical_actions.setdefault(candidate.actor, []).append(candidate.command)
+            medical = [c for c in medical if guidance.permit(c)]
+            guidance.medical_actions = {
+                identity: [c.command for c in medical if c.actor == identity]
+                for identity in {c.actor for c in medical}}
             candidates.extend(medical)
             supply = world.duty_budget.run('repair_supply', lambda budget_end: draft.repair_supply.candidates(
                 world, clock, self.rules, self.policy, budget_end, guidance,
@@ -665,6 +692,9 @@ class Agent:
                       "work_plans":guidance.work_plans,
                       "repair":draft.repair.diagnostic,
                       "repair_supply":draft.repair_supply.diagnostic,
+                      "wall_service":{f'{p[0]},{p[1]}':v for p,v in draft.wall_service.sites.items()},
+                      "caretaker_stand":defence_duties.service_diagnostic(world,guidance.operator_stands),
+                      "day_access":world.access_diagnostic,
                       "night_roster": {"w":draft.night_roster.w, "p":draft.night_roster.p,
                           "m":draft.night_roster.m, "defenders":sorted(world.night_defenders),
                           "substituting":draft.night_roster.substituting,

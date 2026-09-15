@@ -38,8 +38,10 @@ def statistics_review(task, answer_only=False):
         'execution':'用简短程序一次完成分页、断言、统计；同题已有完整计算结果时直接提交，不要重复查询。最终 stdout 只输出题目要求的一个完整 JSON 对象；不能夹杂调试、首页响应或说明文字，否则无法提取答案。计算最终答案时必须在cmd同级加 submit_output:true，省去最后一次模型往返。统计缺字段应明确失败。',
         'feedback':'收到官方某字段不符时，定位该字段的记录和转换逻辑并重新运行；保留其他实际计算值，不凭记忆改答案。',
         'coverage':'temporal_value_counts 为有界当前执行观察，标记 partial；须由程序根据实际分页确认全部数据。'}
+    result['audit']='统计程序计算完成后，将本次计算的 field、definition、records_count、pages_complete、raw_time、sort_key、selected_name、output_value 写入全局字典 HUNTER_STATISTICS_AUDIT；值必须来自当前题目和实际计算，不填猜测值。运行包装器会单独记录它，不要自行打印审计字典。它是程序的自报依据，不代替完整数据断言；stdout 仍只输出题目答案。'
     if answer_only:
         result.pop('execution')
+        result.pop('audit')
         result['feedback'] = '现在只可根据当前已观察的执行结果修正并提交。不能请求重新运行或提出代码计划。'
         result['coverage'] = '检查当前执行观察是否覆盖全部记录；不能从首页或采样记录猜测完整统计。'
     return result

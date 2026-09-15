@@ -81,6 +81,17 @@ def candidates(world, clock, policy, plans, deadline):
             continue
         # No affordable observed equipment is a reason to rejoin the battery,
         # not to wait forever at a vanished task point or an empty shop.
+        # An idle return must not occupy an unbuilt gun site that a worker is
+        # approaching. Otherwise site clearance and this return can alternate
+        # forever, outbidding construction on every frame the site is free.
+        battery = getattr(world, 'battery_plan', None)
+        if battery:
+            from copy import copy
+            pending = {p for _, p in battery['slots']} - {g.pos for g in world.weapons}
+            if pending:
+                topology = copy(world)
+                topology.occupied = world.occupied | pending
+                home = home_field(topology, actor, deadline)
         result.extend(_moves(actor, home, 'pioneer merchant returns to duty while no funded trade is available'))
     return result
 

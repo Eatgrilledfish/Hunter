@@ -46,6 +46,8 @@ def prepare_wall_cycle(world, clock, rules, policy=None):
     # Reserve only imminent, actually funded work. Reserving the whole future
     # ring changes long-distance return budgets before any wall can be built.
     missing = set(battery.missing_walls(world,rules))
+    access_gap=getattr(world,'active_access_gap',None)
+    if access_gap is not None:missing.discard(access_gap)
     if (len(missing)==1 and getattr(world,"wall_stage",None)!="front10" and not world.seal_cells
             and (planned_gate(world) is None or planned_gate(world) in missing)):
         missing.clear()  # The deliberately open daytime gate is not ready for construction.

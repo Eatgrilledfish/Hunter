@@ -55,15 +55,18 @@ def prepare(market, world, clock, rules, policy, guidance, jobs, excluded, deadl
                      if world.near_zone(actor.pos,'weaponShop') else DaySchedule.moves(actor,trip['checkout'],'free guard goes directly to weapon shop'))
             stage='upgrade_procure'
         else:
-            ready=[r for r in trip['held'] if r['level']==r['unit'].level]
+            ready=[r for r in trip['held'] if not r.get('pending') and r['level']==r['unit'].level]
             targets=[]
             for req in ready:
                 use=interaction_cells(view,[req['unit'].pos],actor.pos)
                 route=weighted_field(view,{p:home[p]+1 for p in use if p in home},actor,deadline)
-                if route and route.get(actor.pos,float('inf'))+policy.return_buffer < clock.until_night:
-                    targets.append((req['rank'],route[actor.pos],req['unit'].id,req,route))
+                if route and route.get(actor.pos,float('inf'))+policy.return_buffer <= clock.until_night:
+                    targets.append((req['rank'],actor.pos not in use,route[actor.pos],req['unit'].id,req,route))
             if targets:
-                _,_,_,req,route=min(targets,key=lambda t:t[:3]);item=req['name'];num=1
+                # The quoted tour applies nearby coupons on the way home.
+                # Do not pass an equally ranked, already adjacent target just
+                # because a different target is closer to the final duty stand.
+                _,_,_,_,req,route=min(targets,key=lambda t:t[:4]);item=req['name'];num=1
                 choices=([Candidate(actor.id,dict(action='use',name=item,targetPos=[pos_json(req['unit'].pos)]),240,
                                     'apply held coupon at its observed current level')]
                          if actor.pos in interaction_cells(view,[req['unit'].pos],actor.pos)

@@ -378,6 +378,8 @@ class Diagnostics(logging.Handler):
                 sent=pending['round'], consecutive=number==pending['round']+1,
                 accepted=feedback.get(pending['actor']) if number==pending['round']+1 else None,
                 hp_after=target.get('health'),level_after=target.get('level'),
+                target_id=pending.get('target'),target_pos=target.get('pos'),target_type=target.get('roleType'),
+                configured_max_hp=getattr(self,'max_health',{}).get(target.get('roleType'),{}).get(target.get('level')),
                 stock_after=bag.count(pending['item']) if isinstance(bag,list) else None)
         reasons = {str(r.get('actor')):r.get('reason') for r in decision.get('selected',[])}
         prices = {r.get('name'):r.get('price') for r in array(raw.get('weaponShopList')) if isinstance(r,dict)}
@@ -396,6 +398,7 @@ class Diagnostics(logging.Handler):
             bag=actor.get('backpack')
             self._write_compact('item_use' if command['action']=='use' else 'item_buy',
                 actor=str(identity)[:32],item=item,target=target_id,
+                target_pos=target.get('pos'),target_type=target.get('roleType'),
                 hp_before=target.get('health'),max_hp=maximum,level_before=target.get('level'),
                 stock_before=bag.count(item) if isinstance(bag,list) else None,
                 quantity=command.get('num',1),price=prices.get(item) if command['action']=='buy' else None,
@@ -405,6 +408,13 @@ class Diagnostics(logging.Handler):
                        if str(identity)==str(obj(decision.get('night_roster')).get('m')) else None)
             state.setdefault('item_pending',[]).append(dict(actor=str(identity),item=item,
                 target=target_id,round=number))
+        sites=obj(decision.get('wall_service'))
+        marker=tuple((p,r.get('id'),r.get('level'),r.get('state'),r.get('reserved_owner'))
+            for p,r in sorted(sites.items()))
+        if sites and (marker!=state.get('wall_service_marker') or number%self.interval==0):
+            self._write_compact('wall_service',sites=sites,access=decision.get('day_access'),
+                caretaker=decision.get('caretaker_stand'))
+            state['wall_service_marker']=marker
         previous=state.setdefault('work_stages',{})
         plans=obj(decision.get('work_plans'))
         for identity,plan in plans.items():

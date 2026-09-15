@@ -105,7 +105,14 @@ def permits(world, clock, candidate):
     actor = world.ours.get(candidate.actor)
     if (clock.phases == {'night'} and actor and actor.id in getattr(world,'night_economists',())
             and command.get('action') in {'buy','sell'}):
-        return command in getattr(world,'night_resupply_commands',{}).get(actor.id,())
+        contract = getattr(world, 'forage_contract', None) or {}
+        admitted_trade = (contract.get('actor') == actor.id
+                          and contract.get('command') == command)
+        if not (admitted_trade or command in getattr(world,'night_resupply_commands',{}).get(actor.id,())):
+            return False
+        # Admission grants only this observed order. Continue through pending
+        # receipt and disabled-economy checks below; arbitration still validates
+        # the contract's joint guard service and the actor's actual resources.
     if clock.phases != {'day'} and actor and actor.kind == 'pioneer':
         if command.get('action') in {'acceptTask','collect','sell','buy','summonTreasure','drop'}:
             return False

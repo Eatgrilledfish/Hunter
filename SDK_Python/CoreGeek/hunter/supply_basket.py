@@ -33,7 +33,14 @@ def requirements(world, rules, policy):
         rank = upgrade_rank(world, unit)
         for level in range(unit.level, unit.level+1 if emergency else 3):
             result.append(dict(unit=unit, level=level, name=f'{prefix}UpgradeVoucher{level}', rank=rank))
-    return sorted(result, key=lambda r:(r['rank'], r['level'], r['unit'].id))
+    from .wall_service import pending_targets, service_key
+    if not emergency:
+        for unit in pending_targets(world,scheduled=True):
+            for level in (1,2):
+                result.append(dict(unit=unit,level=level,name=f'WallUpgradeVoucher{level}',rank=2,
+                    pending=True,ready_after=world.wall_service[unit.pos]['build_after']))
+    return sorted(result, key=lambda r:(int(r['rank']), r['level'],
+        not r.get('pending',False),service_key(world,r['unit'])))
 
 
 def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=None):
@@ -51,8 +58,8 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
             lengths[key] = min((fields[identity][p] for p in interaction_cells(world,[req['unit'].pos],u.pos)
                                if p in fields[identity]), default=None)
         return lengths[key]
-    from .wall_policy import priority_units
-    stage_ids = {u.id for u in priority_units(world)}
+    from .wall_policy import purchase_units
+    stage_ids = {u.id for u in purchase_units(world)}
     held, unfilled, covered, owners = [], [], set(), {}
     for req in requirements(world, rules, policy):
         if time.monotonic() >= deadline:
@@ -66,6 +73,8 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
             owners.setdefault(uid, owner)
             covered.add((uid, req['level']))
             if owner == actor.id: held.append(req)
+            if req['name']=='WallUpgradeVoucher1' and req.get('pending'):
+                world.wall_service[req['unit'].pos]['reserved_owner']=owner
         else:
             unfilled.append(req)
     costs = [r.gold for k in WEAPONS if (r:=rules.build_rule(world,k)) is not None]
@@ -85,6 +94,19 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
     prepaid = set(covered)
     planned = []
     limits = Counter(order_limits) if order_limits is not None and not emergency else None
+    # The maintenance worker needs real personal repair stock, not just money
+    # reserved in P's basket. Fund a small working stock alongside the wall
+    # stage, before its remaining cash is exhausted by upgrade chains.
+    if (not emergency and actor.id==roster.w and len(world.weapons)==rules.weapon_limit
+            and not any(g.id in stage_ids for g in world.weapons)):
+        price=world.shop.get('WallFixer',0)
+        if price>0:
+            count=min(space,available//price,max(0,2-actor.inventory['WallFixer']))
+            if limits is not None:count=min(count,limits['WallFixer'])
+            if count:
+                planned.extend(dict(name='WallFixer',rank=1.9,level=0,unit=None) for _ in range(count))
+                available-=count*price;space-=count
+                if limits is not None:limits['WallFixer']-=count
     for req in unfilled:
         if not primary:break
         if space <= 0 or time.monotonic() >= deadline:
@@ -115,12 +137,17 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
     # may buy several in one action rather than stopping at the old one-item cap.
     defence_reserve = sum(world.shop.get(r['name'], available) for r in unfilled
                           if r['unit'].id in stage_ids and (r['unit'].id,r['level']) not in covered)
-    if primary and not emergency:
+    # Upgrade ownership serializes shared building investment, not personal
+    # guard ammunition. W must budget its sale/checkout before sealing even
+    # when the free pioneer owns the team's upgrade purchases.
+    if (primary or actor.id == roster.w) and not emergency:
         stock.extend((('DizzyWeapon', 2), ('Bomb', 60)))
+    if primary and not emergency:
         # Spend smaller residuals on next-wave pressure only after personal
         # defence stock. Held orders across all bags already occupy the quota.
         slots=getattr(world,'summon_purchase_slots',0)
-        if slots and policy.summon_pressure_enabled:
+        from .wall_policy import pressure_ready
+        if slots and policy.summon_pressure_enabled and pressure_ready(world):
             stock.append(('SmallRobotSummonOrder', actor.inventory['SmallRobotSummonOrder']+slots))
     for name, target in stock:
         price = world.shop.get(name,0)
@@ -135,7 +162,7 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
                 prepaid=prepaid, stock_targets=stock, unfunded_defence_reserve=defence_reserve)
 
 
-def use_tour(world, actor, entries, start, home, deadline, fields=None):
+def use_tour(world, actor, entries, start, home, deadline, fields=None, *, arrival_offset=0):
     """Cost of actually applying selected tiers in order, ending at duty."""
     view = copy(world)
     view.occupied = world.occupied-{actor.pos}
@@ -154,7 +181,11 @@ def use_tour(world, actor, entries, start, home, deadline, fields=None):
                    for p in interaction_cells(view,[r['unit'].pos],point) if p in reach]
         if not choices:return None
         length,_,_,_,point,index = min(choices)
-        total += length+1
+        entry = remaining[index]
+        if entry.get('pending'):
+            total=max(total+length,max(0,entry['ready_after']-world.round-arrival_offset))+1
+        else:
+            total += length+1
         remaining.pop(index)
     if point not in home:return None
     return total+home[point]
@@ -183,7 +214,8 @@ def quote(world, actor, clock, rules, policy, deadline, *, home, tail=None, end=
             # old home->tour->home estimate rejected affordable short trips.
             costs = {}
             for point in shops & home.keys():
-                steps = use_tour(world,actor,data['held']+entries,point,home,deadline,fields)
+                steps = use_tour(world,actor,data['held']+entries,point,home,deadline,fields,
+                    arrival_offset=distance(actor.pos,point)+len(orders))
                 if steps is not None:costs[point]=steps+len(orders)
                 if time.monotonic()>=deadline:return None
             if not costs:return None

@@ -16,6 +16,39 @@ from .defence_duties import enabled, ingress_reserve
 COLD_TASK_SOLVE_WINDOW = 20  # Strategy starting budget, not an official solver duration.
 
 
+def checkout_before_task(world, clock, rules, policy, selected, actor, committed, deadline):
+    """A purchase may fill cooldown slack, not erase an affordable task.
+
+    Requote the route through checkout and actual item use to the task cell.
+    An already started checkout may finish before admitting another task.
+    Having enough gold alone says nothing about this trip being executable.
+    """
+    from copy import copy
+    from . import supply_basket
+    offer=selected['task']
+    if not committed and selected['waiting_bound']<=0:return False
+    available=(clock.until_night-policy.return_buffer if committed
+               else max(selected['travel'],offer.get('coldDownRounds',0)))
+    if available<=0:return False
+    view=copy(world)
+    view.upgrade_checkout_actor=actor.id
+    view.wall_service={p:dict(row) for p,row in getattr(world,'wall_service',{}).items()}
+    # The real checkout planner returns to the defence stand. Include its
+    # subsequent walk back to the task, rather than proving a different tour.
+    duty=home_cells(view,actor)
+    to_task=({p:0 for p in duty} if committed else
+             distance_field(view,{selected['goal']},actor.pos,deadline))
+    ends=[p for p in duty if p in to_task]
+    if not ends:return False
+    end=min(ends,key=lambda p:(to_task[p],p))
+    home=distance_field(view,{end},actor.pos,deadline)
+    task_walk=to_task[end]
+    trip=supply_basket.quote(view,actor,clock,rules,policy,deadline,
+        home=home,end=end,margin=task_walk,cash=world.gold or 0)
+    return bool(time.monotonic()<deadline and trip and (trip['orders'] or trip['held'])
+                and trip['required'] is not None and trip['required']+task_walk<=available)
+
+
 def solve_window(task, estimate):
     if estimate['source'] != 'deadline_fallback':
         return min(task['timeoutRounds'], estimate['duration'])
