@@ -5,6 +5,7 @@ from .navigation import neighbours
 from .protocol import distance, pos_json
 from .robot_threats import active
 from .rules import station_rings
+from .medical import needs_treatment
 from .task_side_layout import _field, BudgetExpired
 
 
@@ -48,7 +49,7 @@ def propose(world, clock, rules, policy, deadline, *, keep_economy=False, allow_
         # Low-health economic movement must retain the same pursuit margin
         # as treatment routes, including a fallback from an unavailable shop.
         # Healthy workers keep the original productive range boundary.
-        radius=robot.attack_range + int(m.health <= 110)
+        radius=robot.attack_range + int(needs_treatment(world,m,clock))
         for x in range(max(0,robot.pos[0]-radius),min(world.width,robot.pos[0]+radius+1)):
             if time.monotonic()>=deadline:raise BudgetExpired
             for y in range(max(0,robot.pos[1]-radius),min(world.height,robot.pos[1]+radius+1)):
@@ -132,7 +133,7 @@ def propose(world, clock, rules, policy, deadline, *, keep_economy=False, allow_
             immediate=(action=='use' or action=='buy' and world.near_zone(m.pos,'weaponShop')
                        and (supply_report.get('stage')!='NIGHT_DAWN_PREBUY' or dawn_prebuy_fits)
                        or action=='sell' and world.near_zone(m.pos,'vendor'))
-            treatment=(m.health<=110 and supply_report.get('item')=='Medicine')
+            treatment=(needs_treatment(world,m,clock) and supply_report.get('item')=='Medicine')
             committed=held_delivery and supply_report.get('stage') in {
                 'NIGHT_UPGRADE_DELIVER','NIGHT_WAIT_DAWN_DELIVERY'}
             if (fallback and fallback_report.get('stage')=='NIGHT_FORAGE'
@@ -199,8 +200,29 @@ def propose(world, clock, rules, policy, deadline, *, keep_economy=False, allow_
         stock['stone']=max(0,stock['stone']-max(len(targets),1 if clock.day<10 else 0))
         if not stock['stone']:stock.pop('stone')
     value=sum(world.vendor[name]*count for name,count in stock.items())
+    night_left=min(130-(clock.round-o)%130 for o in clock.offsets)
+    vendors={q for v in world.zones.get('vendor',()) for q in neighbours(v)
+             if world.inside(q) and q not in blocked}
+    observed_clear=(isinstance(world.raw.get('robot'),dict)
+        and isinstance(world.raw['robot'].get('roles'),list)
+        and not any(r.alive and r.target_team in (None,world.side) for r in world.robots.values()))
+    # Clearing the wave does not close the market until dawn. Liquidate a
+    # full backpack (or stock already at the vendor) on a safe route, preserving the
+    # worker's construction stock above. Requote after each actual receipt.
+    if (observed_clear and m.capacity and stock
+            and (len(m.backpack)>=m.capacity or m.pos in vendors)):
+        choices=sorted((reach[q],q) for q in vendors if q in reach and reach[q]+1<=night_left)
+        if choices:
+            travel,stand=choices[0]
+            name=max(stock,key=lambda k:(stock[k]*world.vendor[k],k))
+            command=({'action':'sell','name':name,'num':stock[name]} if not travel else step({stand}))
+            if command:
+                world.night_resupply_commands = {**getattr(world,'night_resupply_commands',{}),m.id:[command]}
+                return candidate(command,'NIGHT_CASHOUT',vendor_stand=stand,
+                    vendor_travel_steps=travel,quoted_stock_value=value,
+                    reason='cleared own wave: convert carried surplus using observed night quote')
     if not m.capacity or len(m.backpack)>=m.capacity:
-        return None,dict(report,hold=True,reason='bag full; await dawn cashout',quoted_stock_value=value)
+        return None,dict(report,hold=True,reason='bag full; no authorized safe cashout route',quoted_stock_value=value)
     # The next enclosing-ring work needs actual stone, not projected copper
     # proceeds. M can gather its own non-gate share overnight; W's gate stone
     # remains W's responsibility. This is a stock target, not a promised build.
@@ -209,10 +231,7 @@ def propose(world, clock, rules, policy, deadline, *, keep_economy=False, allow_
     stone_cost=wall_rule.items.get('stone',0) if wall_rule else 0
     worker_stock=max(0,w.inventory['stone']-stone_cost*int(plan['gate'] in next_missing)) if w and w.backpack is not None else 0
     material_deficit=max(0,len(non_gate)*stone_cost-worker_stock-m.inventory['stone']) if clock.phases=={'night'} and clock.day<10 else 0
-    night_left=min(130-(clock.round-o)%130 for o in clock.offsets)
     material_actions=min(material_deficit,m.capacity-len(m.backpack))
-    vendors={q for v in world.zones.get('vendor',()) for q in neighbours(v)
-             if world.inside(q) and q not in blocked}
     sale_field=_field(world,vendors,blocked,deadline)
     ongoing=getattr(world,'observed_collect_targets',{}).get(m.id)
     options=[]

@@ -8,12 +8,18 @@ import time
 from .arbitration import Candidate
 from .navigation import distance_field, interaction_cells, neighbours
 from .protocol import pos_json
-from .director import exposure
+from .director import exposure, return_reserve
 from .task_timing import TaskTiming, descriptor
 from .defence_duties import enabled, ingress_reserve
 
 
 COLD_TASK_SOLVE_WINDOW = 20  # Strategy starting budget, not an official solver duration.
+
+
+def task_return_reserve(world,policy,walk,deadline):
+    # Admission must satisfy every return owner, including the director's
+    # existing corridor margin, not just the final gate ingress quote.
+    return max(return_reserve(world,policy,walk),ingress_reserve(world,policy,walk,deadline))
 
 
 def checkout_before_task(world, clock, rules, policy, selected, actor, committed, deadline):
@@ -75,9 +81,9 @@ def can_accept(world, clock, policy, timing, actor, task, deadline):
     except TimeoutError:
         return False
     estimate = timing.estimate(descriptor(task, world.task_cells(task)), task['timeoutRounds'])
-    return (back is not None and 1+solve_window(task, estimate)+ingress_reserve(world,policy,back) <= clock.until_night
+    return (back is not None and 1+solve_window(task, estimate)+task_return_reserve(world,policy,back,deadline) <= clock.until_night
             and (not policy.task_full_timeout_guard_enabled
-                 or 1+task['timeoutRounds']+ingress_reserve(world,policy,back) <= clock.until_night))
+                 or 1+task['timeoutRounds']+task_return_reserve(world,policy,back,deadline) <= clock.until_night))
 
 
 def choose(world, clock, policy, deadline, timing=None):
@@ -127,12 +133,12 @@ def choose(world, clock, policy, deadline, timing=None):
             # Avoid consuming a finite task immediately before the return.
             # Cold tasks reserve a declared strategy window, not their whole
             # possibly 120-round timeout; learned durations remain observations.
-            if back is None or ready_in+1+solve_rounds+ingress_reserve(world,policy,back) > clock.until_night:
+            if back is None or ready_in+1+solve_rounds+task_return_reserve(world,policy,back,deadline) > clock.until_night:
                 continue
             # Accept and finish use their own turns. Preserve the current
             # defence policy; conditional night release is a separate change.
             if policy.task_full_timeout_guard_enabled and clock.phases == {'day'} and home and (back is None or
-                    ready_in+1+duration+ingress_reserve(world,policy,back) > clock.until_night):
+                    ready_in+1+duration+task_return_reserve(world,policy,back,deadline) > clock.until_night):
                 continue
             routes.append((risk['upper_per_attack_opportunity'],travel,cell,back))
         if not routes:
@@ -148,7 +154,7 @@ def choose(world, clock, policy, deadline, timing=None):
         rows.append(dict(task=task,goal=cell,travel=travel,return_rounds=back,risk=risk,
                          full_correct_rate=utility,holding_bound=task['timeoutRounds'],
                          full_hold_fits_day=(None if clock.phases != {'day'} or not home else
-                             back is not None and travel+wait+1+task['timeoutRounds']+ingress_reserve(world,policy,back)<=clock.until_night),
+                             back is not None and travel+wait+1+task['timeoutRounds']+task_return_reserve(world,policy,back,deadline)<=clock.until_night),
                          waiting_bound=wait,score_interval=[0,score+5*task['timeoutRounds']],
                          base_score_interval=[0,score],gold_interval=[0,gold],
                          minimum_solve_strategy_rounds=solve_rounds,

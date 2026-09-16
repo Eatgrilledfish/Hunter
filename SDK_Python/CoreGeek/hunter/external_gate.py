@@ -59,6 +59,7 @@ def valid_seal(world, builds):
 class ExternalGate:
     day: int | None = None
     stage: str = 'INACTIVE'
+    ordered_ingress: tuple | None = None
     m: str | None = None
     w: str | None = None
     p: str | None = None
@@ -86,6 +87,7 @@ class ExternalGate:
     miner_exit_clearer: str | None = None
     pioneer_exit_clearance_day: int | None = None
     pioneer_return_clearance_day: int | None = None
+    worker_return_clearance_day: int | None = None
     gate_assignment: dict = field(default_factory=dict)
     gate_offer: dict = field(default_factory=dict)
     gate_before: dict = field(default_factory=dict)

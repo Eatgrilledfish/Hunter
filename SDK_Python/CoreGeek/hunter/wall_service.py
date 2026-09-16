@@ -109,8 +109,9 @@ def pending_targets(world, *, scheduled=False):
 
 
 def service_key(world, unit):
+    from .wall_pressure import priority
     record = getattr(world,'wall_service',{}).get(unit.pos,{})
-    return (not record.get('reconstruction',False),unit.id)
+    return (not record.get('reconstruction',False),priority(world,unit),unit.id)
 
 
 def handoff_margin(world):

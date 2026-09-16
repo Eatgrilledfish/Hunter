@@ -11,12 +11,17 @@ from .navigation import distance_field, interaction_cells, neighbours
 from .protocol import pos_json
 from . import supply_basket
 from .rules import station_rings
+from .medical import needs_treatment
 
 
 def propose(world, clock, rules, policy, actor, blocked, deadline):
-    if (clock.phases != {'night'} or not policy.upgrade_commitment_enabled
+    if (clock.phases != {'night'} or not (policy.upgrade_commitment_enabled or policy.medical_supply_enabled)
             or actor.backpack is None or actor.capacity is None or world.gold is None):
         return None, {}
+    treatment_needed=policy.medical_supply_enabled and needs_treatment(world,actor,clock)
+    if treatment_needed and actor.inventory['Medicine']:
+        return Candidate(actor.id,dict(action='use',name='Medicine'),1050,'treat persistent exterior injury'),dict(
+            actor=actor.id,stage='NIGHT_TREATMENT',item='Medicine',independent=True)
     view = copy(world)
     view.occupied = set(blocked)
     view.upgrade_checkout_actor = actor.id
@@ -50,7 +55,7 @@ def propose(world, clock, rules, policy, actor, blocked, deadline):
         medical_view = view
         medical_reach = reach
         medical_shops = shops
-        if actor.health <= 110 and not world.near_zone(actor.pos,'weaponShop'):
+        if treatment_needed and not world.near_zone(actor.pos,'weaponShop'):
             # A treatment route must not repeatedly skim the attack boundary
             # while the patient cannot afford pursuit. One tile is a planning
             # precaution, not an assumed robot movement rule.
@@ -67,7 +72,7 @@ def propose(world, clock, rules, policy, actor, blocked, deadline):
             medical_view.occupied.discard(actor.pos)
             medical_reach = distance_field(medical_view,{actor.pos},actor.pos,deadline)
             medical_shops = interaction_cells(medical_view,world.zones.get('weaponShop',()),actor.pos) & medical_reach.keys()
-        choices=sorted((medical_reach[p],p) for p in medical_shops if medical_reach[p]+1<=remaining)
+        choices=sorted((medical_reach[p],p) for p in medical_shops if medical_reach[p]+1+int(treatment_needed)<=remaining)
         if not choices:return None
         _,shop=choices[0]
         command=(dict(action='buy',name='Medicine',num=1) if actor.pos==shop else
@@ -75,9 +80,10 @@ def propose(world, clock, rules, policy, actor, blocked, deadline):
         if command and time.monotonic()<deadline:
             return offer(command,'NIGHT_UPGRADE_BUY',item='Medicine',quantity=1,shop=shop)
         return None
-    if policy.medical_supply_enabled and actor.health*2<=220:
+    if treatment_needed:
         treatment=personal_dose()
         if treatment:return treatment
+    if not policy.upgrade_commitment_enabled:return None,{}
     held = [r for r in data['held'] if not r.get('pending') and r['unit'] is not None and r['level']==r['unit'].level
             and actor.pos in field(r['unit'])]
     held.sort(key=lambda r:(field(r['unit'])[actor.pos] != 0, r['rank'], field(r['unit'])[actor.pos],r['unit'].id))

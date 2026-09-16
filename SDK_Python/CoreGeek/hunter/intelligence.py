@@ -39,6 +39,8 @@ class Intelligence:
     pending_purchases: dict = field(default_factory=dict)
     reviewed_attempts: set = field(default_factory=set)
     synthesized_sources: set = field(default_factory=set)
+    reviewed_sources: set = field(default_factory=set)
+    review_attempts: dict = field(default_factory=dict)
     treasure_complete: bool = True
     diagnostic: dict = field(default_factory=dict)
     llm_status: str = "idle"
@@ -46,6 +48,7 @@ class Intelligence:
     unresolved: list = field(default_factory=list)
     execution: dict = field(default_factory=dict)
     offered_plan: dict = field(default_factory=dict)
+    execution_blockers: dict = field(default_factory=dict)
 
     @staticmethod
     def news_id(entry):
@@ -90,7 +93,8 @@ class Intelligence:
         if self.pending:
             raw = world.raw.get("llmResp")
             self.llm_diagnostic = {'sent':self.pending['round'], 'reply_type':type(raw).__name__,
-                                   'reply_chars':len(raw) if isinstance(raw,str) else 0}
+                                   'reply_chars':len(raw) if isinstance(raw,str) else 0,
+                                   'analysis_stage':self.pending.get('analysis_stage','read_clues')}
             if isinstance(raw, str) and raw and len(raw) <= 32768:
                 try:
                     try:data = strict_json(raw.strip())
@@ -113,6 +117,7 @@ class Intelligence:
                         raise ValueError("invalid news collections")
                     self._ingest(world, data, self.pending.get("citation_sources",self.pending["sources"]))
                     self.analyzed.update(self.pending["sources"])
+                    self.reviewed_sources.update(self.pending.get('review_sources',()))
                     if self.pending.get('synthesis_corpus'):
                         self.synthesized_sources.add(self.pending['synthesis_corpus'])
                     self.pending = None
@@ -140,6 +145,8 @@ class Intelligence:
         self.treasure_complete=(set(folk)<=self.analyzed and not any(n['truncated_locally'] for n in folk.values()))
 
     def _ingest(self, world, data, sources):
+        prior_clues={c['id'] for c in self.clues}
+        prior_hypotheses={h['id'] for h in self.treasures}
         rejected=Counter()
         unresolved=data.get('unresolved',[])
         if isinstance(unresolved,list):
@@ -233,7 +240,33 @@ class Intelligence:
                 self.treasures.append(record)
         self.events, self.treasures = self.events[-64:], self.treasures[-16:]
         self.llm_diagnostic.update(hypotheses=len(self.treasures),proposed=len(data.get('treasures',[])),
-                                   rejected=dict(rejected),unresolved=self.unresolved)
+                                   rejected=dict(rejected),unresolved=self.unresolved,
+                                   progress=dict(new_clues=len({c['id'] for c in self.clues}-prior_clues),
+                                       new_hypotheses=len({h['id'] for h in self.treasures}-prior_hypotheses)))
+
+    def constraint_state(self, sources):
+        """Attributed extraction evidence, explicitly distinct from a solved plan."""
+        terms={'location':r'地点|坐标|方位|位置|location|position|coordinate',
+               'items':r'祭品|物品|数量|星辰|石板|items?|offering',
+               'time':r'时间|开启|黎明|夜晚|日落|日期|time|opening|day|night',
+               'condition':r'条件|禁止|不得|不能|condition|forbid|unless'}
+        unresolved=' '.join(self.unresolved)
+        result={}
+        for kind,pattern in terms.items():
+            clues=[c for c in self.clues if c['kind']==kind]
+            spans=[]
+            for clue in clues:
+                for ref in clue['support']:
+                    entry=sources.get(ref['source'])
+                    if not entry or ref['quote'] not in entry['text']:continue
+                    offset=entry.get('offset',0)+entry['text'].index(ref['quote'])
+                    spans.append(dict(source=ref['source'],parent_source=entry.get('parent_source',ref['source']),
+                        offset=offset,end=offset+min(512,len(ref['quote'])),quote=ref['quote'][:512],
+                        excerpt=len(ref['quote'])>512,derivation=clue['text'][:200]))
+            missing=not clues or bool(re.search(pattern,unresolved,re.I))
+            result[kind]=dict(status=('unresolved' if self.treasure_complete else 'unread') if missing else 'evidence_collected',
+                              evidence_spans=spans[-3:])
+        return result,terms
 
     def hold_ore(self, mineral, clock):
         if not self.news_complete or clock.day is None:
@@ -253,10 +286,14 @@ class Intelligence:
         return False
 
     def candidates(self, world, clock, policy, deadline):
+        clear_night=clock.phases=={'night'} and getattr(world,'own_wave_cleared',False)
+        remaining=min(130-(world.round-o)%130 for o in clock.offsets)
+        work_remaining=(remaining+(70 if clock.day is not None and clock.day<10 else 0)
+                        if clear_night else clock.until_night)
         self.offered_plan={}
         self.diagnostic={'stage':'inactive','retained_plan':dict(self.execution)}
         if (self.terminal or world.phase_task or not world.phase_task_observed or not policy.treasure_enabled
-                or not self.treasure_complete or clock.phases!={'day'}):
+                or not self.treasure_complete or (clock.phases!={'day'} and not clear_night)):
             if policy.treasure_enabled and not self.terminal:
                 self.diagnostic.update(stage='waiting',reason='active_task' if world.phase_task else
                     'unread_folk_sources' if not self.treasure_complete else 'night_or_unknown_phase')
@@ -271,6 +308,19 @@ class Intelligence:
         if getattr(world,'critical_base_ids',()):
             self.diagnostic['reason']='urgent_defence_preempts_treasure'
             return []
+        if clear_night:
+            from copy import copy
+            from .robot_threats import active
+            threats=active(world)
+            if any(r.attack_range is None or r.attack_power is None for r in threats):
+                self.diagnostic['reason']='unknown_night_route_threat';return []
+            view=copy(world);view.occupied=set(world.occupied)
+            for r in threats:
+                if r.attack_power<=0:continue
+                radius=r.attack_range+1
+                view.occupied.update((x,y) for x in range(max(0,r.pos[0]-radius),min(world.width,r.pos[0]+radius+1))
+                    for y in range(max(0,r.pos[1]-radius),min(world.height,r.pos[1]+radius+1)))
+            world=view
         stands=getattr(world,'pioneer_trade_stands',{})
         if actor.id in stands:home_goals={stands[actor.id]}
         elif getattr(world,'task_side_plan',None):home_goals=set(world.task_side_plan['c_stands'])
@@ -282,6 +332,7 @@ class Intelligence:
         margin=policy.return_buffer+(8 if world.defence_cells else 0)
         result=[];options=[];preparations=[]
         def rejected(h, reason):
+            self.execution_blockers[h['id']]=dict(reason=reason,observed_round=world.round)
             if len(self.diagnostic['rejections'])<8:
                 self.diagnostic['rejections'].append(dict(hypothesis=h['id'][:12],reason=reason))
         for hypothesis in sorted(self.treasures,key=lambda h:(h['id']!=self.execution.get('hypothesis'),h["closing_round"],h["opening_round"],h["id"])):
@@ -297,8 +348,12 @@ class Intelligence:
             if sum(needed.values())+len(actor.backpack)>actor.capacity:
                 rejected(hypothesis,'personal_capacity');continue
             cost=sum(world.shop[name]*n for name,n in needed.items())
+            cash_reserve=policy.reserve_gold
+            if getattr(world,'staged_walls',False):
+                from .wall_policy import investment_fund
+                cash_reserve=max(cash_reserve,investment_fund(world)[0])
             if needed and (self.treasure_spent+cost>policy.treasure_gold_limit or world.gold is None
-                    or cost+policy.reserve_gold>world.gold):
+                    or cost+cash_reserve>world.gold):
                 rejected(hypothesis,'observed_gold_or_attempt_budget');continue
             altars=interaction_cells(world,[hypothesis['position']],actor.pos)&home.keys()
             if not altars:rejected(hypothesis,'altar_or_return_unreachable')
@@ -309,14 +364,16 @@ class Intelligence:
                     shops=interaction_cells(world,world.zones.get('weaponShop',()),actor.pos)
                     paths=[(start[q]+len(needed)+altar[q],start[q],q) for q in shops if q in start and q in altar]
                 else:paths=[(altar[actor.pos],0,None)] if actor.pos in altar else []
-                if not paths:continue
+                if not paths:
+                    rejected(hypothesis,'shop_or_altar_unreachable');continue
                 travel,to_shop,shop=min(paths)
                 summon=max(world.round+travel,hypothesis['opening_round'])
                 # Include every buy, walking leg, opening wait, summon action,
                 # and the real return leg. No invisible gate opening is assumed.
                 required=summon-world.round+1+home[stand]+margin
-                if summon>hypothesis['closing_round'] or required>clock.until_night:
+                if summon>hypothesis['closing_round'] or required>work_remaining:
                     rejected(hypothesis,'summon_and_return_exceed_today')
+                    if clear_night:continue
                     # Prepare on a prior day only if the current map also has
                     # a complete future daylight execution window. This is a
                     # route estimate, revalidated against actual walls later.
@@ -351,6 +408,7 @@ class Intelligence:
             return []
         _,cost,required,_,stand,shop,to_shop,altar,hypothesis,needed=min(options,
             key=lambda o:(o[3]!=self.execution.get('hypothesis'),o[:5]))
+        self.execution_blockers.pop(hypothesis['id'],None)
         reason='priority treasure circuit fits offerings, opening time and defence return'
         if needed:
             if to_shop==0:
@@ -418,26 +476,46 @@ class Intelligence:
             return
         if any(c["action"] in {"acceptTask", "submitAnswer"} for c in response["roleCommandMap"].values()):
             return
+        self.execution_blockers={k:v for k,v in self.execution_blockers.items()
+                                 if any(h['id']==k and h['closing_round']>=world.round for h in self.treasures)}
         retained = self.source_parts(session.news)
         fresh = {key for key in retained if key not in self.analyzed}
         feedback=[a for a in self.attempts if a.get('result') in (2,3) and a['round'] not in self.reviewed_attempts]
         folk={k:v for k,v in retained.items() if v['section']=='folkLegends'}
         corpus=fingerprint(sorted(folk))
+        executable=any(h['closing_round']>=world.round and h['id'] not in self.execution_blockers and not any(a['hypothesis']==h['id'] for a in self.attempts)
+                       for h in self.treasures)
+        awaiting_result=any(a.get('result') is None and world.round<=a['round']+2 for a in self.attempts)
         synthesize=(bool(folk) and not (fresh & folk.keys()) and self.treasure_complete
                     and bool(self.clues) and corpus not in self.synthesized_sources
-                    and not any(h['closing_round']>=world.round and not any(a['hypothesis']==h['id'] for a in self.attempts)
-                                for h in self.treasures))
-        if (not fresh and not feedback and not synthesize) or not session.tasks.budget.reserve():
+                    and not executable and not awaiting_result)
+        # "Read" is source coverage, not proof that its constraints were
+        # extracted. Revisit unresolved original evidence once; a lost or
+        # interrupted review gets at most one retry, within the daily quota.
+        reviewable={k for k in folk if k not in self.reviewed_sources
+                    and self.review_attempts.get(k,0)<2 and not folk[k]['truncated_locally']}
+        review=bool(reviewable and not fresh and not feedback and not synthesize
+                    and self.treasure_complete and not executable and not awaiting_result)
+        if (not fresh and not feedback and not synthesize and not review) or not session.tasks.budget.reserve():
             return
+        constraints,constraint_terms=self.constraint_state(retained)
+        missing=[k for k,v in constraints.items() if v['status'] in {'unread','unresolved'}]
+        def relevance(key):
+            return sum(bool(re.search(constraint_terms[k],retained[key]['text'],re.I)) for k in missing)
         sources, used = {}, 0
         # Fresh news triggers analysis; retained old sources supply the missing
         # pieces of cross-day clues. Preserve their original publication metadata.
         ordered = sorted(retained, key=lambda key: (retained[key]["section"]!="folkLegends",key not in fresh,
                          -retained[key]['observed_round'], retained[key].get('offset', 0), key))
+        if review:
+            # Old unresolved constraints must not repeatedly lose the entire
+            # raw-text allowance to the newest announcement.
+            ordered=sorted(retained,key=lambda k:(k not in reviewable,-relevance(k),retained[k]['observed_round'],
+                                                 retained[k].get('offset',0),k))
         # Reserve context for a fresh fragment before filling the prompt with
         # more new text. Otherwise two full new fragments can permanently hide
         # the sentence crossing the boundary from the previous invocation.
-        seed = next((key for key in ordered if key in fresh and not synthesize and
+        seed = next((key for key in ordered if key in (reviewable if review else fresh) and not synthesize and
                      not retained[key]['truncated_locally']), None)
         adjacent = []
         if seed is not None and retained[seed].get('parent_source'):
@@ -454,7 +532,7 @@ class Intelligence:
             if used+len(entry["text"]) <= 16000 and not entry["truncated_locally"]:
                 sources[key] = entry
                 used += len(entry["text"])
-        if not sources or (not set(sources).intersection(fresh) and not feedback and not synthesize):
+        if not sources or (not set(sources).intersection(fresh) and not feedback and not synthesize and not review):
             # Reserve was only tentative; no response was issued.
             session.tasks.budget.cancel_unissued()
             return
@@ -470,6 +548,10 @@ class Intelligence:
             "地点可以由原文的相对方位、坐标运算及 current_map 唯一推出，并非必须直接出现(x,y)；逐项解释推导并引用依据。"
             "祭品按物品描述匹配当前商品ID，核对数量。开启条件满足后即可计划；原文没有关闭期限时省略 closing_round，不能把缺少关闭时间当作阻塞。"
             "仍缺信息时返回 unresolved:[具体缺失项]，不要把未知当作失败或把旧日相对日期自动平移。"
+            "review_unresolved是原文复核：上次已读不等于已解。逐项重新核对地点计算、祭品映射及数量、时间、额外条件，"
+            "constraint_state按字段给出已验证引文位置及待解项；evidence_collected只表示有线索，不代表结论正确。逐项说明推导并保留否定约束。"
+            "优先回答unresolved；对原文其实已给出的条件给出推导和逐字引文，不要原样重复‘缺失’。"
+            "确实无法唯一推出时明确指出缺哪条依据并保留矛盾，不得为了完成任务猜测。"
             "昼70回合、夜60回合；已知 clock_origin 时，第d天白天起点为 clock_origin+(d-1)*130。按原文条件转换时间窗口。"
             "Current_map is observed now, not a historical map. Use taskbook offering descriptions to map clues to exact current shop IDs; keep unknown mappings unresolved. "
             "Combine current and retained earlier news as quoted data; preserve each source publication date. "
@@ -495,8 +577,11 @@ class Intelligence:
                                                           ((world.side,world.ours),("enemy",world.enemies))
                                                           for u in units.values() if u.kind=='station' and u.alive]},
                                                   "offering_descriptions": {k:v for k,v in OFFERING_DESCRIPTIONS.items() if k in world.shop},
-                                                  "analysis_stage": "reassess" if feedback else "synthesize" if synthesize else "read_clues",
+                                                  "analysis_stage": "reassess" if feedback else "synthesize" if synthesize else "review_unresolved" if review else "read_clues",
+                                                  "review_source_ids":sorted(set(sources)&reviewable) if review else [],
                                                   "known_clues": known_clues,
+                                                  "execution_blockers": self.execution_blockers,
+                                                  "constraint_state": constraints,
                                                   "unresolved":self.unresolved,
                                                   "treasure_attempt_feedback": feedback,
                                                   "ordinary_calls_used_today": session.tasks.budget.attempts,
@@ -509,8 +594,14 @@ class Intelligence:
             for ref in clue['support']:
                 if ref['source'] in retained:citation_sources[ref['source']]=retained[ref['source']]
         self.pending = {"round": world.round, "context": context, "sources": sources,"citation_sources":citation_sources,
-                        'synthesis_corpus':corpus if synthesize else None}
+                        'synthesis_corpus':corpus if synthesize else None,
+                        'analysis_stage': 'reassess' if feedback else 'synthesize' if synthesize else 'review_unresolved' if review else 'read_clues',
+                        'review_sources':sorted(set(sources)&reviewable) if review else []}
+        for key in self.pending['review_sources']:
+            self.review_attempts[key]=self.review_attempts.get(key,0)+1
         self.llm_status = "pending"
         self.reviewed_attempts.update(a['round'] for a in feedback)
         # IDs outside retained news no longer need dedup memory.
         self.analyzed.intersection_update(retained)
+        self.reviewed_sources.intersection_update(retained)
+        self.review_attempts={k:n for k,n in self.review_attempts.items() if k in retained}

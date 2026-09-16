@@ -5,6 +5,12 @@ import time
 from .navigation import distance_field, interaction_cells
 
 
+def restoration_needed(base, reference, weapon_demand):
+    """Any credible loss creates demand; urgency and funding are separate."""
+    return bool(base.alive and base.level in (1, 2) and reference > 0
+                and base.health is not None and reference-base.health > 0)
+
+
 @dataclass
 class BaseRecovery:
     observations: dict = field(default_factory=dict)
@@ -34,20 +40,13 @@ class BaseRecovery:
             loss = max(0, reference-base.health)
             self.diagnostic["bases"][base.id] = {"reference_hp": reference, "observed_hp": base.health,
                 "loss_lower_bound": loss, "source": "verified_maximum" if verified >= prior["peak"] else "observed_peak"}
-            # While weapons still need upgrades, reserve base priority for a
-            # critical 35% HP remainder. Ordinary damage must not consume the
-            # first weapon budget. These are policy thresholds, not game rules.
+            # Record every credible injury. The investment stage separately
+            # reserves unfinished weapons before a noncritical joint checkout.
             weapon_demand = any(u.level in (1,2) for u in world.weapons)
-            threshold = .65 if weapon_demand else .2
+            threshold = 0
             self.diagnostic['bases'][base.id].update(priority_loss_fraction=threshold,
                 weapon_demand=weapon_demand)
-            if getattr(world, "staged_walls", False) and base.health > reference*.35:
-                from .wall_policy import priority_units
-                leading = priority_units(world)
-                if not leading or any(u.kind != "station" for u in leading):
-                    self.diagnostic["bases"][base.id]["deferred_for_upgrade_order"] = True
-                    continue
-            if policy.base_recovery_enabled and loss > 0 and loss >= reference*threshold:
+            if policy.base_recovery_enabled and restoration_needed(base, reference, weapon_demand):
                 result.add(base.id)
         return result
 

@@ -124,6 +124,8 @@ class Agent:
             worker_unit=world.ours.get(worker)
             paid_weapon_delivery=bool(worker_unit and any(n and name.startswith('WeaponUpgradeVoucher')
                 for name,n in worker_unit.inventory.items()))
+            world.worker_upgrade_checkout_pending = bool(daily.day == clock.day
+                and daily.phase in {'buy','sell'} and draft.sunset_market.upgrade_owner == worker)
             world.worker_close_requested = bool(self.policy.pioneer_rotation_enabled
                 and daily.day == clock.day and daily.phase in {'close','use'} and not paid_weapon_delivery
                 and not (world.phase_task or draft.tasks.active or draft.tasks.accept_pending))
@@ -255,7 +257,11 @@ class Agent:
                         draft.external_gate.commands[identity].extend(commands)
             guidance.candidates.extend(repairs)
             candidates.extend(repairs)
-            cleared_work=draft.night_clear.prepare(world,clock,self.rules,self.policy,guidance,min(deadline,time.monotonic()+.025))
+            exterior_repairs=draft.exterior_repair.prepare(world,clock,self.rules,self.policy,guidance,
+                min(deadline,time.monotonic()+.025))
+            candidates.extend(exterior_repairs)
+            guidance.candidates.extend(exterior_repairs)
+            cleared_work=draft.night_clear.prepare(world,clock,self.rules,self.policy,guidance,min(deadline,time.monotonic()+.065))
             candidates.extend(cleared_work)
             guidance.candidates.extend(cleared_work)
             # A fixed gun site may initially be occupied by an idle pioneer.
@@ -372,6 +378,25 @@ class Agent:
             if not draft.tasks.active and not draft.tasks.accept_pending:
                 world.pioneer_trade_stands = guidance.operator_stands
                 treasure = draft.intelligence.candidates(world,clock,self.policy,min(deadline,time.monotonic()+.15))
+                report=draft.intelligence.diagnostic
+                treasure_actor=report.get('actor')
+                clear_treasure=(clock.phases=={'night'} and getattr(world,'own_wave_cleared',False)
+                    and treasure_actor==draft.night_roster.p
+                    and treasure_actor not in guidance.survival_actions
+                    and treasure_actor not in getattr(world,'return_recovery_actions',{})
+                    and not getattr(world,'repair_commands',{}).get(treasure_actor)
+                    and (treasure or report.get('stage')=='wait_open'))
+                if clear_treasure:
+                    # Only the completed safe circuit overrides an idle gun
+                    # hold. A new wave removes this grant on the next frame.
+                    exact=[c.command for c in treasure]
+                    previous=guidance.duty_permit
+                    def clear_permit(c,identity=treasure_actor,commands=exact,prior=previous):
+                        owner=c.command.get('controllerId') if c.command.get('action')=='attack' else c.actor
+                        if owner==identity:
+                            return c.command in commands or (c.command.get('action')=='use' and c.command.get('name') in {'Medicine','Bomb','DizzyWeapon'})
+                        return prior(c) if prior else None
+                    guidance.duty_permit=clear_permit
                 treasure = [c for c in draft.filter_failures(treasure,world.round) if guidance.permit(c)]
                 task_reserved = bool(task_choice and task_choice.get('selected'))
                 if task_reserved:
@@ -386,6 +411,7 @@ class Agent:
                            and identity not in guidance.roster_transit_actions
                            and identity not in draft.external_gate.commands
                            and not guidance.return_routes.get(identity,{}).get('due'))
+                waiting = waiting or bool(clear_treasure and report.get('stage')=='wait_open')
                 if treasure or waiting:
                     world.treasure_actions[identity] = [c.command for c in treasure]
                     if report.get("cost",0):
@@ -517,7 +543,8 @@ class Agent:
             if draft.tasks.accept_pending:
                 excluded.add(draft.tasks.accept_pending.get('actor'))
             medical = draft.medical.candidates(world, clock, self.rules, self.policy,
-                                               min(deadline, time.monotonic()+0.08), guidance, excluded)
+                                               min(deadline, time.monotonic()+0.08), guidance, excluded,
+                                               construction_jobs=build_jobs)
             medical = draft.filter_failures(medical, world.round)
             # A validated treatment trip supersedes optional economic steps.
             # Register its exact commands before rechecking final permissions.
@@ -530,9 +557,12 @@ class Agent:
             candidates.extend(medical)
             supply = world.duty_budget.run('repair_supply', lambda budget_end: draft.repair_supply.candidates(
                 world, clock, self.rules, self.policy, budget_end, guidance,
-                excluded | set(guidance.medical_actions) | set(world.sunset_actions)
-                | ({identity for identity, job in build_jobs.items() if not job.get('gate')}
-                   if self.policy.pioneer_rotation_enabled else set())), min(deadline,time.monotonic()+.04))
+                excluded | set(guidance.medical_actions) | set(world.sunset_actions),
+                construction_jobs=build_jobs,
+                retry_rounds={identity:failure[1]+min(4,failure[0]+1)
+                    for (identity,signature),failure in draft.failed.items()
+                    if signature==fingerprint(dict(action='buy',name='WallFixer',num=1))}),
+                min(deadline,time.monotonic()+.04))
             supply = draft.filter_failures(supply, world.round)
             for candidate in supply:
                 guidance.repair_supply_actions.setdefault(candidate.actor,[]).append(candidate.command)
@@ -639,6 +669,7 @@ class Agent:
             draft.night_clear.finalize(world,decision.response)
             draft.repair.finalize(world,decision.response)
             draft.repair_supply.finalize(world,decision.response)
+            draft.exterior_repair.finalize(world,decision.response)
             draft.sunset_market.finalize(world,decision.response)
             draft.risk.finalize(world, clock, decision.response)
             draft.economic_routes.finalize(world, decision.selected, self.policy)
@@ -700,6 +731,7 @@ class Agent:
                       "work_plans":guidance.work_plans,
                       "repair":draft.repair.diagnostic,
                       "repair_supply":draft.repair_supply.diagnostic,
+                      "exterior_repair":draft.exterior_repair.diagnostic,
                       "wall_service":{f'{p[0]},{p[1]}':v for p,v in draft.wall_service.sites.items()},
                       "caretaker_stand":defence_duties.service_diagnostic(world,guidance.operator_stands),
                       "day_access":world.access_diagnostic,

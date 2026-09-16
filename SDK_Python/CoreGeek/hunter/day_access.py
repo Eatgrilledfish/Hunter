@@ -13,6 +13,7 @@ def gate(world):
 def prepare(world, clock, deadline, state=None):
     world.active_access_gap=None
     world.access_diagnostic={}
+    world.clear_exit_plan=state.get('point') if state else None
     plan=getattr(world,'task_side_plan',None)
     if not plan or clock.phases!={'day'} or clock.day<=1:return
     if state is not None and state.get('day')!=clock.day:
@@ -20,8 +21,12 @@ def prepare(world, clock, deadline, state=None):
     blue,yellow=station_rings(plan['anchor'])
     walls={u.pos:u for u in world.ours.values() if u.alive and u.kind=='wall'}
     gaps=yellow-walls.keys()
-    if not gaps:return
     fixed=plan['gate']
+    from .wall_policy import monster_face
+    backup_doors={p for p,u in walls.items() if p in yellow and u.level==1
+                  and p not in monster_face(world,plan['anchor'])}
+    upgraded_fixed=fixed in walls and walls[fixed].level in (2,3)
+    if not gaps and not upgraded_fixed:return
     actors=[world.ours.get(i) for i in (world.night_roster.w,world.night_roster.p)]
     if any(not u or not u.alive for u in actors):return
     blocked=set(world.occupied)-{u.pos for u in world.movers}
@@ -38,8 +43,13 @@ def prepare(world, clock, deadline, state=None):
     options=[]
     candidates=set(gaps)
     if fixed in walls and walls[fixed].level==1:candidates.add(fixed)
+    if upgraded_fixed:candidates.update(backup_doors)
+    front = monster_face(world, plan['anchor']) - {fixed}
     incumbent=state.get('point') if state else None
-    for point in sorted(candidates,key=lambda p:(p!=incumbent,p)):
+    for point in sorted(candidates,key=lambda p:(p in front,upgraded_fixed and p in walls,p!=incumbent,p)):
+        if (upgraded_fixed and point in backup_doors
+                and any(not remove and position not in front for _,remove,position in options)):
+            break  # Keep an already open ordinary passage until its actual closure.
         view=copy(world)
         # Prove this passage remains useful after the other holes are closed.
         view.occupied=(blocked | (gaps-{point}))-{point}
@@ -64,11 +74,20 @@ def prepare(world, clock, deadline, state=None):
             # The policy already prefers today's valid selection over every
             # alternative. Once both current routes prove it valid, stop;
             # unrelated searches must not make a funded passage disappear.
-            if point==incumbent:break
+            if point not in front and (point==incumbent or upgraded_fixed and point in backup_doors):break
     if options:
-        chosen=next((o for o in options if state and o[2]==state.get('point')),None)
-        _,needs_remove,point=chosen or min(options)
+        # Reusing an attacked front hole would reserve it until final ingress,
+        # removing its rebuilding and upgrade window. Prefer a proven route
+        # through an ordinary door, even when that needs one legal removal.
+        preferred=[o for o in options if o[2] not in front] or options
+        chosen=next((o for o in preferred if state and o[2]==state.get('point')),None)
+        _,needs_remove,point=chosen or min(preferred)
         if state is not None:state['point']=point
-        if not needs_remove:world.active_access_gap=point
+        if not needs_remove or point!=fixed:world.active_access_gap=point
+        world.clear_exit_plan=point
         world.access_diagnostic=dict(gap=point,reused=not needs_remove,
             candidates=[dict(cost=c,remove=r,pos=p) for c,r,p in sorted(options)])
+    elif upgraded_fixed:
+        world.clear_exit_plan=None
+        if state is not None:state.pop('point',None)
+        world.access_diagnostic={'reason':'upgraded door preserved; no proven ordinary backup passage'}

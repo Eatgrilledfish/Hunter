@@ -21,8 +21,10 @@ from .night_roles import NightRoster
 from .night_clear import NightClear
 from .repair_plan import RepairPlan
 from .repair_supply import RepairSupply
+from .exterior_repair import ExteriorRepair
 from .wall_service import WallService
 from .wall_health import WallHealth
+from .wall_pressure import WallPressure
 from .opening_wave import OpeningWave
 from .navigation import neighbours
 from .protocol import pos_json
@@ -47,11 +49,13 @@ class Session:
     mover_walk_history: dict = field(default_factory=dict)
     task_approach: dict = field(default_factory=dict)
     wall_observations: dict = field(default_factory=dict)
+    wall_pressure: WallPressure = field(default_factory=WallPressure)
     wall_restore_observations: dict = field(default_factory=dict)
     day_access_choice: dict = field(default_factory=dict)
     robot_observations: dict = field(default_factory=dict)
     mover_health_observations: dict = field(default_factory=dict)
     recent_mover_injuries: dict = field(default_factory=dict)
+    persistent_mover_injuries: dict = field(default_factory=dict)
     enemy_memory: dict = field(default_factory=dict)
     news: list = field(default_factory=list)
     feedback_counts: dict = field(default_factory=dict)
@@ -73,6 +77,7 @@ class Session:
     night_clear: NightClear = field(default_factory=NightClear)
     repair: RepairPlan = field(default_factory=RepairPlan)
     repair_supply: RepairSupply = field(default_factory=RepairSupply)
+    exterior_repair: ExteriorRepair = field(default_factory=ExteriorRepair)
     wall_service: WallService = field(default_factory=WallService)
     wall_health: WallHealth = field(default_factory=WallHealth)
     opening_wave: OpeningWave = field(default_factory=OpeningWave)
@@ -96,6 +101,7 @@ class Session:
         clock = Clock(world.round, self.origin)
         world.strategy_clock = clock
         self.wall_health.observe(world, clock, self)
+        self.wall_pressure.observe(world, clock)
         self.opening_wave.observe(world,clock)
         world.observed_wall_losses = {}
         world.observed_robot_motion = {}
@@ -145,6 +151,19 @@ class Session:
         # recovery, death and leaving the observed night clear the record.
         self.recent_mover_injuries = injuries
         world.recent_mover_injuries = injuries
+        persistent={}
+        for u in world.movers:
+            old=self.mover_health_observations.get(u.id)
+            if (not u.alive or not old or old[0]!=world.round-1
+                    or u.health is None or old[1] is None or u.health>old[1]):continue
+            loss=world.observed_mover_losses.get(u.id,0)
+            previous=self.persistent_mover_injuries.get(u.id)
+            if previous:
+                persistent[u.id]=dict(previous,damage=previous['damage']+loss)
+            elif loss and clock.day is not None:
+                persistent[u.id]=dict(day=clock.day,damage=loss)
+        self.persistent_mover_injuries=persistent
+        world.persistent_mover_injuries=persistent
         self.mover_health_observations = {u.id:(world.round,u.health) for u in world.movers if u.alive}
         for u in world.ours.values():
             old = self.wall_observations.get(u.id)

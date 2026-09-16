@@ -113,6 +113,12 @@ class CaretakerDay:
         missing = set(world.wall_targets or ()) - walls - set(getattr(world,'helper_wall_targets',()))
         rule = rules.build_rule(world, 'wall')
         stone = len(missing) * rule.items.get('stone', 0) if rule else 0
+        from .wall_policy import monster_face
+        door=next((u for u in world.ours.values() if u.alive and u.kind=='wall' and u.pos==plan['gate']),None)
+        next_exit_stone=(rule.items.get('stone',0) if rule and policy.night_foraging_enabled
+            and clock.day is not None and clock.day<10 and set(world.wall_targets or ())==yellow
+            and plan['gate'] not in monster_face(world,plan['anchor'])
+            and (plan['gate'] in missing or door and door.level==1) else 0)
         retained_stone = stone
         if (clock.day is not None and clock.day<10 and set(world.wall_targets or ())==yellow
                 and missing<={plan['gate']} and len(world.weapons)==rules.weapon_limit
@@ -244,10 +250,11 @@ class CaretakerDay:
                 fields[key] = distance_field(trip_world,
                     interaction_cells(trip_world,[target['unit'].pos],carrier.pos),carrier.pos,deadline)
             return fields[key]
-        ready = [(t['rank'],route(actor,t).get(actor.pos,float('inf')),t['unit'].id,t)
+        from .wall_pressure import priority
+        ready = [(t['rank'],priority(world,t['unit']),route(actor,t).get(actor.pos,float('inf')),t['unit'].id,t)
                  for t in held if not t.get('pending') and t['level']==t['unit'].level]
         if ready:
-            _,length,_,target = min(ready,key=lambda t:t[:3])
+            _,_,length,_,target = min(ready,key=lambda t:t[:4])
             if length != float('inf'):deliveries[actor.id]=(target,length)
         if self.construction_only:
             # Paid coupons may still be used after construction, but new
@@ -323,25 +330,58 @@ class CaretakerDay:
         if (self.phase == 'harvest' and missing-{plan['gate']}
                 and actor.inventory['stone'] >= stone and self.front_rebuild_pending):
             self.phase = 'close'
-        if (self.phase=='harvest' and not self.construction_only
-                and actor.inventory['stone']>=stone and funded_checkout
-                and checkout is not None
-                and checkout.get(actor.pos,float('inf'))+margin<=clock.until_night):
-            investment=(getattr(world,'upgrade_checkout_actor',None)==actor.id
+        investment=bool(trip and getattr(world,'upgrade_checkout_actor',None)==actor.id
                         and any('UpgradeVoucher' in name for name in trip['orders']))
-            from .repair_decision import eligible
-            repair_gap=(actor.inventory['WallFixer']==0 and trip['orders'].get('WallFixer',0)>0
-                        and any(u.kind=='wall' and eligible(world,u,rules,policy) for u in world.ours.values()))
-            if investment or repair_gap:
+        sale_funded=bool(investment and stock and required is not None
+            and required+margin<=clock.until_night
+            and sum(world.shop[name]*amount for name,amount in trip['orders'].items())
+                <= cash+sum(n*world.vendor[name] for name,n in stock.items()))
+        if (self.phase=='harvest' and not self.construction_only
+                and actor.inventory['stone']>=stone
+                and (sale_funded or funded_checkout and checkout is not None
+                     and checkout.get(actor.pos,float('inf'))+margin<=clock.until_night)):
+            # Restocking must precede the next attack, including when the
+            # damaged wall has already fallen. The basket has already matched
+            # personal stock and funded the bounded maintenance requirement.
+            # Restore its existing two-pack working reserve first; optional
+            # top-ups must not interrupt a funded material trip while that
+            # reserve is still present.
+            repair_reserve=(actor.inventory['WallFixer']<2
+                            and trip['orders'].get('WallFixer',0)>0)
+            if investment or repair_reserve:
                 # A fully funded executable investment no longer waits until
                 # all remaining harvesting time has been consumed. Material,
                 # use, closure and return are already in this very quote.
-                self.phase=('sell' if stock and world.near_zone(actor.pos,'vendor')
+                self.phase=('sell' if not funded_checkout or stock and world.near_zone(actor.pos,'vendor')
                             and required is not None and required+margin<=clock.until_night else 'buy')
                 required=(required if self.phase=='sell' else checkout[actor.pos])
                 self.last_required=required+margin
                 self.diagnostic.update(required=self.last_required,
-                    harvest_released='funded investment' if investment else 'empty personal repair stock')
+                    harvest_released='funded investment' if investment else 'funded personal repair reserve')
+        if (self.phase in {'harvest','close','home'} and next_exit_stone and missing<={plan['gate']}
+                and stone<=actor.inventory['stone']<stone+next_exit_stone
+                and actor.capacity-len(actor.backpack)>=stone+next_exit_stone-actor.inventory['stone']
+                and not held and not getattr(world,'critical_base_ids',())):
+            # Today's seal must not consume the only material needed to reopen
+            # the ordinary door after clearing. Fund the extra stone with a
+            # complete mine -> current construction -> duty route, never by
+            # postponing an already selected necessary checkout or paid use.
+            need=stone+next_exit_stone-actor.inventory['stone']
+            start=distance_field(world,{actor.pos},actor.pos,deadline)
+            options=[]
+            for mine in world.zones.get('stone',()):
+                if getattr(world,'batch_mine_owners',{}).get(mine,actor.id)!=actor.id:continue
+                for point in interaction_cells(world,[mine],actor.pos)&start.keys()&tail.keys():
+                    required=start[point]+need+tail[point]+margin+2
+                    if required<=clock.until_night:options.append((required,start[point],mine,point))
+            if options and time.monotonic()<deadline:
+                required,length,mine,point=min(options)
+                choices=([Candidate(actor.id,dict(action='collect',targetPos=[pos_json(mine)]),240,
+                                     'collect personal next-clear exit material before sealing')]
+                         if not length else DaySchedule.moves(actor,distance_field(world,{point},actor.pos,deadline),
+                            'reserve next-clear exit material inside the proven closure deadline'))
+                return self.finish(world,guidance,jobs,actor,choices,'harvest',
+                    next_clear_stone=next_exit_stone,required=required)
         if self.phase == 'harvest':
             repairs = getattr(world, 'repair_commands', {}).get(actor.id, [])
             repair_steps = getattr(world, 'day_repair_steps', {}).get(actor.id, 1)
@@ -426,7 +466,18 @@ class CaretakerDay:
             required = checkout[actor.pos]
             self.last_required = required + margin
             self.diagnostic.update(required=self.last_required, sale_deferred='basket already funded')
+        if (self.phase == 'buy' and stock and not funded_checkout
+                and trip and trip['orders'] and required is not None
+                and required + margin <= clock.until_night):
+            # Shared cash may have changed, or a blocked prior frame may have
+            # lost its quote. Re-establish the actual sale before spending its
+            # forecast proceeds; current stock and the whole tour are proven.
+            self.phase = 'sell'
         if self.phase == 'sell':
+            if (stock and required is None and self.last_required is not None
+                    and self.last_required + 2 < clock.until_night):
+                return self.finish(world,guidance,jobs,actor,[],'sell',
+                    reason='temporarily blocked sale route; preserve unsold personal stock')
             if stock and sale is not None and required is not None and required + margin <= clock.until_night:
                 name = max(stock, key=lambda k:(stock[k]*world.vendor[k], k))
                 choices = ([Candidate(actor.id, dict(action='sell', name=name, num=stock[name]), 240,
@@ -435,6 +486,11 @@ class CaretakerDay:
                 return self.finish(world, guidance, jobs, actor, choices, 'sell')
             self.phase = 'buy'
         if self.phase == 'buy':
+            if count and checkout is not None and actor.pos in checkout:
+                # Once the sale is skipped, preserve the confirmed checkout
+                # circuit rather than expiring it against the longer sale tour.
+                self.last_required = checkout[actor.pos] + margin
+                self.diagnostic['required'] = self.last_required
             if (required is None and self.last_required is not None
                     and self.last_required+2 < clock.until_night):
                 # A teammate can briefly occupy the single return corridor.
@@ -587,4 +643,9 @@ class CaretakerDay:
                 self.diagnostic['completed_return'] = True
             else:
                 self.diagnostic['blocked'] = True
+                if phase in {'buy','sell'}:
+                    # Keep ownership while a service route is blocked; an
+                    # unrelated material trip must not move the carrier away.
+                    guidance.work_plans[actor.id] = dict(owner='caretaker_day',phase=phase,
+                        commands=[],waiting_for_route=True)
         return choices

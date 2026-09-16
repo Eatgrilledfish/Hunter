@@ -114,12 +114,14 @@ def permits(world, clock, candidate):
         # receipt and disabled-economy checks below; arbitration still validates
         # the contract's joint guard service and the actor's actual resources.
     if clock.phases != {'day'} and actor and actor.kind == 'pioneer':
-        if command.get('action') in {'acceptTask','collect','sell','buy','summonTreasure','drop'}:
+        clear_treasure=(getattr(world,'own_wave_cleared',False)
+                        and command in treasure.get(candidate.actor,()))
+        if not clear_treasure and command.get('action') in {'acceptTask','collect','sell','buy','summonTreasure','drop'}:
             return False
         if command.get('action') == 'move':
             # Only observed defence/clearance/repair routes can move P at
             # night. A fresh procurement or treasure route cannot bypass C.
-            return (command in getattr(world,'pioneer_defence_moves',()) or
+            return (clear_treasure or command in getattr(world,'pioneer_defence_moves',()) or
                     command in getattr(world,'repair_commands',{}).get(actor.id,()))
     gate_duty=getattr(world,'gate_worker_duty',None)
     if (gate_duty and gate_duty.get('round')==world.round and command.get('action')=='remove'

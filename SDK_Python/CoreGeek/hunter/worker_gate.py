@@ -403,14 +403,54 @@ def prepare(state, world, clock, rules, policy, deadline, *, task_busy=False):
     # reserves its own trip, construction and voucher use. Adding that entire
     # itinerary here recalled P from a nearby shop many turns too early.
     # Reserve P's entry and bounded worker clearance at the actual bottleneck.
-    required = ingress_reserve(world, policy, home.get(pioneer.pos,0))
+    required = ingress_reserve(world, policy, home.get(pioneer.pos,0), deadline)
     if gate in walls and not missing:
         # Once closure is observed, release the temporary ingress holds. A
         # paid wall delivery may still fit inside the remaining daylight.
         state.stage='WORKER_SEALED'
         state.diagnostic['stage']=state.stage
         return result
-    if clock.until_night > required:
+    ingress_key = (clock.day, gate)
+    committed = gate != plan['gate'] and state.ordered_ingress == ingress_key
+    if clock.until_night > required and not committed:
+        paid_worker = any(worker.inventory[r['name']] and r['name'].startswith('WeaponUpgradeVoucher')
+                          for r in delivery_targets.values())
+        worker_investment = paid_worker or (getattr(world,'worker_upgrade_checkout_pending',False)
+            and any(r['name'].startswith('WeaponUpgradeVoucher')
+                    and 0 < world.shop.get(r['name'],0) <= (world.gold or 0)
+                    for r in delivery_targets.values()))
+        if (task_busy or world.phase_task or state.worker_return_clearance_day != clock.day
+                or not worker_investment or worker.pos in blue and not paid_worker):
+            state.worker_return_clearance_day = None
+        if (worker_investment and not task_busy and not world.phase_task and worker.backpack is not None
+                and (worker.pos not in blue or state.worker_return_clearance_day == clock.day)):
+            # Checkout needs a real return path even before the final recall.
+            # Attribute the blockage to P alone, then use the existing proof
+            # that both guards can reach duty after P vacates the choke.
+            goals = stands(world,worker.id)
+            actual = distance_field(world,goals,worker.pos,deadline).get(worker.pos)
+            preview = copy(world)
+            preview.occupied = world.occupied-{pioneer.pos}
+            unblocked = distance_field(preview,goals,worker.pos,deadline).get(worker.pos)
+            if unblocked is not None and unblocked+policy.return_buffer+2 < clock.until_night:
+                if actual is None or actual > unblocked+2:
+                    command = clear_worker_for(worker,goals,inside=True,blocker=pioneer)
+                    if command:
+                        offer(pioneer,command,'clear observed worker checkout and paid-delivery return')
+                        state.worker_return_clearance_day = clock.day
+                elif state.worker_return_clearance_day == clock.day:
+                    # Do not immediately walk back into the same passage or
+                    # start opposing traffic while W delivers its paid stock.
+                    # Finish returning to P's own stand: an intermediate
+                    # clearance cell may still cut W off from another gun.
+                    command = step(pioneer,{plan['w']})
+                    if command:
+                        offer(pioneer,command,'finish worker clearance at pioneer duty stand')
+                    else:
+                        hold(pioneer)
+                if pioneer.id in state.commands:
+                    state.diagnostic.update(stage='WORKER_RETURN_CLEARANCE')
+                    return result
         closing = not missing and getattr(world,'worker_close_requested',False)
         unfunded_worker = (worker.backpack is not None and not worker.inventory['stone']
             and not any(n and name.startswith('WeaponUpgradeVoucher') for name,n in worker.inventory.items()))
@@ -496,6 +536,7 @@ def prepare(state, world, clock, rules, policy, deadline, *, task_busy=False):
         if missing:state.diagnostic.update(stage='WORKER_CONSTRUCTION',remaining_walls=len(missing))
         return result
     world.ordered_ingress_due = True
+    if gate != plan['gate']:state.ordered_ingress = ingress_key
     state.stage = 'PIONEER_FIRST'
 
     if pioneer.pos != plan['w']:
@@ -541,6 +582,10 @@ def prepare(state, world, clock, rules, policy, deadline, *, task_busy=False):
     # Prefer a sealing cell which can already serve the single turret.
     service = entries & stands(world,worker.id)
     goals = service or entries
+    if gate != plan['gate']:
+        from .defence_duties import alternate_seal_tour
+        _, quoted = alternate_seal_tour(world, deadline)
+        if quoted:goals = quoted
     if worker.pos not in goals:
         offer(worker,step(worker,goals),'maintenance worker enters last with own sealing stone')
     elif worker.backpack is not None and worker.inventory['stone'] >= 1 and gate not in world.occupied:

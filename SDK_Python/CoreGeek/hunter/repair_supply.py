@@ -76,7 +76,7 @@ class RepairSupply:
         # Unresolved spends remain charged and block that buyer across days.
         self.daily=dict(sorted(self.daily.items())[-10:])
 
-    def candidates(self, world, clock, rules, policy, deadline, guidance, excluded=()):
+    def candidates(self, world, clock, rules, policy, deadline, guidance, excluded=(), *, construction_jobs=None, retry_rounds=None):
         self.offered={}
         used=self.daily.get(clock.day,dict(count=0,spent=0))
         self.diagnostic=dict(status='disabled',pending=sorted(self.pending),**used)
@@ -97,7 +97,7 @@ class RepairSupply:
         roster=world.night_roster
         result=[]
         from .defence_duties import enabled
-        for identity in ((roster.w,) if enabled(world) else (roster.w,roster.p)):
+        for identity in ((roster.w,roster.m) if enabled(world) else (roster.w,roster.p)):
             if time.monotonic()>=deadline or slots<=0 or price>budget:
                 break
             actor=world.ours.get(identity)
@@ -106,6 +106,18 @@ class RepairSupply:
             if (actor.backpack is None or actor.capacity is None or len(actor.backpack)>=actor.capacity
                     or actor.inventory['WallFixer']>=1 or actor.health<(220 if actor.kind=='worker' else 200)*.75):
                 continue
+            delay=max(0,(retry_rounds or {}).get(identity,world.round)-world.round)
+            job=(construction_jobs or {}).get(identity,{})
+            pauses_work=False
+            if policy.pioneer_rotation_enabled and job and not job.get('gate'):
+                steps=job.get('construction_steps')
+                pauses_work=(identity==roster.m and job.get('helper_collect')
+                    and type(steps) in (int,float) and steps>=0
+                    and steps+delay+1+policy.return_buffer<=clock.until_night
+                    and world.near_zone(actor.pos,'weaponShop')
+                    and len(actor.backpack)+1+sum(max(0,n-actor.inventory[k])
+                        for k,n in job.get('items',{}).items())<=actor.capacity)
+                if not pauses_work:continue
             if identity in guidance.urgent_upgrades or identity in guidance.recovery_actions or identity in guidance.site_clear_actions:
                 continue
             # Only workers carry maintenance stock; preserve existing duties
@@ -113,13 +125,23 @@ class RepairSupply:
             if not enabled(world) and identity==roster.w and not world.near_zone(actor.pos,'weaponShop'):
                 continue
             home=guidance.operator_stands.get(identity)
+            if enabled(world) and identity==roster.m:
+                # Stock the outside repair owner during an existing shop
+                # visit; this grant cannot create a new daytime detour.
+                from .rules import station_rings
+                blue,_=station_rings(world.task_side_plan['anchor'])
+                static=world.occupied-{u.pos for u in world.movers}
+                outside_work=any(u.alive and u.kind=='wall' and not (set(neighbours(u.pos)) & blue)-static
+                                 for u in world.ours.values())
+                if not outside_work or not world.near_zone(actor.pos,'weaponShop'):continue
+                home=actor.pos
             if home is None:
                 continue
             start=distance_field(world,[actor.pos],actor.pos,deadline)
             back=distance_field(world,[home],actor.pos,deadline)
             shops=interaction_cells(world,world.zones.get('weaponShop',()),actor.pos)
             paths=[(start[q]+1+back[q],start[q],q) for q in shops & start.keys() & back.keys()
-                   if start[q]+1+back[q]+policy.return_buffer<=clock.until_night]
+                   if start[q]+delay+1+back[q]+policy.return_buffer<=clock.until_night]
             if not paths or time.monotonic()>=deadline:
                 continue
             total,length,stand=min(paths)
@@ -136,6 +158,12 @@ class RepairSupply:
             # gets priority over ordinary wall/base procurement.
             if guidance.return_routes.get(identity,{}).get('due') or not offers:
                 continue
+            if enabled(world) and identity==roster.m and length==0:
+                admitted=getattr(world,'personal_repair_stock_commands',{})
+                admitted[identity]=commands
+                world.personal_repair_stock_commands=admitted
+                if pauses_work:guidance.repair_stock_pauses.add(identity)
+                if delay:guidance.repair_stock_waits.add(identity)
             result.extend(offers);budget-=price;slots-=1
             self.diagnostic.setdefault('buyers',{})[identity]=dict(price=price,travel=length,total_actions=total)
             if length==0:

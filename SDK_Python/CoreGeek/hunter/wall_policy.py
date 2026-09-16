@@ -60,6 +60,11 @@ def front_cells(world, anchor):
 
 def prepare(world, rules, policy):
     world.critical_base_ids = critical_bases(world, rules)
+    from .recovery import restoration_needed
+    weapon_demand = any(u.level in (1, 2) for u in world.weapons)
+    world.base_restore_ids = frozenset(u.id for u in world.stations
+        if policy and policy.base_recovery_enabled and restoration_needed(
+            u, rules.max_health.get('station', {}).get(u.level, 0), weapon_demand))
     world.staged_walls = False
     world.front_walls = frozenset()
     world.monster_front_walls = frozenset()
@@ -102,9 +107,25 @@ def priority_units(world):
         return walls
     weapons = [u for u in world.weapons if u.level != 3]
     if weapons:
+        if any(u.level not in (1, 2) for u in weapons):
+            return weapons  # Unknown tiers cannot establish a fully funded upgrade budget.
+        restoration = [u for u in world.stations if u.id in getattr(world, 'base_restore_ids', ())]
+        held = sum((u.inventory for u in world.movers if u.backpack is not None), Counter())
+        needed = Counter(f'WeaponUpgradeVoucher{level}' for u in weapons for level in range(u.level,3)) - held
+        if (restoration and world.gold is not None
+                and (not getattr(world,'task_side_plan',None) or len(world.weapons)>=3)
+                and all(world.shop.get(name,0)>0 for name in needed)):
+            reserve = sum(world.shop[name]*count for name,count in needed.items())
+            cost = sum(world.shop.get(f'StationUpgradeVoucher{u.level}',float('inf'))
+                       for u in restoration if not held[f'StationUpgradeVoucher{u.level}'])
+            if reserve+cost<=world.gold:
+                return weapons+restoration  # Jointly funded, still weapon-first in the use tour.
         return weapons
     if getattr(world, 'task_side_plan', None) and len(world.weapons) < 3:
         return []  # Rebuild a missing planned rocket before funding later tiers.
+    restoration = [u for u in world.stations if u.id in getattr(world, 'base_restore_ids', ())]
+    if restoration:
+        return restoration  # Actual injury must not wait for every wall to max out.
     permanent = upgrade_targets(world)
     front = walls
     if front:
@@ -134,7 +155,8 @@ def investment_fund(world):
         ids = {u.id for u in units}
         units += [u for u in world.ours.values() if u.alive and u.kind=='wall'
                   and u.pos in upgrade_targets(world) and u.level in (1,2) and u.id not in ids]
-    for unit in sorted(units, key=lambda u: (upgrade_rank(world,u),u.level,u.id)):
+    from .wall_pressure import priority
+    for unit in sorted(units, key=lambda u: (upgrade_rank(world,u),u.level,priority(world,u),u.id)):
         prefix = 'Weapon' if unit.kind in {'rocket', 'gatling', 'railgun'} else 'Wall' if unit.kind == 'wall' else 'Station'
         for level in range(unit.level, 3):
             name = f'{prefix}UpgradeVoucher{level}'
@@ -203,7 +225,9 @@ def pressure_ready(world):
 def purchase_units(world):
     """Allow next-stage checkout once weapon purchases are fully funded."""
     current = priority_units(world)
-    if getattr(world,'critical_base_ids',()):return current
+    if (getattr(world,'critical_base_ids',()) or
+            any(u.id in getattr(world,'base_restore_ids',()) for u in current)):
+        return current
     held = Counter()
     for actor in world.movers:
         if actor.backpack is not None:held.update(actor.inventory)
@@ -230,8 +254,11 @@ def purchase_permitted(world, rules, candidate):
                  for u in purchase_units(world)}
         return prefix in allowed
     # Genuine treatment can interrupt investment; healthy stock cannot.
-    if name=='Medicine' and actor.health <= (200 if actor.kind=='pioneer' else 220)*.5:
-        return True
+    if name=='Medicine':
+        from .medical import needs_treatment
+        clock=getattr(world,'strategy_clock',None)
+        if actor.health <= (200 if actor.kind=='pioneer' else 220)*.5 or clock and needs_treatment(world,actor,clock):
+            return True
     if name=='WallFixer' and getattr(world,'critical_base_ids',()):return True
     if name.endswith('SummonOrder') and not pressure_ready(world):return False
     reserve,item=investment_fund(world)

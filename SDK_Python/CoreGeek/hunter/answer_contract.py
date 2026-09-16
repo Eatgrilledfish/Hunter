@@ -79,6 +79,19 @@ def validate_schema(value, schema, partial=False, path='$', depth=0):
             validate_schema(item, schema['items'], partial, path+f'[{index}]', depth+1)
 
 
+def coverage_scope(text):
+    """Explicit requested population; output field names carry no scope."""
+    local=bool(re.search(r'only\s+(?:the\s+)?first\s+page|仅(?:查询|统计|返回)?(?:首屏|第一页|首[页屏])|只(?:查询|统计|返回)?第一页',text,re.I))
+    complete=bool(re.search(r'\b(?:all|every)\s+(?:the\s+)?(?:records?|rows?|pages?|results?|items?)\b|'
+                            r'\b(?:entire|complete)\s+dataset\b|(?:全部|所有|全量)(?:数据|记录|条目|结果|页面)|遍历.*分页',text,re.I))
+    paths=[]
+    from urllib.parse import urlsplit
+    for address in re.findall(r'https?://[^\s`<>\"\']+',text):
+        path=urlsplit(address.rstrip('.,;。')).path
+        if path and path not in paths:paths.append(path)
+    return dict(complete=complete and not local,local=local,paths=paths)
+
+
 def contract(task):
     statements = [task.text]
     for record in task.evidence.values():
@@ -93,6 +106,7 @@ def contract(task):
         "json_required": bool((re.search(r"(?<![.\w])JSON\b", text, re.I) and not re.search(r"without\s+JSON|不(?:要|使用|用)\s*JSON|纯文本", text, re.I)) or "合法 JSON" in feedback or "合法JSON" in feedback),
         "execution_required": bool(re.search(r"\bAPI\b|\./check|修复|查询|query|repair|run .*check", text, re.I)),
         "required_fields": explicit_fields(text),
+        "coverage_scope": coverage_scope(text),
         "schema": answer_schema(text),
         "validation_scope": "explicit field lists and declared structural schema; semantic correctness requires execution/judge evidence",
     }
@@ -123,11 +137,18 @@ def validate(task, spec, value, refs):
     # Concrete observed pagination can disprove a complete API aggregation.
     # This does not infer missing pages, field meanings or unseen API contracts.
     aggregate_fields = set(fields) | set((required.get('schema') or {}).get('properties', {}))
-    aggregate = bool(aggregate_fields & {'world_heritage_count','oldest_era'})
-    if required['execution_required'] and aggregate and not partial:
+    scope=required['coverage_scope']
+    aggregate = scope['complete'] or bool(aggregate_fields & {'world_heritage_count','oldest_era'}) and not scope['local']
+    if required['execution_required'] and aggregate and (scope['complete'] or not partial):
         for result in results:
             for event in result.get('runtime_events', []):
                 if event.get('kind') != 'json_shape':
+                    continue
+                datasets=event.get('pagination_datasets',[])
+                relevant=[d for d in datasets if not scope['paths'] or d.get('path') in scope['paths']]
+                if any(d.get('complete') is False for d in relevant):
+                    raise ValueError('API pagination incomplete: requested dataset has uncovered record ranges')
+                if datasets:
                     continue
                 coverage = event.get('pagination_coverage')
                 if isinstance(coverage,dict) and coverage.get('complete') is False:

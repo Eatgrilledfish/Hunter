@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "version": "observed-batch-work-and-survival-2026-09-14",
-  "basis": "Personal mine batches; one worker day itinerary timed through sale, checkout, building and return; weapons then front walls then base; 50% normal wall repair with observed-loss emergencies; exterior movement and treatment share one survival decision. P rotates A/B, W guards C, M remains exterior.",
+  "version": "continuous-clear-defence-recovery-2026-09-16",
+  "basis": "Observed own-wave clearance permits continuous safe collection, sale, checkout and use with next-duty deadlines. Actual base injury and threatened front walls share funded recovery plans; normal wall repair begins at 30% with observed-loss prepositioning. Personal medical and repair stock use confirmed receipts. P rotates A/B, W guards C, M serves exterior work and inaccessible wall corners.",
   "parameters": {
     "planning_seconds": 2.8,
     "lock_seconds": 0.15,
@@ -36,7 +36,7 @@
     "economy_first_enabled": true,
     "staged_walls_enabled": true,
     "construction_site_coordination_enabled": true,
-  "wall_repair_health_fraction": 0.3,
+    "wall_repair_health_fraction": 0.3,
     "defence_procurement_enabled": false,
     "defence_gold_limit": 200,
     "joint_lookahead_enabled": false,

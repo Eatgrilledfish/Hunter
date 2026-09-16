@@ -30,6 +30,7 @@ class SunsetMarket:
     upgrade_travellers: set = field(default_factory=set)
     upgrade_owner: str | None = None
     checkout_intents: dict = field(default_factory=dict)
+    checkout_targets: dict = field(default_factory=dict)
     caretaker_day: CaretakerDay = field(default_factory=CaretakerDay)
 
     def prepare(self, world, clock, rules, policy, guidance, jobs, excluded, deadline):
@@ -56,9 +57,17 @@ class SunsetMarket:
             self.upgrade_travellers.clear()
             self.upgrade_owner=None
             self.checkout_intents.clear()
+            self.checkout_targets.clear()
         if getattr(world,'critical_base_ids',()):
             self.checkout_intents.clear()  # New survival priority overrides routine purchases.
+            self.checkout_targets.clear()
         world.checkout_order_limits=self.checkout_intents
+        self.checkout_targets={i:[(uid,level) for uid,level in targets
+            if uid in world.ours and world.ours[uid].alive
+            and world.ours[uid].level is not None and world.ours[uid].level<=level]
+            for i,targets in self.checkout_targets.items() if i in world.ours and world.ours[i].alive}
+        world.checkout_targets=self.checkout_targets
+        world.quoted_checkout_targets={}
         if (not policy.day_schedule_enabled or clock.phases != {'day'} or clock.day is None
                 or not world.phase_task_observed or time.monotonic()>=deadline):
             return []
@@ -83,8 +92,15 @@ class SunsetMarket:
                     # reserved, but a free P can spend newly received gold.
                     self.upgrade_owner = None
                 owner = self.upgrade_owner if self.upgrade_owner in reachable else None
+                at_shop = [i for i in reachable if world.near_zone(world.ours[i].pos,'weaponShop')]
+                if (owner is not None and owner not in at_shop and at_shop
+                        and owner not in self.pending
+                        and not any(n and 'UpgradeVoucher' in name for name,n in world.ours[owner].inventory.items())):
+                    # An unpaid traveller cannot reserve the counter while a
+                    # free teammate is already there. Actual paid deliveries
+                    # and unresolved purchase receipts retain their owner.
+                    owner=min(at_shop)
                 if owner is None:
-                    at_shop = [i for i in reachable if world.near_zone(world.ours[i].pos,'weaponShop')]
                     owner = min(at_shop) if at_shop else roster.p if roster.p in reachable else roster.w
                 world.upgrade_checkout_actor = owner
                 emergency = [u for u in world.stations if u.id in getattr(world,'critical_base_ids',()) and u.level in (1,2)]
@@ -94,7 +110,7 @@ class SunsetMarket:
                 # Each free guard gets a bounded share. A complex wall tour
                 # must not consume the pioneer's entire shopping search.
                 worker_deadline=(time.monotonic()+max(0,deadline-time.monotonic())*.5
-                                 if roster.p in free else deadline)
+                                 if roster.p in free and not (owner==roster.w and roster.w in at_shop) else deadline)
                 daily = (None if worker_rescue else
                          self.caretaker_day.prepare(world,clock,rules,policy,guidance,jobs,excluded,worker_deadline))
                 from .upgrade_dispatch import prepare
@@ -407,6 +423,11 @@ class SunsetMarket:
 
     def finalize(self, world, response):
         for actor,command in response['roleCommandMap'].items():
+            if (command.get('action')=='buy' and 'UpgradeVoucher' in command.get('name','')
+                    and actor in getattr(world,'quoted_checkout_targets',{})):
+                # Preserve the feasible delivery subset, not hypothetical
+                # inventory. Matching still consumes only observed vouchers.
+                self.checkout_targets[actor]=world.quoted_checkout_targets[actor]
             if (command.get('action')=='use' and 'UpgradeVoucher' in command.get('name','')
                     and command in getattr(world,'sunset_actions',{}).get(actor,())):
                 self.upgrade_travellers.add(actor)
@@ -439,6 +460,8 @@ def permits(world, candidate):
         and (actor.health <= (200 if actor.kind=='pioneer' else 220)*.5
              or world.near_zone(actor.pos,'weaponShop'))
         and getattr(getattr(world,'strategy_policy',None),'medical_stock_enabled',False))
+    if command in getattr(world,'personal_repair_stock_commands',{}).get(identity,()):
+        return True  # Exact in-place order; investment and joint cash validation still apply.
     if command in getattr(world,'treasure_actions',{}).get(identity,()):
         return True
     if identity == getattr(world,'caretaker_day_actor',None):

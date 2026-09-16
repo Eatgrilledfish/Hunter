@@ -123,6 +123,8 @@ def upgrade_demand(world, policy, *, priority_ids=(), rules=None):
                                         else 2 if prefix == "Weapon" else 3 if prefix == "Station" else 4}
         if staged and unit.id in targets:
             targets[unit.id]["rank"] = upgrade_rank(world, unit)
+            from .wall_pressure import priority
+            targets[unit.id]['pressure_priority'] = priority(world,unit)
     # Fix the purchasing tier before assigning held stock. Held Gatling range
     # vouchers and rocket vouchers are not observed upgrades yet; their pending
     # deliveries must not release this tier's budget to lower-priority work.
@@ -169,10 +171,10 @@ def match_carried_supply(targets, actors, deadline, field):
                     continue
                 length = field(actor, target).get(actor.pos)
                 if length is not None:
-                    options.append((target["rank"], length, identity, target_id))
+                    options.append((target["rank"], target.get('pressure_priority',(1,0,0)), length, identity, target_id))
         if not options:
             break
-        _, length, identity, target_id = min(options)
+        _, _, length, identity, target_id = min(options)
         target = targets.pop(target_id)
         supply[identity][target["name"]] -= 1
         jobs.setdefault(identity, (target, length))
@@ -290,12 +292,12 @@ def propose(world, policy, deadline, task_actor=None, *, plans=None, priority_id
                     # already at the counter may buy immediately instead of
                     # waiting several rounds for P to arrive from the battery.
                     preferred=getattr(world,'upgrade_preferred_buyer',None)
-                    options.append((target["rank"], bool(preferred) and identity!=preferred,
+                    options.append((target["rank"], target.get('pressure_priority',(1,0,0)), bool(preferred) and identity!=preferred,
                                     identity in getattr(world,'upgrade_busy_ids',()), bool(traders) and to_shop > 0,
                                     identity not in traders, total, price, identity, target_id, to_shop, stand))
         if not options:
             break
-        _, _, _, _, _, total, price, identity, target_id, length, stand = min(options)
+        _, _, _, _, _, _, total, price, identity, target_id, length, stand = min(options)
         actor, target = buyers.pop(identity), targets.pop(target_id)
         begin = len(result)
         gold -= price

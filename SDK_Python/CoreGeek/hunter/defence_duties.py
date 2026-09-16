@@ -55,7 +55,41 @@ def seal_service_steps(world):
     return 2*max(0,distance(world.task_side_plan['w'],opening)-1)+1
 
 
-def ingress_reserve(world, policy, walk):
+def alternate_seal_tour(world, deadline):
+    """Quote W's actual entry, seal and post-closure gun return with P in place."""
+    from copy import copy
+    import time
+    from .day_access import gate
+    from .navigation import distance_field, neighbours
+    from .rules import station_rings
+    plan = world.task_side_plan
+    opening = gate(world)
+    if opening == plan['gate']:
+        return 0, set()
+    cached = getattr(world, 'alternate_seal_quote', None)
+    if cached is not None:return cached
+    worker = world.ours.get(world.night_roster.w)
+    pioneer = world.ours.get(rotator(world))
+    if not worker or not pioneer:return float('inf'), set()
+    blue, _ = station_rings(plan['anchor'])
+    view = copy(world)
+    view.occupied = (world.occupied - {worker.pos, pioneer.pos}) | {plan['w']}
+    reach = distance_field(view, {worker.pos}, worker.pos, deadline)
+    closed = copy(view)
+    closed.occupied = view.occupied | {opening}
+    home = distance_field(closed, stands(world, worker.id), worker.pos, deadline)
+    entries = (set(neighbours(opening)) & blue) - {plan['w']}
+    choices = [(reach[q] + 1 + home[q], q) for q in entries & reach.keys() & home.keys()]
+    if time.monotonic() >= deadline or not choices:
+        return float('inf'), set()
+    cost = min(n for n, _ in choices)
+    result = cost, {q for n, q in choices if n == cost}
+    world.alternate_seal_phases = [(reach[q],1+home[q]) for _,q in choices]
+    world.alternate_seal_quote = result
+    return result
+
+
+def ingress_reserve(world, policy, walk, deadline=float('inf')):
     """Use the same clearance window for task admission and ordered ingress."""
     from .rules import station_rings
     reserve = walk + policy.return_buffer
@@ -68,6 +102,16 @@ def ingress_reserve(world, policy, walk):
             # Walking already includes the passage. Budget the observed final
             # seal and a worker yield, not another fixed perimeter traversal.
             reserve += int(opening is not None and opening not in walls)
+            if opening is not None and opening not in walls and opening != world.task_side_plan['gate']:
+                tour, _ = alternate_seal_tour(world, deadline)
+                phases=getattr(world,'alternate_seal_phases',())
+                if phases:
+                    # Both exterior approaches proceed concurrently. Only
+                    # W's seal and post-closure return follow P's ingress.
+                    # The phase paths already exclude P's final occupied stand.
+                    reserve += min(max(0,approach-walk)+tail-1 for approach,tail in phases)
+                else:
+                    reserve += max(0, tour - 1)  # Keep the conservative unknown-route fallback.
             roster = getattr(world, 'night_roster', None)
             worker = world.ours.get(roster.w) if roster else None
             pioneer = world.ours.get(rotator(world)) if roster else None

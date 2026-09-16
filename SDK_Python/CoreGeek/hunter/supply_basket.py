@@ -61,14 +61,24 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
     from .wall_policy import purchase_units
     stage_ids = {u.id for u in purchase_units(world)}
     held, unfilled, covered, owners = [], [], set(), {}
-    for req in requirements(world, rules, policy):
+    commitments={i:set(targets) for i,targets in getattr(world,'checkout_targets',{}).items()}
+    def committed(req,identity):
+        return (req['unit'].id,req['level']) in commitments.get(identity,set())
+    requests=requirements(world,rules,policy)
+    # A receipt must retain the quoted feasible targets. Reassigning a partial
+    # batch by unit ID can add an excluded exterior corner and invalidate the
+    # remaining checkout/use circuit immediately after the first purchase.
+    from .wall_pressure import priority
+    requests=sorted(enumerate(requests),key=lambda pair:(pair[1]['rank'],pair[1]['level'],
+        priority(world,pair[1]['unit']),not any(committed(pair[1],i) for i in carriers),pair[0]))
+    for _,req in requests:
         if time.monotonic() >= deadline:
             return None
         uid = req['unit'].id
-        possible = [(owners.get(uid) != i, reachable(i,req), i) for i in carriers
+        possible = [(not committed(req,i),owners.get(uid) != i, reachable(i,req), i) for i in carriers
                     if supply[i][req['name']] and reachable(i,req) is not None]
         if possible:
-            _, _, owner = min(possible)
+            _, _, _, owner = min(possible)
             supply[owner][req['name']] -= 1
             owners.setdefault(uid, owner)
             covered.add((uid, req['level']))
@@ -101,7 +111,13 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
             and not any(g.id in stage_ids for g in world.weapons)):
         price=world.shop.get('WallFixer',0)
         if price>0:
-            count=min(space,available//price,max(0,2-actor.inventory['WallFixer']))
+            from .wall_policy import investment_fund
+            investment_reserve,_=investment_fund(world)
+            # The minimum working stock is still subject to the same next
+            # investment reserve as the final purchase permit. An impossible
+            # top-up must not keep prepaid delivery waiting at the shop.
+            stock_cash=max(0,available-max(0,investment_reserve-reserve))
+            count=min(space,stock_cash//price,max(0,2-actor.inventory['WallFixer']))
             if limits is not None:count=min(count,limits['WallFixer'])
             if count:
                 planned.extend(dict(name='WallFixer',rank=1.9,level=0,unit=None) for _ in range(count))
@@ -149,6 +165,14 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
         from .wall_policy import pressure_ready
         if slots and policy.summon_pressure_enabled and pressure_ready(world):
             stock.append(('SmallRobotSummonOrder', actor.inventory['SmallRobotSummonOrder']+slots))
+    # Forecast proceeds may fund necessary investment, but must not make an
+    # already affordable upgrade depend on an extra sale just to add optional
+    # ammunition. Keep the whole basket payable from observed cash in that case.
+    primary_cost = sum(world.shop[e['name']] for e in planned)
+    cash_funded_investment = bool(any(e['unit'] is not None for e in planned)
+        and primary_cost <= max(0,(world.gold or 0)-reserve))
+    if cash_funded_investment:
+        available = min(available,max(0,(world.gold or 0)-reserve-primary_cost))
     for name, target in stock:
         price = world.shop.get(name,0)
         if price <= 0: continue
@@ -159,7 +183,8 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
             planned.extend(dict(name=name,rank=4,level=0,unit=None) for _ in range(count))
             available -= count*price;space -= count
     return dict(held=held, planned=planned, reserve=reserve, unspent=available,
-                prepaid=prepaid, stock_targets=stock, unfunded_defence_reserve=defence_reserve)
+                prepaid=prepaid, stock_targets=stock, unfunded_defence_reserve=defence_reserve,
+                cash_funded_investment=cash_funded_investment)
 
 
 def use_tour(world, actor, entries, start, home, deadline, fields=None, *, arrival_offset=0):
@@ -180,7 +205,15 @@ def use_tour(world, actor, entries, start, home, deadline, fields=None, *, arriv
                    if not any(t['unit'].id==r['unit'].id and t['level']<r['level'] for t in remaining)
                    for p in interaction_cells(view,[r['unit'].pos],point) if p in reach]
         if not choices:return None
-        length,_,_,_,point,index = min(choices)
+        # The delivery planner prioritizes last night's damaged wall within
+        # a tier. Quote that same order rather than a shorter unrelated tour.
+        from .wall_pressure import priority
+        if any(priority(world,remaining[c[-1]]['unit'])[0] == 0 for c in choices):
+            choices.sort(key=lambda c:(c[1],priority(world,remaining[c[-1]]['unit']),c[0],c[2],c[3]))
+            chosen=choices[0]
+        else:
+            chosen=min(choices)
+        length,_,_,_,point,index = chosen
         entry = remaining[index]
         if entry.get('pending'):
             total=max(total+length,max(0,entry['ready_after']-world.round-arrival_offset))+1
@@ -208,6 +241,13 @@ def quote(world, actor, clock, rules, policy, deadline, *, home, tail=None, end=
     fields, routes = {}, {}
     def attempt(entries):
         orders = Counter(e['name'] for e in entries)
+        # A cash-funded building investment does not need an ore-sale detour.
+        # Apply this before fitting subsets, or that unnecessary detour can
+        # discard a required voucher even when checkout and delivery fit.
+        funded = (any(e['unit'] is not None for e in entries)
+            and sum(world.shop[name]*n for name,n in orders.items())
+                <= max(0,(world.gold or 0)-data['reserve']))
+        sales = {} if funded else sale_stock
         if actor.kind == 'pioneer' and not orders and (data['held'] or not sale_stock):
             # Checkout has finished. Start delivery at the observed carrier,
             # not at home followed by a second outward tour of the same walls.
@@ -230,9 +270,9 @@ def quote(world, actor, clock, rules, policy, deadline, *, home, tail=None, end=
                 if time.monotonic()>=deadline:return None
             if not costs:return None
             checkout=weighted_field(world,costs,actor,deadline) or {}
-            sale=(weighted_field(world,{p:checkout[p]+len(sale_stock) for p in
+            sale=(weighted_field(world,{p:checkout[p]+len(sales) for p in
                   interaction_cells(world,world.zones.get('vendor',()),actor.pos) if p in checkout},actor,deadline)
-                  if sale_stock else checkout) or {}
+                  if sales else checkout) or {}
             required=sale.get(actor.pos)
             return dict(data,planned=entries,orders=orders,use_steps=min(costs.values())-len(orders),
                         checkout=checkout,sale=sale,required=required,
@@ -242,13 +282,13 @@ def quote(world, actor, clock, rules, policy, deadline, *, home, tail=None, end=
         delivery = {p:n+use_steps for p,n in tail.items()}
         # Every extra use/purchase adds a constant to the same travel field.
         # Reuse navigation while considering several feasible subsets.
-        key = bool(orders)
+        key = bool(orders), bool(sales)
         if key not in routes:
             checkout_base = (weighted_field(world,{p:tail[p] for p in shops if p in tail},actor,deadline)
                              if orders else tail)
-            sale_base = (weighted_field(world,{p:checkout_base[p]+len(sale_stock) for p in
+            sale_base = (weighted_field(world,{p:checkout_base[p]+len(sales) for p in
                          interaction_cells(world,world.zones.get('vendor',()),actor.pos) if p in checkout_base},actor,deadline)
-                         if sale_stock and checkout_base else checkout_base)
+                         if sales and checkout_base else checkout_base)
             routes[key] = checkout_base or {},sale_base or {}
         checkout_base,sale_base = routes[key]
         extra = use_steps+len(orders)
@@ -258,8 +298,14 @@ def quote(world, actor, clock, rules, policy, deadline, *, home, tail=None, end=
         return dict(data, planned=entries, orders=orders, use_steps=use_steps,
                       checkout=checkout, sale=sale, required=required,
                       fits=required is not None and required+margin <= clock.until_night)
+    def remember_targets(trip):
+        if trip is not None and hasattr(world,'quoted_checkout_targets'):
+            world.quoted_checkout_targets[actor.id]=list(dict.fromkeys(
+                (e['unit'].id,e['level']) for e in trip['held']+trip['planned']
+                if e['unit'] is not None and not e.get('pending')))
+        return trip
     full = attempt(planned)
-    if full and full['fits']:return full
+    if full and full['fits']:return remember_targets(full)
     selected, best = [], attempt([])
     covered = set(data['prepaid'])
     budget = data['unspent']+sum(world.shop[e['name']] for e in planned)
@@ -291,4 +337,4 @@ def quote(world, actor, clock, rules, policy, deadline, *, home, tail=None, end=
         trial=attempt(selected+entries)
         if trial and trial['fits']:
             selected+=entries;best=trial;available-=count*price;counts[name]+=count
-    return best
+    return remember_targets(best)

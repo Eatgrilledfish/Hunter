@@ -136,16 +136,27 @@ def propose(world, clock, deadline, trapped=False):
                     'exterior survival: restore HP when no survivable first step exists')],dict(
                     report,status='treat_before_escape',actor=actor.id,decision='Medicine')
             return [], dict(report,status='no improving legal exterior route')
-    # Preserve exposure, immediate risk and escape-exit ordering. Only tied
-    # routes prefer observed staffed fire coverage, so a pursuing robot is
-    # less likely to be led away from the defenders' usable weapons.
+    # Preserve projected exposure and immediate risk. Among equally safe
+    # routes prefer staffed fire support, including distance to its edge
+    # when every local endpoint is outside range. Exit count breaks ties.
     staffed = [g for g in world.weapons if g.attack_range is not None and
         any(i in world.ours and world.ours[i].alive and distance(world.ours[i].pos,g.pos)<=1
             for i in world.night_defenders)]
     def support(row):
-        return sum(distance(g.pos,row[4][-1]) <= g.attack_range for g in staffed)
-    score,first,_,_,route,total = min(
-        ranked,key=lambda r:(r[0],r[1],r[2],-support(r),r[3],r[4]))
+        return min(sum(distance(g.pos,q) <= g.attack_range for g in staffed) for q in row[4])
+    def turning(row):
+        # An observed displacement can turn instead of continuing straight.
+        # Compare this uncertainty only after established exposure and support;
+        # it is not an asserted speed, attack cadence, or expanded hard range.
+        return sum(r.attack_power for depth,q in enumerate(row[4],1) for r in known
+            if distance(q,r.pos) <= r.attack_range + max(map(abs,motion.get(r.id,(0,0))))*depth)
+    chosen = min(
+        ranked,key=lambda r:(r[0],r[1],-support(r),
+                             min((max(0,distance(g.pos,r[4][-1])-g.attack_range) for g in staffed),default=0),
+                             turning(r),
+                             min((distance(g.pos,r[4][-1]) for g in staffed),default=0),
+                             r[2],r[3],r[4]))
+    score,first,_,_,route,total = chosen
     # A strictly safer legal step wins over an independent high-scoring heal.
     # If even the first step exceeds current HP but a carried dose improves the
     # stationary scenario, permit healing as the one survival action instead.
@@ -159,6 +170,9 @@ def propose(world, clock, deadline, trapped=False):
                   known_damage_after=damage(point),observed_route=route,
                   route_end_damage=damage(route[-1]),route_damage_bound=total,
                   damage_budget=actor.health*.25,no_observed_exposure=not unknown and damage(point)==0,
-                  decision='move',hold_scenario=stay,move_scenario=score)
+                  decision='move',hold_scenario=stay,move_scenario=score,
+                  turning_exposure_scenario=turning(chosen),
+                  staffed_distance=min((distance(g.pos,route[-1]) for g in staffed),default=None),
+                  turning_basis='observed displacement; tie-break only, not a movement rule')
     return [Candidate(actor.id,dict(action='move',targetPos=[pos_json(point)]),1200,
                       'exterior survival: improving escape before personal treatment')],report

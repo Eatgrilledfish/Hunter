@@ -169,6 +169,12 @@ class RepairPlan:
                 continue
             if not actor.inventory['WallFixer'] and not (maintenance_mode and any(
                     actor.inventory[name] for name in ('WallUpgradeVoucher1','WallUpgradeVoucher2'))):
+                unmet = [wall for wall in walls if repair_decision.eligible(world, wall, rules, policy)]
+                if unmet:
+                    wall = min(unmet, key=lambda w:(w.pos not in getattr(world,'monster_front_walls',()),w.health,w.id))
+                    self.diagnostic[identity] = dict(phase='NO_STOCK',wall=wall.id,stock=0,
+                        reason='observed repair demand lacks a personally carried repair item',
+                        observed_cooldown=window)
                 if current:
                     current['phase'] = 'RETURN_C'
                     home = distance_field(routing, c_stands, actor.pos, deadline)
@@ -190,15 +196,11 @@ class RepairPlan:
                     continue
                 maximum=rules.health_limit(world,wall)
                 wall_pressure = exposure[wall.pos]
-                item = None
+                upgrade_item = None
                 if maintenance_mode and wall.level in (1,2) and actor.inventory[f'WallUpgradeVoucher{wall.level}']:
                     from .procurement import upgrade_allowed
-                    if upgrade_allowed(world,wall,policy,rules):item=f'WallUpgradeVoucher{wall.level}'
-                if item is None and actor.inventory['WallFixer'] and repair_decision.eligible(
-                        world, wall, rules, policy, service_steps=max(1, window or 1)+1,
-                        pressure=wall_pressure):
-                    item = 'WallFixer'
-                if item is None:
+                    if upgrade_allowed(world,wall,policy,rules):upgrade_item=f'WallUpgradeVoucher{wall.level}'
+                if upgrade_item is None and not actor.inventory['WallFixer']:
                     continue
                 emergency = wall_pressure >= wall.health
                 stands = interaction_cells(routing, [wall.pos], actor.pos)
@@ -206,6 +208,15 @@ class RepairPlan:
                     stands &= {actor.pos}
                 stands -= {plan['w']} if identity == defence_duties.caretaker(world) else set()
                 for stand in stands & outgoing.keys():
+                    item=upgrade_item
+                    # Cooldown bounds forgone firing opportunities, not time
+                    # until a worker can apply the pack. Judge each real stand
+                    # using its outbound path plus the use action; returning
+                    # to the gun happens after the wall has been restored.
+                    if item is None and repair_decision.eligible(world,wall,rules,policy,
+                            service_steps=outgoing[stand]+1,pressure=wall_pressure):
+                        item='WallFixer'
+                    if item is None:continue
                     back = home.get(stand) if maintenance_mode or identity == defence_duties.caretaker(world) else 0
                     if back is None:
                         continue

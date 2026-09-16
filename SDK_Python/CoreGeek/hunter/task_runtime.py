@@ -15,6 +15,7 @@ _hunter_temporal = {}
 _hunter_rows_observed = 0
 _hunter_json_dataset = None
 _hunter_page_sets = {}
+_hunter_coverages = {}
 def _hunter_sample(value, depth=0):
     if depth > 3:return '<nested value omitted>'
     if isinstance(value,dict):
@@ -99,6 +100,11 @@ def _hunter_loads(*args,**kwargs):
                     covered=sum(max(0,min(end,total)-min(start,total)) for start,end in merged)
                     record['pagination_coverage']={'total_count':total,'covered_records':covered,
                         'complete': covered==total,'ranges':merged[:8],'ranges_partial':len(merged)>8}
+                    _hunter_coverages[key]=dict(record['pagination_coverage'],path=_hunter_json_dataset[2])
+        if _hunter_coverages:
+            # Preserve each separately keyed population when a later request
+            # changes endpoint or query. Query values are never emitted.
+            record['pagination_datasets']=list(_hunter_coverages.values())
         prior=next((i for i,e in enumerate(_hunter_events) if e.get('kind')=='json_shape'),None)
         if prior is not None:_hunter_events[prior]=record
         else:_hunter_event(**record)

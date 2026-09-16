@@ -158,7 +158,14 @@ class Diagnostics(logging.Handler):
             duty['rumour'] = rumour
         treasure = obj(decision.get('treasure'))
         if treasure.get('stage') not in (None,'inactive'):
-            duty['treasure'] = {k:treasure[k] for k in ('stage','actor','target','items','required','opening','closing','reason','hypotheses','unresolved') if k in treasure}
+            duty['treasure'] = {k:treasure[k] for k in ('stage','phase','actor','target','items','required','opening','closing','reason','hypotheses','unresolved','held_offerings','retained_plan','rejections') if k in treasure}
+        cleared = obj(decision.get('night_clear'))
+        outside_repair=obj(decision.get('exterior_repair'))
+        if outside_repair.get('stage') not in (None,'inactive','NO_DEMAND'):
+            duty['exterior_repair']=outside_repair
+        if cleared.get('stage') not in (None,'inactive'):
+            duty['night_clear'] = {k:cleared[k] for k in ('stage','actor','own_clear','return_steps',
+                'night_remaining','economic_remaining','own_wall_material_needed','reason') if k in cleared}
         market = obj(decision.get('sunset_market'))
         if market.get('stage') not in (None,'inactive'):
             duty['market'] = {k:market[k] for k in ('stage','buyer','fallback_worker','waiting','item','num','gold','blocked','target','required','worker_busy') if k in market}
@@ -255,7 +262,9 @@ class Diagnostics(logging.Handler):
             gate.get('stage'),obj(duty.get('gate')).get('wall_observed'),
             assignment.get('gate_confirmed_round'),
             tuple((i,r['phase'],r['wall'],r['selected']) for i,r in repairs.items()),
-            obj(duty.get('forage')).get('issued'))
+            obj(duty.get('forage')).get('issued'),
+            (cleared.get('stage'),cleared.get('reason'),cleared.get('own_clear')),
+            (treasure.get('stage'),treasure.get('phase'),treasure.get('reason')))
         return duty, marker
 
     def _notice(self,state,identity,category,signature):
@@ -338,18 +347,25 @@ class Diagnostics(logging.Handler):
     def _task_lifecycle(self,state,raw,response,task,number):
         previous=state.get('task_totals')
         identity=task.get('id')
+        observed_errors=[dict(round=number,errorCode=e.get('errorCode'),
+            description=llm_trace.redact(str(e.get('description','')))[:160])
+            for e in array(raw.get('errors'))[:4] if isinstance(e,dict) and e.get('errorCode')==2]
+        if previous:
+            history=previous.setdefault('judge_errors',[])
+            history.extend(e for e in observed_errors if e not in history)
+            previous['judge_errors']=history[-4:]
         if previous and previous['task']!=identity:
             self._write_compact('task_end',**llm_trace.fit({**previous,
                 'end':task.get('end') or 'task_changed', 'last_diagnostic':state.get('last_task_diagnostic'),
-                'judge_errors':[{k:e.get(k) for k in ('errorCode','description')}
-                    for e in array(raw.get('errors'))[:2] if isinstance(e,dict)]}))
+                'judge_errors':previous.get('judge_errors',[])}))
             state['task_totals']=None;state['last_task_diagnostic']=None
         if not identity:return
         totals=state.get('task_totals')
         if totals is None:
             active=getattr(self.local,'task_active',{})
             totals=state['task_totals']={'task':identity,'start':number,'accept':active.get('accept_round'),
-                'timeout':active.get('timeout'),'llm_calls':0,'cmd_calls':0,'submitted':0}
+                'timeout':active.get('timeout'),'llm_calls':0,'cmd_calls':0,'submitted':0,
+                'judge_errors':observed_errors}
         totals['file']=task.get('file') or totals.get('file')
         totals['llm_calls']+=bool(response.get('prompt'))
         totals['cmd_calls']+=bool(response.get('executeCmd'))

@@ -58,6 +58,7 @@ class Directive:
     upgrade_actions: dict = field(default_factory=dict)
     recovery_actions: dict = field(default_factory=dict)
     medical_actions: dict = field(default_factory=dict)
+    medical_detour_actors: set = field(default_factory=set)
     economic_route_actions: dict = field(default_factory=dict)
     economic_route_goals: dict = field(default_factory=dict)
     operator_plan_status: str = "unplanned"
@@ -67,11 +68,23 @@ class Directive:
     site_clear_actions: dict = field(default_factory=dict)
     roster_transit_actions: dict = field(default_factory=dict)
     repair_actions: dict = field(default_factory=dict)
+    repair_stock_pauses: set = field(default_factory=set)
+    repair_stock_waits: set = field(default_factory=set)
 
     def treatment_view(self, actor):
         """Replace only optional economic steps for a proven treatment trip."""
         view = copy(self)
         view.medical_actions = {i: actions for i, actions in self.medical_actions.items() if i != actor}
+        plan = self.work_plans.get(actor, {})
+        if (plan.get('owner') == 'mine_batch' and plan.get('phase') == 'harvest'
+                or plan.get('waiting_for_route')):
+            view.work_plans = {i: p for i, p in self.work_plans.items() if i != actor}
+        if actor in self.medical_detour_actors:
+            # The medical planner has budgeted a round trip back to the
+            # construction start plus the original complete work obligation.
+            view.construction_actions = {i: c for i,c in self.construction_actions.items() if i != actor}
+            if plan.get('owner') == 'mine_batch':
+                view.work_plans = {i:p for i,p in self.work_plans.items() if i != actor}
         for name in ('funded_actions', 'day_actions'):
             commitments = getattr(self, name)
             actions = commitments.get(actor, ())
@@ -106,7 +119,31 @@ class Directive:
             targets = candidate.command.get("targetPos", [])
             if len(targets) == 1 and (targets[0].get("x"), targets[0].get("y")) in self.blocked_moves.get(candidate.actor, set()):
                 return False
+        if candidate.command in self.medical_actions.get(candidate.actor, ()):
+            return self.treatment_view(candidate.actor).permit(candidate)
+        if identity in self.repair_stock_waits:
+            return candidate.command.get('action')=='use' and candidate.command.get('name') in {'Medicine','Bomb','DizzyWeapon'}
         plan = self.work_plans.get(identity)
+        if plan and plan.get('waiting_for_route'):
+            action = candidate.command.get('action')
+            route = self.return_routes.get(identity, {})
+            targets = candidate.command.get('targetPos', [])
+            due_return = (action == 'move' and route.get('due') and len(targets) == 1
+                and (targets[0].get('x'),targets[0].get('y')) in route.get('steps',()))
+            required = (candidate.command == self.seal_builds.get(identity)
+                or candidate.command in self.site_clear_actions.get(identity,())
+                or candidate.command in self.roster_transit_actions.get(identity,())
+                or any(candidate is c for c in self.candidates))
+            if action not in {'attack','use'} and not due_return and not required:
+                return False
+        if (identity in self.repair_stock_pauses and plan and plan.get('owner')=='mine_batch'
+                and plan.get('phase')=='harvest'
+                and candidate.command in self.repair_supply_actions.get(identity,())):
+            plan=None  # One in-place stocked pack was included in the construction budget.
+        if (self.medical_actions.get(candidate.actor) and plan and plan.get('owner') == 'mine_batch'
+                and plan.get('phase') == 'harvest'
+                and candidate.command.get('action') in {'move', 'collect', 'sell'}):
+            return False
         if plan and plan.get('at_duty'):
             return candidate.command.get('action') in {'attack', 'use'}
         if plan and plan['commands']:
@@ -275,6 +312,11 @@ def fallback_stands(world, *, include_pioneer, task_actor, allow_task_control, h
     return {u.id: p for u, p in zip(operators, best[1]) if p is not None}
 
 
+def return_reserve(world, policy, length):
+    """The mandatory route margin, shared with admission of optional tasks."""
+    return length+policy.return_buffer+(8 if world.defence_cells else 0)
+
+
 def return_plan(world, clock, stands, policy, deadline=float("inf"), *, failed_steps=None, force_due=False):
     """Publish all routes together; an interrupted refinement returns None."""
     routes, candidates = {}, []
@@ -307,8 +349,7 @@ def return_plan(world, clock, stands, policy, deadline=float("inf"), *, failed_s
         if policy.operator_safety_enabled and exposure(world, clock, actor.pos)["upper_per_attack_opportunity"]:
             steps.sort(key=lambda p: (exposure(world, clock, p)["upper_per_attack_opportunity"], p))
         # Near-complete walls require time for gate traffic and sealing after arrival.
-        seal_buffer = 8 if world.defence_cells else 0
-        slack = clock.until_night-length-policy.return_buffer-seal_buffer
+        slack = clock.until_night-return_reserve(world,policy,length)
         due = force_due or clock.phases != {"day"} or slack <= 0
         routes[actor.id] = {"stand": stand, "length": length, "steps": steps,
                            "slack_before_buffer": slack, "due": due}
@@ -601,7 +642,7 @@ def _pioneer_return_due(world, clock, policy, deadline):
         length = distance_field(relaxed,goals-relaxed.occupied,pioneer.pos,deadline).get(pioneer.pos)
     from .defence_duties import enabled, ingress_reserve
     return (time.monotonic() < deadline and length is not None
-            and clock.until_night <= (ingress_reserve(world,policy,length) if enabled(world)
+            and clock.until_night <= (ingress_reserve(world,policy,length,deadline) if enabled(world)
                 else length+policy.return_buffer+(8 if world.defence_cells else 0)))
 
 
