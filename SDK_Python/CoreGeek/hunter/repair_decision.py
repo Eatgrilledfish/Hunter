@@ -38,3 +38,8 @@ def stock_target(world, policy):
     """Actual daytime service debt plus the next night's personal carry target."""
     return (max(2,getattr(world,'caretaker_repair_target',policy.caretaker_repair_target))
             + max(0,getattr(world,'day_repair_demand',0)))
+
+
+def purchase_floor(world, policy):
+    """Fund normal night stock first; extra service debt follows upgrades."""
+    return min(stock_target(world,policy),max(2,policy.caretaker_repair_target))

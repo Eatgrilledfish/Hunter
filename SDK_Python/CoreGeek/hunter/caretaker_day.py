@@ -198,7 +198,9 @@ class CaretakerDay:
         if self.phase == 'harvest':
             repairs = getattr(world,'repair_commands',{}).get(actor.id,[])
             repair_steps = getattr(world,'day_repair_steps',{}).get(actor.id,1)
-            if repairs and repair_steps*2+home.get(actor.pos,float('inf'))+margin < clock.until_night:
+            paid_wall=any(actor.inventory[f'WallUpgradeVoucher{level}'] for level in (1,2))
+            if (repairs and (not paid_wall or getattr(world,'day_repair_urgent',False))
+                    and repair_steps*2+home.get(actor.pos,float('inf'))+margin < clock.until_night):
                 return self.finish(world,guidance,jobs,actor,
                     [Candidate(actor.id,c,260,'repair owned low-health wall before planning optional shopping') for c in repairs],
                     'repair')
@@ -303,6 +305,7 @@ class CaretakerDay:
         repairs=getattr(world,'repair_commands',{}).get(actor.id,[])
         repair_steps=getattr(world,'day_repair_steps',{}).get(actor.id)
         if (self.phase!='harvest' and repairs and repair_steps is not None
+                and getattr(world,'day_repair_urgent',False)
                 and actor.id not in getattr(world,'checkout_pending_actors',())
                 and 2*repair_steps+tail.get(actor.pos,float('inf'))+use_steps+margin<=clock.until_night):
             return self.finish(world,guidance,jobs,actor,
@@ -393,6 +396,15 @@ class CaretakerDay:
                             'deliver paid base while actual daytime passage remains open' if station else
                             'deliver paid wall while actual daytime passage remains open'))
                     return self.finish(world,guidance,jobs,actor,choices,'use')
+        # Preventive maintenance may follow an infeasible paid delivery, but
+        # must not repeatedly interrupt a feasible one. Emergency work above
+        # still preempts it, including during a checkout already in progress.
+        if (self.phase!='harvest' and repairs and repair_steps is not None
+                and actor.id not in getattr(world,'checkout_pending_actors',())
+                and 2*repair_steps+tail.get(actor.pos,float('inf'))+use_steps+margin<=clock.until_night):
+            return self.finish(world,guidance,jobs,actor,
+                [Candidate(actor.id,c,260,'maintenance after checking paid upgrade delivery') for c in repairs],
+                'repair')
         if (self.phase == 'harvest' and missing-{plan['gate']}
                 and actor.inventory['stone'] >= stone and self.front_rebuild_pending):
             self.phase = 'close'
