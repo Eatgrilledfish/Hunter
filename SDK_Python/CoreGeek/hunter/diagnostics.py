@@ -379,6 +379,8 @@ class Diagnostics(logging.Handler):
                 'timeout':active.get('timeout'),'llm_calls':0,'cmd_calls':0,'submitted':0,
                 'judge_errors':observed_errors}
         totals['file']=task.get('file') or totals.get('file')
+        stages=getattr(self.local,'task_active',{}).get('metrics',{})
+        if stages:totals['stages']=stages
         totals['llm_calls']+=bool(response.get('prompt'))
         totals['cmd_calls']+=bool(response.get('executeCmd'))
         totals['submitted']=task.get('submitted',0)

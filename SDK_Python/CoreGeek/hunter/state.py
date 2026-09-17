@@ -58,6 +58,7 @@ class Session:
     persistent_mover_injuries: dict = field(default_factory=dict)
     enemy_memory: dict = field(default_factory=dict)
     news: list = field(default_factory=list)
+    news_observations: dict = field(default_factory=dict)
     feedback_counts: dict = field(default_factory=dict)
     tasks: TaskEngine = field(default_factory=TaskEngine)
     intelligence: Intelligence = field(default_factory=Intelligence)
@@ -268,16 +269,20 @@ class Session:
             if not isinstance(text, str) or not text:
                 continue
             digest = fingerprint(text)
-            previous = next((n for n in reversed(self.news) if n["section"] == section), None)
-            # At a certain new day, identical text is retained as a publication
-            # candidate with ambiguity, rather than silently shifting an old date.
-            if previous and previous["hash"] == digest and (clock.day is None or previous["observed_day"] == clock.day):
+            previous = next((n for n in reversed(self.news) if n["section"] == section and n['hash'] == digest), None)
+            # Observation updates must not mutate an original publication or
+            # the evidence snapshot already sent to an asynchronous model.
+            if previous:
+                self.news_observations[(section,digest)] = dict(last_seen_round=world.round,
+                    observed_day=clock.day,republication_unknown=clock.day != previous['observed_day'])
                 continue
-            self.news.append({"section": section, "hash": digest, "text": text[:2*1024*1024],
+            self.news.append({"section": section, "hash": digest, "text": text,
                               "observed_round": world.round, "observed_day": clock.day,
                               "publication_certain": self.origin is not None and (world.round-self.origin) % 130 == 0,
                               "truncated_locally": len(text) > 2*1024*1024})
-        self.news = self.news[-64:]
+        # Exact raw strings are archived for the half, including oversized
+        # sources. The marker above prevents claiming they fit local analysis.
+        # Do not evict an old negation merely because more news arrived.
         self.tasks.reconcile(world, clock, self.epoch)
         self.intelligence.reconcile(world, clock, self)
         self.opponent.reconcile(world, clock)

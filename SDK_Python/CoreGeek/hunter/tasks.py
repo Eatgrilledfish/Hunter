@@ -13,7 +13,7 @@ from .documents import DocumentLedger
 from .answer_contract import contract as answer_contract, validate as validate_answer
 from .task_payload import pack_evidence
 from .program_recipes import ProgramRecipes, arguments as program_arguments
-from .task_timing import TaskTiming, descriptor as timing_descriptor
+from .task_timing import TaskTiming, descriptor as timing_descriptor, mark as mark_timing
 from .task_checkpoints import remember as remember_checkpoint, checkpoint as task_checkpoint
 from .task_lifecycle import TaskLifecycle, family as task_family
 from .rules import Clock, Policy
@@ -99,10 +99,13 @@ class LLMBudget:
                 self.calendars[origin]['blocked'] = True
         self._sync()
 
+    def available(self):
+        return self.history_known and not self.blocked and self.attempts < 3
+
     def reserve(self, active_task=False):
         if active_task:
             return True
-        if not self.history_known or self.blocked or self.attempts >= 3:
+        if not self.available():
             return False
         for origin in self.active_origins:
             self.calendars[origin]['attempts'] += 1
@@ -155,6 +158,7 @@ class TaskInstance:
     checkpoints: list = field(default_factory=list)
     task_family: str | None = None
     diagnostic_events: list = field(default_factory=list)  # Never included in model prompts.
+    metrics: dict = field(default_factory=dict)
 
 
 def binding_value(task_text, argument):
@@ -626,7 +630,8 @@ class TaskEngine:
             self.closed.append({"key": task.key, "reason": reason, "round": world.round,
                                 "outcome": "UNKNOWN", "submitted": task.submitted[-16:],
                                 "events": task.events[-16:],
-                                "evidence_count": len(task.evidence), "activation_round": task.activation_round})
+                                "evidence_count": len(task.evidence), "activation_round": task.activation_round,
+                                'stages':task.metrics})
             self.closed = self.closed[-32:]
         self.active = None
 
@@ -659,6 +664,7 @@ class TaskEngine:
         submitted["feedback"] = {"round": world.round,
                                  "action_accepted": accepted if type(accepted) is bool else None,
                                  "errors": errors}
+        mark_timing(task,'judge_error' if errors else 'submission_feedback',world.round,submitted['round'])
         # A true action result is an acknowledgement, never a pass-rate signal.
         task.events.append({"round": world.round,
                             "kind": "answer_wrong_or_partial" if errors else "submission_action_feedback",
@@ -735,6 +741,8 @@ class TaskEngine:
             self.generation += 1
             key = f"{epoch}:{self.generation}:{accepted_round}:{fingerprint(text)[:16]}"
             self.active = TaskInstance(key, pioneer.id, text, cells, accepted_round, world.round, timeout)
+            mark_timing(self.active,'activated',world.round)
+            if accepted_round is not None:mark_timing(self.active,'accepted',accepted_round)
             self.active.task_family = task_family(world, task_info)
             self.active.timing_descriptor = timing_descriptor(task_info, cells)
             self.active.statement_names = task_documents(text)
@@ -746,9 +754,17 @@ class TaskEngine:
             task.events.append({"kind": "exit_not_observed_still_adjacent", "round": world.round})
             task.phase = "ACTIVE"
         if task.llm_pending:
+            sent=task.llm_pending['round']
             self._consume_llm(world)
+            if task.llm_pending is None:mark_timing(task,'llm_resolved',world.round,sent)
         if task.sandbox_pending:
+            sent=task.sandbox_pending['round']
             self._consume_sandbox(world)
+            if task.sandbox_pending is None:mark_timing(task,'sandbox_resolved',world.round,sent)
+        if task.statement_ready and 'statement_ready' not in task.metrics.get('first',{}):
+            mark_timing(task,'statement_ready',world.round)
+        if task.answer:
+            mark_timing(task,'answer_ready',world.round)
         task.events = task.events[-32:]
 
     def _context(self, task, purpose):
@@ -933,6 +949,14 @@ class TaskEngine:
                     if not complete:
                         task.command_plan = {"operation":"read_slice", "path":task.statement_path,
                                              "offset":data.get("next_missing_byte", 0), "limit":8192}
+                elif (data.get('completeness')!='complete' and data.get('assembly_status')=='incomplete'
+                      and (data.get('path')=='API_DOCS.md' or str(data.get('path','')).endswith('/spec.md')
+                           or data.get('path')=='spec.md')):
+                    # Known task contracts need no model round per 8 KiB page.
+                    # The ledger validates ranges/hashes; oversized/unknown
+                    # files keep explicit incompleteness instead of looping.
+                    task.command_plan={'operation':'read_slice','path':data['path'],
+                                       'offset':data['next_missing_byte'],'limit':8192}
             except ValueError:
                 data = {"status": "error", "operation": "read_slice", "message": "slice integrity validation failed"}
                 usable = False
@@ -1047,7 +1071,7 @@ class TaskEngine:
                 return [Candidate(task.actor, {"action": "submitAnswer", "taskAnswer": task.answer["text"]},
                                   200, "submit current-task evidence candidate; correctness unconfirmed")]
             return []
-        if world.phase_task or self.accept_pending:
+        if world.phase_task or self.accept_pending or getattr(world, 'news_task_hold', False):
             return []
         clock = getattr(world, 'strategy_clock', Clock(world.round, None))
         if clock.phases != {'day'}:
@@ -1101,6 +1125,7 @@ class TaskEngine:
                 task.command_plan = None
             return  # Tool eligibility is rechecked after observing actual movement.
         if action.get("action") == "submitAnswer":
+            mark_timing(task,'submitted',world.round)
             task.phase = "SUBMIT_PENDING"
             sources = [e for e in task.executions
                        if e["evidence"] in task.answer.get("evidence_refs", ())]
@@ -1156,11 +1181,13 @@ class TaskEngine:
             context = self._context(task, "prepare_task")
             response["executeCmd"] = bootstrap(context,task.statement_names)
             task.sandbox_pending = {"round": world.round, "context": context, "operation": "bootstrap"}
+            mark_timing(task,'sandbox_sent',world.round)
         elif task.environment and task.sandbox_pending is None and task.statement_names and task.statement_path is None:
             if task.locate_attempts < 2 and world.round-task.locate_round >= 3:
                 context = self._context(task, "locate_task_document")
                 response["executeCmd"] = locate_task(context, task.environment, task.statement_names)
                 task.sandbox_pending = {"round":world.round, "context":context, "operation":"locate_task"}
+                mark_timing(task,'sandbox_sent',world.round)
                 task.locate_attempts += 1
                 task.locate_round = world.round
             else:
@@ -1198,6 +1225,7 @@ class TaskEngine:
                     if plan is None and self.reuse_enabled and not task.executions:
                         plan, program_id = self.programs.next(task)
                         if program_id:
+                            mark_timing(task,'program_reuse',world.round)
                             task.events.append({'kind':'program_recipe_reuse', 'round':world.round,
                                                 'recipe':program_id[:12]})
                     if plan is None and self.reuse_enabled and (task.workflow_id or not task.executions):
@@ -1226,6 +1254,8 @@ class TaskEngine:
                                             "skill_id": skill["id"] if skill else None,
                                             "program_id": program_id,
                                             "workflow_id": workflow["id"] if workflow else None}
+                    mark_timing(task,'sandbox_sent',world.round)
+                    mark_timing(task,'operation_'+plan['operation'],world.round)
                     if plan['operation'] in {'run_python','run_tool'} and plan.get('effect') != 'read_only':
                         task.checkpoints.clear()
                 except (ValueError, TypeError, KeyError) as exc:
@@ -1276,3 +1306,4 @@ class TaskEngine:
                 payload['required_response'] = 'ONLY JSON; copy the current request_id and choose one allowed action.'
                 response["prompt"] = instructions + json.dumps(payload, ensure_ascii=False)
                 task.llm_pending = {"round": world.round, "context": context,'answer_only':final_answer_only}
+                mark_timing(task,'llm_sent',world.round)

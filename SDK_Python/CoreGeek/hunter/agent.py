@@ -104,8 +104,11 @@ class Agent:
                 session = Session(self.epoch, key, self.rules.round_origin)
             draft = deepcopy(session)
             draft.tasks.reuse_enabled = self.policy.skill_reuse_enabled
-            clock = draft.reconcile(world)
             world.strategy_policy = self.policy
+            clock = draft.reconcile(world)
+            world.news_task_hold = (self.policy.news_daily_enabled and
+                (bool(draft.intelligence.return_plan) or
+                 draft.intelligence.cycle.hold(draft.intelligence,world,clock,draft,self.policy)))
             from . import pioneer_trade
             pioneer_trade.prepare(world, clock)
             task_actor = draft.task_actor(world)
@@ -397,8 +400,11 @@ class Agent:
                             return c.command in commands or (c.command.get('action')=='use' and c.command.get('name') in {'Medicine','Bomb','DizzyWeapon'})
                         return prior(c) if prior else None
                     guidance.duty_permit=clear_permit
+                if self.policy.news_daily_enabled and (treasure or report.get('stage')=='wait_open'):
+                    if guidance.work_plans.get(treasure_actor,{}).get('owner')=='task_approach':
+                        guidance.work_plans.pop(treasure_actor)
                 treasure = [c for c in draft.filter_failures(treasure,world.round) if guidance.permit(c)]
-                task_reserved = bool(task_choice and task_choice.get('selected'))
+                task_reserved = bool(task_choice and task_choice.get('selected') and not self.policy.news_daily_enabled)
                 if task_reserved:
                     # The bounded task plan has a stated score and deadline.
                     # Treasure observation still runs, but must not erase that
@@ -413,6 +419,8 @@ class Agent:
                            and not guidance.return_routes.get(identity,{}).get('due'))
                 waiting = waiting or bool(clear_treasure and report.get('stage')=='wait_open')
                 if treasure or waiting:
+                    if self.policy.news_daily_enabled:
+                        world.news_task_hold=True
                     world.treasure_actions[identity] = [c.command for c in treasure]
                     if report.get("cost",0):
                         world.treasure_reserved_gold = report["cost"]+self.policy.reserve_gold
@@ -706,7 +714,10 @@ class Agent:
                       "sunset_market": draft.sunset_market.diagnostic,
                       "treasure": draft.intelligence.diagnostic,
                       "rumour_llm": {"used":draft.tasks.budget.attempts,"status":draft.intelligence.llm_status,
-                                     "clues":len(draft.intelligence.clues), **draft.intelligence.llm_diagnostic},
+                                     "clues":len(draft.intelligence.clues), 'cycle':draft.intelligence.cycle.number,
+                                     'cycle_state':draft.intelligence.cycle.status,
+                                     'map_treasure':draft.intelligence.terminal,
+                                     **draft.intelligence.llm_diagnostic},
                       "return_recovery": return_recovery_report,
                       "return_routes": guidance.return_routes,
                       "navigation_retry_exclusions": {u.id:sorted(world.navigation_avoided.get(u.pos, set())) for u in world.movers},
@@ -806,7 +817,7 @@ class Agent:
                          "llm_pending", "sandbox_pending", "command_plan", "answer", "submitted", "events", "environment",
                          "uncertain_operations", "executions", "workflow_id", "workflow_results",
                          "statement_names", "statement_path", "statement_ready", "statement_empty", "locate_attempts",
-                         "evidence", "diagnostic_events")} if task else None,
+                         "evidence", "diagnostic_events", "metrics")} if task else None,
                         accept_pending=draft.tasks.accept_pending, closed=draft.tasks.closed,
                         budget=draft.tasks.budget)
 

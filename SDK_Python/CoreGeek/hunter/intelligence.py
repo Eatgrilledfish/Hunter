@@ -10,6 +10,8 @@ from .economy import movement
 from .navigation import route, distance_field, interaction_cells, neighbours
 from .protocol import obj, integer, position, pos_json, fingerprint, strict_json
 from .tasks import llm_service_failure
+from .news_cycle import NewsCycle
+from .rules import Policy
 
 
 # Taskbook 4.6.3 descriptions. The live shop controls availability and price.
@@ -25,6 +27,9 @@ OFFERING_DESCRIPTIONS = {
 
 @dataclass
 class Intelligence:
+    cycle: NewsCycle = field(default_factory=NewsCycle)
+    preparations: list = field(default_factory=list)
+    return_plan: dict = field(default_factory=dict)
     pending: dict | None = None
     analyzed: set = field(default_factory=set)
     events: list = field(default_factory=list)
@@ -77,13 +82,25 @@ class Intelligence:
         return sources
 
     def reconcile(self, world, clock, session):
+        policy = getattr(world, 'strategy_policy', Policy())
+        if policy.news_daily_enabled:
+            self.cycle.entries(session.news, clock)
         for identity, purchase in list(self.pending_purchases.items()):
             actor=world.ours.get(identity)
             feedback=obj(world.raw.get('lastRoundRoleActionResults'))
-            arrived=actor and actor.backpack is not None and actor.inventory[purchase['item']]>purchase['prior']
+            delta = max(0, actor.inventory[purchase['item']]-purchase['prior']) if actor and actor.backpack is not None else 0
+            requested = purchase.get('requested_num',1)
+            arrived=delta >= requested
             failed=world.round==purchase['round']+1 and feedback.get(identity) is False
+            settled=world.round==purchase['round']+1 and feedback.get(identity) is True
+            purchase.update(observed_delta=delta,settlement_status='complete' if arrived else
+                            'partial' if delta else 'failed' if failed else 'unknown')
+            if settled and 0 < delta < requested:
+                self.treasure_spent -= purchase['reserved_cost']*(requested-delta)//requested
+                self.pending_purchases.pop(identity)
+                continue
             if arrived or failed:
-                if failed and not arrived:self.treasure_spent-=purchase['reserved_cost']
+                if failed and not arrived and not delta:self.treasure_spent-=purchase['reserved_cost']
                 self.pending_purchases.pop(identity)
         if self.attempts:
             latest = self.attempts[-1]
@@ -93,6 +110,8 @@ class Intelligence:
                     latest["result"] = result
                     if result in {1, 4}:
                         self.terminal = "success" if result == 1 else "empty"
+                        if policy.news_daily_enabled:
+                            self.cycle.close(self,clock)
         if self.pending:
             raw = world.raw.get("llmResp")
             self.llm_diagnostic = {'sent':self.pending['round'], 'reply_type':type(raw).__name__,
@@ -114,10 +133,19 @@ class Intelligence:
                         matched=data.get('request_id')==fingerprint(self.pending['context']['nonce'])[:16]
                     if not matched:
                         raise ValueError("news response mismatch")
+                    if self.pending.get('cycle_id', self.cycle.number) != self.cycle.number:
+                        raise ValueError('closed news cycle')
                     data.setdefault('events',[])
                     data.setdefault('treasures',[])
                     if not isinstance(data.get("events"), list) or not isinstance(data.get("treasures"), list):
                         raise ValueError("invalid news collections")
+                    if policy.news_daily_enabled:
+                        if data.get('decision','WAIT_INFO') not in {'WAIT_INFO','BUY_READY','DIG_READY'}:
+                            raise ValueError('invalid news decision')
+                        # Each new accepted analysis revises the actionable plan;
+                        # an empty conclusion cannot leave yesterday's plan live.
+                        self.treasures.clear()
+                        self.preparations.clear()
                     self._ingest(world, data, self.pending.get("citation_sources",self.pending["sources"]))
                     self.analyzed.update(self.pending["sources"])
                     self.reviewed_sources.update(self.pending.get('review_sources',()))
@@ -126,6 +154,8 @@ class Intelligence:
                     reviewed=set(self.pending.get('validation_ids',()))
                     self.invalid_candidates=[v for v in self.invalid_candidates if v['id'] not in reviewed]
                     self.pending = None
+                    if policy.news_daily_enabled:
+                        self.cycle.status = ('dig_ready' if self.treasures else 'buy_ready' if self.preparations else 'wait_info')
                     self.llm_status = ('accepted_without_plan' if self.llm_diagnostic.get('rejected')
                                        and not self.llm_diagnostic.get('progress',{}).get('new_hypotheses') else 'accepted')
                 except (ValueError, TypeError, KeyError) as exc:
@@ -147,8 +177,11 @@ class Intelligence:
         if session.tasks.active:
             # Active task takes the channel; a late ordinary nonce cannot satisfy
             # any task pending. The consumed ordinary reservation is not refunded.
+            if self.pending:
+                self.cycle.retired.add(self.pending['context']['nonce'])
+                self.llm_status='interrupted'
             self.pending = None
-        sources = self.source_parts(session.news)
+        sources = self.source_parts(self.cycle.entries(session.news,clock) if policy.news_daily_enabled else session.news)
         self.news_complete = (set(sources) <= self.analyzed and
                               not any(n['truncated_locally'] for n in sources.values()))
         folk={k:v for k,v in sources.items() if v['section']=='folkLegends'}
@@ -199,7 +232,8 @@ class Intelligence:
             record={'kind':kind,'text':text,'support':refs}
             record['id']=fingerprint(record)
             if not any(c['id']==record['id'] for c in self.clues):self.clues.append(record)
-        self.clues=self.clues[-64:]
+        if not getattr(world,'strategy_policy',Policy()).news_daily_enabled:
+            self.clues=self.clues[-64:]
         for rejection in data.get('rejections', [])[:16]:
             if not isinstance(rejection, dict):
                 continue
@@ -230,7 +264,7 @@ class Intelligence:
             if (record not in self.events and
                     not any(r['hypothesis_id'] == record['id'] for r in self.rejections)):
                 self.events.append(record)
-        for candidate in data.get("treasures", [])[:8]:
+        for candidate in (data.get("treasures", [])[:8] if data.get('decision') in (None,'DIG_READY') else []):
             if not isinstance(candidate, dict) or support(candidate) is None:
                 reject(candidate,'unsupported_source')
                 continue
@@ -264,6 +298,19 @@ class Intelligence:
                     not any(r['hypothesis_id'] == record['id'] for r in self.rejections)):
                 self.treasures.append(record)
                 self.invalid_candidates=[]
+        for candidate in (data.get('purchases',[])[:8] if data.get('decision') in (None,'BUY_READY') else []):
+            if not isinstance(candidate,dict) or support(candidate) is None:
+                reject(candidate,'unsupported_source');continue
+            items=candidate.get('items')
+            if not isinstance(items,list) or not 1<=len(items)<=40:
+                reject(candidate,'position_or_items');continue
+            if any(not isinstance(x,str) or x not in world.shop for x in items):
+                reject(candidate,'unknown_shop_item');continue
+            if candidate.get('confidence')!='high' or candidate.get('all_item_conditions_resolved') is not True:
+                reject(candidate,'unresolved_conditions');continue
+            record=dict(items=sorted(items),support=support(candidate),basis='model_hypothesis_not_official')
+            record['id']=fingerprint(record)
+            if record not in self.preparations:self.preparations.append(record)
         self.events, self.treasures = self.events[-64:], self.treasures[-16:]
         self.llm_diagnostic.update(hypotheses=len(self.treasures),proposed=len(data.get('treasures',[])),
                                    rejected=dict(rejected),unresolved=self.unresolved,
@@ -318,6 +365,22 @@ class Intelligence:
                         if clear_night else clock.until_night)
         self.offered_plan={}
         self.diagnostic={'stage':'inactive','retained_plan':dict(self.execution)}
+        if self.return_plan and not world.phase_task and world.phase_task_observed:
+            actor=world.ours.get(self.return_plan['actor'])
+            if actor and actor.alive:
+                goal=tuple(self.return_plan['home'])
+                if actor.pos==goal:
+                    self.return_plan={}
+                else:
+                    back=distance_field(world,{goal},actor.pos,deadline)
+                    steps=[p for p in neighbours(actor.pos) if back.get(p,float('inf'))<back.get(actor.pos,0)]
+                    self.diagnostic=dict(stage='return',actor=actor.id,cost=0,home=goal)
+                    return movement(actor,steps,220,'complete treasure return obligation')
+            else:
+                self.return_plan={}
+        if policy.news_daily_enabled and getattr(world,'news_task_hold',False):
+            self.diagnostic=dict(stage='waiting',reason='daily_analysis_or_return')
+            return []
         if (self.terminal or world.phase_task or not world.phase_task_observed or not policy.treasure_enabled
                 or not self.treasure_complete or (clock.phases!={'day'} and not clear_night)):
             if policy.treasure_enabled and not self.terminal:
@@ -327,6 +390,9 @@ class Intelligence:
         self.diagnostic={'stage':'waiting','reason':'no_resolved_hypothesis' if not self.treasures else 'no_feasible_circuit',
                          'hypotheses':len(self.treasures),'unresolved':self.unresolved,
                          'retained_plan':dict(self.execution),'rejections':[]}
+        if policy.news_daily_enabled and len({(t['position'],tuple(t['items']),t['opening_round'],t['closing_round'])
+                                               for t in self.treasures})>1:
+            self.diagnostic['reason']='conflicting_treasure_hypotheses';return []
         actor = next((u for u in world.movers if u.kind == "pioneer"), None)
         if actor is None or actor.backpack is None or actor.capacity is None:
             self.diagnostic['reason']='actor_or_personal_inventory_unknown'
@@ -350,6 +416,7 @@ class Intelligence:
         stands=getattr(world,'pioneer_trade_stands',{})
         if actor.id in stands:home_goals={stands[actor.id]}
         elif getattr(world,'task_side_plan',None):home_goals=set(world.task_side_plan['c_stands'])
+        elif self.execution.get('home'):home_goals={tuple(self.execution['home'])}
         else:
             home_goals=interaction_cells(world,[u.pos for u in world.weapons],actor.pos) if world.weapons else {actor.pos}
         home=distance_field(world,home_goals,actor.pos,deadline)
@@ -429,6 +496,8 @@ class Intelligence:
             if options:break  # One complete feasible hypothesis is enough for this turn.
         preparing=not options and bool(preparations)
         if preparing:options=preparations
+        if not options and self.preparations and clock.phases=={'day'}:
+            return self._prepare_purchase(world,clock,policy,deadline,actor,start,home,home_goals,margin)
         if not options:
             if time.monotonic()>=deadline:self.diagnostic['reason']='planning_budget_exhausted'
             return []
@@ -474,7 +543,56 @@ class Intelligence:
                          'held_offerings':dict(Counter(hypothesis['items']) & actor.inventory),
                          'retained_plan':dict(self.execution)}
         self.offered_plan=dict(hypothesis=hypothesis['id'],actor=actor.id,stage=stage,
-            phase=self.diagnostic['phase'],opening=hypothesis['opening_round'],closing=hypothesis['closing_round'])
+            phase=self.diagnostic['phase'],opening=hypothesis['opening_round'],closing=hypothesis['closing_round'],
+            home=min(home_goals,key=lambda p:(start.get(p,float('inf')),p)))
+        return result
+
+    def _prepare_purchase(self,world,clock,policy,deadline,actor,start,home,home_goals,margin):
+        """A resolved offering list can own one bounded purchase/return trip."""
+        if len(self.attempts)>=policy.treasure_attempt_limit:return []
+        if actor.id in self.pending_purchases:
+            self.diagnostic=dict(stage='purchase_pending',actor=actor.id,cost=0)
+            return []
+        lists={tuple(p['items']) for p in self.preparations}
+        if len(lists)!=1:
+            self.diagnostic['reason']='conflicting_offering_lists';return []
+        plan=self.preparations[0]
+        if any(a.get('result')==3 and a['items']==plan['items'] for a in self.attempts):return []
+        needed=Counter(plan['items'])-actor.inventory
+        if any(n not in world.shop for n in needed) or sum(needed.values())+len(actor.backpack)>actor.capacity:return []
+        cost=sum(world.shop[n]*count for n,count in needed.items())
+        reserve=policy.reserve_gold
+        if getattr(world,'staged_walls',False):
+            from .wall_policy import investment_fund
+            reserve=max(reserve,investment_fund(world)[0])
+        if needed and (world.gold is None or cost+reserve>world.gold or self.treasure_spent+cost>policy.treasure_gold_limit):return []
+        goal=min(home_goals,key=lambda p:(start.get(p,float('inf')),p))
+        if not needed:
+            if home.get(actor.pos)==0:
+                self.diagnostic=dict(stage='prepared',actor=actor.id,cost=0)
+                return []
+            if actor.pos not in home or home[actor.pos]+margin>clock.until_night:return []
+            steps=[p for p in neighbours(actor.pos) if home.get(p,float('inf'))<home[actor.pos]]
+            result=movement(actor,steps,220,'return with confirmed treasure supplies')
+            stage='prepare_return'
+        else:
+            shops=interaction_cells(world,world.zones.get('weaponShop',()),actor.pos)
+            choices=[(start[p]+len(needed)+home[p]+margin,start[p],p) for p in shops & start.keys() & home.keys()
+                     if start[p]+len(needed)+home[p]+margin<=clock.until_night]
+            if not choices:return []
+            required,walk,shop=min(choices)
+            if not walk:
+                name,count=sorted(needed.items())[0]
+                result=[Candidate(actor.id,dict(action='buy',name=name,num=count),220,
+                        'purchase source-resolved treasure supplies',gold_reserve=reserve)]
+            else:
+                field=distance_field(world,{shop},actor.pos,deadline)
+                result=movement(actor,[p for p in neighbours(actor.pos) if field.get(p,float('inf'))<field.get(actor.pos,0)],220,
+                                'purchase source-resolved treasure supplies')
+            stage='procure'
+        if time.monotonic()>=deadline:return []
+        self.diagnostic=dict(stage=stage,actor=actor.id,phase='prepare',cost=cost,items=plan['items'])
+        self.offered_plan=dict(actor=actor.id,hypothesis=plan['id'],phase='prepare',stage=stage,home=goal)
         return result
 
     def finalize(self, world, clock, session, response, policy):
@@ -491,13 +609,19 @@ class Intelligence:
                 if hypothesis:
                     self.attempts.append({"hypothesis": hypothesis["id"], "items": sorted(action["item"]),
                                           "round": world.round, "result": None})
+                    if policy.news_daily_enabled and self.offered_plan.get('home'):
+                        self.return_plan=dict(actor=identity,home=self.offered_plan['home'])
             if (action['action']=='buy' and actor.kind=='pioneer'
                     and action in getattr(world,'treasure_actions',{}).get(identity,())):
                 cost = world.shop[action["name"]]*action.get("num", 1)
                 self.treasure_spent += cost  # Conservative reservation; unknown failures do not replenish budget.
-                purchase={"round":world.round,"item":action["name"],"reserved_cost":cost,"prior":actor.inventory[action['name']]}
+                purchase={"round":world.round,"item":action["name"],"reserved_cost":cost,"prior":actor.inventory[action['name']],
+                          'requested_num':action.get('num',1),'settlement_status':'pending'}
                 self.purchases.append(purchase)
                 self.pending_purchases[identity]=purchase
+        if policy.news_daily_enabled:
+            self.cycle.emit(self,world,clock,session,response,policy,OFFERING_DESCRIPTIONS)
+            return
         if response["prompt"] or session.tasks.active or self.pending or self.terminal or not policy.treasure_enabled:
             return
         if any(c["action"] in {"acceptTask", "submitAnswer"} for c in response["roleCommandMap"].values()):

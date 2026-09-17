@@ -73,7 +73,7 @@ def home_cells(world, actor):
 
 def can_accept(world, clock, policy, timing, actor, task, deadline):
     """Shared adjacent fallback guard, using the same real return and solve budget."""
-    if clock.phases != {'day'} or type(task.get('timeoutRounds')) is not int or task['timeoutRounds'] <= 0:
+    if getattr(world,'news_task_hold',False) or clock.phases != {'day'} or type(task.get('timeoutRounds')) is not int or task['timeoutRounds'] <= 0:
         return False
     home = home_cells(world, actor)
     try:
@@ -87,7 +87,7 @@ def can_accept(world, clock, policy, timing, actor, task, deadline):
 
 
 def choose(world, clock, policy, deadline, timing=None):
-    if (not policy.task_schedule_enabled or world.phase_task or not world.phase_task_observed
+    if (getattr(world,'news_task_hold',False) or not policy.task_schedule_enabled or world.phase_task or not world.phase_task_observed
             or clock.phases != {'day'}):
         return None
     actors = [a for a in world.movers if a.kind == 'pioneer']

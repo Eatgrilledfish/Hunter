@@ -176,6 +176,8 @@ def check_action(world, clock, rules, identity, command, *, task_actor=None, sum
                 return invalid("backpack capacity exceeded")
             r.gold = world.shop[name] * quantity
     elif action == "acceptTask":
+        if getattr(world,'news_task_hold',False):
+            return invalid('daily intelligence or treasure trip owns pioneer')
         if actor.kind != "pioneer" or world.phase_task:
             return invalid("cannot accept task")
         if not any(t.get("isValid") is True and type(t.get("coldDownRounds")) is int

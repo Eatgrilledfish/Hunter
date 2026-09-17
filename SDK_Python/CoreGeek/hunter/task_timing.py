@@ -6,6 +6,17 @@ task family. Censored/failed episodes retain the deadline as their bound.
 from dataclasses import dataclass, field
 
 
+def mark(task, kind, round_no, sent=None):
+    """Small cumulative ledger, independent of the bounded detailed event log."""
+    task.metrics.setdefault('first', {}).setdefault(kind, round_no)
+    task.metrics.setdefault('last', {})[kind] = round_no
+    counts=task.metrics.setdefault('counts', {})
+    counts[kind]=counts.get(kind,0)+1
+    if sent is not None:
+        waits=task.metrics.setdefault('wait_rounds', {})
+        waits[kind]=waits.get(kind,0)+max(0,round_no-sent)
+
+
 def descriptor(task, cells):
     values = [task.get(k) for k in ('timeoutRounds', 'scoreReward', 'goldReward')]
     if not cells or any(type(v) is not int or v < 0 for v in values) or values[0] < 1:
@@ -38,6 +49,7 @@ class TaskTiming:
                'kind': 'acknowledged_full_submission' if usable else 'censored',
                'official_correctness': 'UNKNOWN',
                'reused_program': any(e.get('kind') == 'program_recipe_reuse' for e in task.events)}
+        row['stages'] = task.metrics
         self.samples.setdefault(key, []).append(row)
         self.samples[key] = self.samples[key][-8:]
         # Bound per-session memory; changing public descriptors do not share data.

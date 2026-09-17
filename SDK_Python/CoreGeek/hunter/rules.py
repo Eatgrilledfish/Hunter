@@ -376,6 +376,9 @@ class Policy:
     treasure_gold_limit: int = 90
     treasure_attempt_limit: int = 2
     news_hold_enabled: bool = True
+    news_daily_enabled: bool = True
+    news_start_day: int = 2
+    news_context_chars: int = 64000  # Local input ceiling, not a model-window claim.
     summon_pressure_enabled: bool = True
     summon_portfolio_enabled: bool = False
     summon_wave_memory_enabled: bool = False
@@ -418,6 +421,8 @@ class Policy:
             elif type(value) not in (int, float) or not 0 <= value <= 3:
                 raise ValueError(f"{name} exceeds local timing bounds")
         result = cls(**parameters)
+        if not 1 <= result.news_start_day <= 10 or not 8000 <= result.news_context_chars <= 100000:
+            raise ValueError('news scheduling/context limits out of bounds')
         if not 0 < result.gatling_upgrade_health_fraction <= 1:
             raise ValueError("gatling upgrade health fraction must be in (0, 1]")
         if not 4 <= result.lookahead_horizon <= 8 or not 0 <= result.lookahead_weight <= 1:
