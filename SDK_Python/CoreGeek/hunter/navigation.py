@@ -5,6 +5,11 @@ import time
 from .protocol import distance
 
 
+class DistanceField(dict):
+    """Missing cells are unreachable only when the flood fill completed."""
+    complete = True
+
+
 def neighbours(pos):
     x, y = pos
     return [(x+dx, y+dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1) if dx or dy]
@@ -20,12 +25,13 @@ def interaction_cells(world, targets, actor_pos=None, extra_blocked=()):
 
 def distance_field(world, goals, actor_pos, deadline=float("inf"), extra_blocked=()):
     blocked = (world.occupied | set(extra_blocked) | world.navigation_avoided.get(actor_pos, set())) - {actor_pos}
-    distances = {p: 0 for p in sorted(goals) if world.inside(p) and p not in blocked}
+    distances = DistanceField({p: 0 for p in sorted(goals) if world.inside(p) and p not in blocked})
     queue = deque(distances)
     count = 0
     while queue:
         count += 1
         if count % 64 == 0 and time.monotonic() >= deadline:
+            distances.complete=False
             break
         current = queue.popleft()
         for p in neighbours(current):

@@ -169,7 +169,9 @@ class NightClear:
                     if back:
                         steps=sorted(p for p in neighbours(worker.pos) if home.get(p,float('inf'))<back)
                         if steps:command=dict(action='move',targetPos=[pos_json(steps[0])]);stage='return'
-        self.diagnostic=dict(stage=stage if command else 'no_safe_circuit',actor=worker.id,
+        self.diagnostic=dict(stage=stage if command else
+                             'budget_exhausted' if time.monotonic()>=deadline or not getattr(home,'complete',True)
+                             else 'no_safe_circuit',actor=worker.id,
                              own_clear=clear,return_steps=back,night_remaining=remaining,
                              economic_remaining=horizon,own_wall_material_needed=need_stone)
         if not command:return []
@@ -202,11 +204,17 @@ class NightClear:
             return dict(action='move',targetPos=[pos_json(steps[0])]) if steps else None
         held=[r for r in data['held'] if not r.get('pending') and r['unit'] is not None]
         tour=supply_basket.use_tour(view,worker,held,worker.pos,home,deadline)
-        if held and tour is not None and tour+policy.return_buffer<=horizon:
+        restock_here=(world.near_zone(worker.pos,'weaponShop')
+                      and any(e['name']=='WallFixer' for e in data['planned']))
+        if held and not restock_here and tour is not None and tour+policy.return_buffer<=horizon:
             from .wall_service import service_key
             ready=sorted((r for r in held if r['level']==r['unit'].level),
                          key=lambda r:(r['rank'],service_key(world,r['unit'])))
             for r in ready:
+                from .wall_service import use_permitted
+                quoted_use=Candidate(worker.id,dict(action='use',name=r['name'],
+                    targetPos=[pos_json(r['unit'].pos)]),0,'quoted held delivery')
+                if not use_permitted(world,quoted_use):continue
                 goals=interaction_cells(view,[r['unit'].pos],worker.pos)&reach.keys()
                 if not goals:continue
                 if worker.pos in goals:
@@ -231,6 +239,17 @@ class NightClear:
             if time.monotonic()>=deadline:return None
             if options:
                 _,shop=min(options)
+                if worker.pos==shop and name in data.get('guard_authorizations',{}):
+                    world.essential_guard_stock=dict(getattr(world,'essential_guard_stock',{}))
+                    world.essential_guard_stock[worker.id,name]=dict(data['guard_authorizations'][name])
+                if worker.pos==shop and name=='WallFixer':
+                    # Only the selected, route-validated purchase publishes its
+                    # quote to the real arbitration world; copy(view) is private.
+                    proof=data.get('repair_authorization',{})
+                    if proof.get('round')==world.round and proof.get('count',0)>0:
+                        world.essential_repair_stock=dict(getattr(world,'essential_repair_stock',{}))
+                        world.essential_repair_stock[worker.id]=dict(proof,price=world.shop[name],
+                            actor=worker.id,purpose='night_clear_repair',count=1)
                 return dict(action='buy',name=name,num=1) if worker.pos==shop else move({shop})
         return None
 

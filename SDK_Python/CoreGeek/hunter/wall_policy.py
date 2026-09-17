@@ -287,6 +287,13 @@ def purchase_permitted(world, rules, candidate):
         if actor.health <= (200 if actor.kind=='pioneer' else 220)*.5 or clock and needs_treatment(world,actor,clock):
             return True
     if name=='WallFixer' and getattr(world,'critical_base_ids',()):return True
+    guard=getattr(world,'essential_guard_stock',{}).get((actor.id,name),{})
+    if (actor.id==getattr(getattr(world,'night_roster',None),'w',None)
+            and name in {'DizzyWeapon','Bomb'} and actor.inventory[name]<1
+            and guard.get('round')==world.round and guard.get('price')==world.shop.get(name)
+            and command.get('num',1)==1==guard.get('count')):
+        candidate.gold_reserve=max(candidate.gold_reserve,getattr(world,'treasure_reserved_gold',0))
+        return True
     repair=getattr(world,'essential_repair_stock',{}).get(actor.id,{})
     if (name=='WallFixer' and repair.get('round')==world.round
             and 0<command.get('num',1)<=repair.get('count',0)):

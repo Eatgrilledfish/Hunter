@@ -40,7 +40,7 @@ def stand_rank(world, actor, position, walk):
     # This only ranks safe legal gun stands; it never authorizes a lethal move.
     losses=getattr(world,'observed_wall_losses',{})
     urgent=[u for u in world.ours.values() if u.alive and u.kind=='wall' and u.pos in front
-            and losses.get(u.id,0)>0 and u.health<=losses[u.id]*3]
+            and losses.get(u.id,0)>0 and u.health<=losses[u.id]*5]
     missed=sum(distance(position,u.pos)>1 for u in urgent)
     return (risk['lethal'],missed,-coverage,damage if damage is not None else float('inf'),walk,position)
 

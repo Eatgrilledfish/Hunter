@@ -215,10 +215,11 @@ class Intelligence:
             'unresolved_conditions':'confidence must be high and all_conditions_resolved true, only when supported by original clues'}
         def reject(candidate,reason):
             rejected[reason]+=1
-            if not isinstance(candidate,dict):return
             encoded=json.dumps(candidate,ensure_ascii=False)
-            if len(encoded)>6000:return
-            record=dict(id=fingerprint(candidate),candidate=candidate,reason=reason,expected=expected[reason],round=world.round)
+            sample=(candidate if isinstance(candidate,dict) and len(encoded)<=6000 else
+                    dict(type=type(candidate).__name__,sample=encoded[:600],truncated=len(encoded)>600))
+            record=dict(id=fingerprint(candidate),candidate=sample,reason=reason,
+                expected=expected[reason],round=world.round)
             self.invalid_candidates=[v for v in self.invalid_candidates if v['id']!=record['id']]
             self.invalid_candidates=(self.invalid_candidates+[record])[-4:]
 

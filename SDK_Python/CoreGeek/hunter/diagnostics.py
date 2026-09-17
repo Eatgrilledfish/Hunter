@@ -58,6 +58,7 @@ class Diagnostics(logging.Handler):
 
     def _write_compact(self, event, **data):
         record = dict(schema=2, run=self.run_id[:8], round=getattr(self.local,"round",None), event=event, **data)
+        if getattr(self,'sdk_fingerprint',None):record.setdefault('sdk',self.sdk_fingerprint)
         if isinstance(record.get('duty'),dict):
             duty=record['duty']
             for section in ('rumour','treasure'):
@@ -186,6 +187,8 @@ class Diagnostics(logging.Handler):
         if treasure.get('stage') not in (None,'inactive'):
             duty['treasure'] = {k:treasure[k] for k in ('stage','phase','actor','target','items','required','opening','closing','reason','hypotheses','unresolved','held_offerings','retained_plan','rejections') if k in treasure}
         cleared = obj(decision.get('night_clear'))
+        funding=obj(decision.get('maintenance_funding'))
+        if funding:duty['maintenance_funding']=funding
         outside_repair=obj(decision.get('exterior_repair'))
         if outside_repair.get('stage') not in (None,'inactive','NO_DEMAND'):
             duty['exterior_repair']=outside_repair
@@ -276,7 +279,8 @@ class Diagnostics(logging.Handler):
                 reason=self._brief(repair.get('reason'),80))
             if repair.get('minimum') is not None:
                 repairs[str(identity)[:32]].update(minimum=repair['minimum'],target=repair.get('target'),
-                    receipt=repair.get('receipt'))
+                    receipt=repair.get('receipt'),blocked=repair.get('blocked'),
+                    preposition=repair.get('preposition'),window_slack=repair.get('observed_window_slack'))
         if repairs:
             duty['repair'] = repairs
         origin = decision.get('origin')
@@ -426,6 +430,17 @@ class Diagnostics(logging.Handler):
 
     def _work_item_events(self, state, raw, response, decision, units, number):
         """Never sample away item identity or confuse an offer with a receipt."""
+        sightings=state.setdefault('role_sightings',{})
+        roster=obj(decision.get('night_roster'))
+        for identity in {str(roster[k]) for k in ('w','p','m') if roster.get(k) is not None}:
+            unit=units.get(identity)
+            status='absent' if unit is None else 'alive' if isinstance(unit.get('health'),(int,float)) and unit['health']>0 else 'not_alive_or_unknown'
+            old=sightings.get(identity)
+            if old and old['status']!=status:
+                self._write_compact('role_presence',actor=identity,previous=old['status'],current=status,
+                    last_seen=old.get('last_seen'),pos=unit.get('pos') if unit else None,
+                    health=unit.get('health') if unit else None)
+            sightings[identity]=dict(status=status,last_seen=number if unit else (old or {}).get('last_seen'))
         limits=decision.get('wall_health_levels',{})
         marker=json.dumps(limits,sort_keys=True)
         if limits and marker!=state.get('wall_health_levels'):
@@ -786,6 +801,7 @@ class Diagnostics(logging.Handler):
                   for p in sorted((root / "CoreGeek").rglob("*"))
                   if p.is_file() and p.suffix in {".py", ".json"}}
         hashes["run.sh"] = hashlib.sha256((root / "run.sh").read_bytes()).hexdigest()
+        self.sdk_fingerprint=hashlib.sha256(json.dumps(hashes,sort_keys=True).encode()).hexdigest()[:12]
         if self.mode == "compact":
             self._write_compact("startup",mode="compact",every=self.interval,task_diag=2,python=sys.version.split()[0],
                 sdk=hashlib.sha256(json.dumps(hashes,sort_keys=True).encode()).hexdigest()[:12],

@@ -412,7 +412,8 @@ class CaretakerDay:
             # Restore its existing two-pack working reserve first; optional
             # top-ups must not interrupt a funded material trip while that
             # reserve is still present.
-            repair_reserve=(actor.inventory['WallFixer']<2
+            from .repair_decision import stock_target
+            repair_reserve=(actor.inventory['WallFixer']<stock_target(world,policy)
                             and trip['orders'].get('WallFixer',0)>0)
             if investment or repair_reserve:
                 # A fully funded executable investment no longer waits until
@@ -567,6 +568,16 @@ class CaretakerDay:
             if count and checkout is not None and checkout.get(actor.pos, float('inf')) + margin <= clock.until_night:
                 amount = min(count, cash // world.shop[order['name']], actor.capacity-len(actor.backpack))
                 if amount:
+                    if world.near_zone(actor.pos,'weaponShop') and trip:
+                        proof=trip.get('repair_authorization',{})
+                        if order['name']=='WallFixer' and proof.get('round')==world.round and amount<=proof.get('count',0):
+                            world.essential_repair_stock=dict(getattr(world,'essential_repair_stock',{}))
+                            world.essential_repair_stock[actor.id]=dict(proof,count=amount,
+                                actor=actor.id,price=world.shop['WallFixer'],purpose='caretaker_day_repair')
+                        guard=trip.get('guard_authorizations',{}).get(order['name'])
+                        if guard and guard.get('round')==world.round and amount<=guard.get('count',0):
+                            world.essential_guard_stock=dict(getattr(world,'essential_guard_stock',{}))
+                            world.essential_guard_stock[actor.id,order['name']]=dict(guard,count=amount)
                     choices = ([Candidate(actor.id, dict(action='buy', name=order['name'], num=amount), 240,
                                           'buy vouchers with observed proceeds before returning to seal',
                                           gold_reserve=getattr(world, 'treasure_reserved_gold', 0))]

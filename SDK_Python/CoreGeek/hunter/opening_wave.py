@@ -60,7 +60,8 @@ def dusk_exit(world, clock, actor, interior, deadline):
             route=alternate
             report['collision_precaution']='visible opposing mover adjacent destinations'
     length=route.get(actor.pos)
-    if length is None or clock.until_night>length+1:
+    margin=max(3,getattr(getattr(world,'strategy_policy',None),'return_buffer',3))
+    if length is None or clock.until_night>length+margin:
         return None,{}
     choices=[q for q in neighbours(actor.pos) if route.get(q,float('inf'))<length
              and q not in world.navigation_avoided.get(actor.pos,set())]

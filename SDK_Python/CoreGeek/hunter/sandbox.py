@@ -238,7 +238,12 @@ runpy.run_path(entry, run_name="__main__")
         if isinstance(text, str):
             lines = []
             for line in text.splitlines(keepends=True):
-                if line.startswith('HUNTER_RUNTIME:'):
+                if line.startswith('HUNTER_CHECKER_OUTPUTS:'):
+                    try:
+                        captured=json.loads(line[len('HUNTER_CHECKER_OUTPUTS:'):])
+                        if isinstance(captured,list):out['checker_outputs']=captured[:2]
+                    except ValueError:pass
+                elif line.startswith('HUNTER_RUNTIME:'):
                     try:
                         events = json.loads(line[len('HUNTER_RUNTIME:'):])
                         if isinstance(events, list):out['runtime_events'] = events[:4]

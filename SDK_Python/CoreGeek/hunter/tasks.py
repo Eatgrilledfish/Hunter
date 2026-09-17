@@ -1021,6 +1021,12 @@ class TaskEngine:
                                       if pending["operation"] in {"run_tool", "run_python"} else ""})
         if usable and not failure and pending.get("plan"):
             output = pending['plan'].get('answer_output')
+            if output is None and data.get('completeness')=='complete':
+                from .checker_contract import token_answer
+                recovered=token_answer(task,data)
+                if recovered is not None:
+                    data['checker_answer']=recovered
+                    output={'format':'json','selector':['checker_answer']}
             # A final successful calculation can arrive after the model's
             # last useful round. An explicit answer contract lets us submit
             # its complete JSON now, without guessing from prose or an API

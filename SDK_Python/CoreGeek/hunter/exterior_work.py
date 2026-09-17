@@ -9,6 +9,28 @@ from .medical import needs_treatment
 from .task_side_layout import _field, BudgetExpired
 
 
+def immediate_fallback(world,clock):
+    """Fresh adjacent collection; no stale move or partial route is replayed."""
+    roster=getattr(world,'night_roster',None)
+    actor=world.ours.get(roster.m) if roster else None
+    if (clock.phases!={'night'} or not actor or not actor.alive or actor.abnormal=='dizzy'
+            or actor.id in world.night_defenders or actor.backpack is None or actor.capacity is None
+            or len(actor.backpack)>=actor.capacity or needs_treatment(world,actor,clock)):
+        return None,{}
+    threats=active(world)
+    if any(r.attack_range is None or r.attack_power is None
+           or r.attack_power>0 and distance(actor.pos,r.pos)<=r.attack_range+1 for r in threats):
+        return None,{}
+    mines=[(-world.vendor.get(name,0),p) for name in ('stone','iron','copper')
+           if world.vendor.get(name,0)>0 for p in world.zones.get(name,())
+           if distance(actor.pos,p)<=1 and getattr(world,'batch_mine_owners',{}).get(p,actor.id)==actor.id]
+    if not mines:return None,{}
+    mine=min(mines)[1]
+    return Candidate(actor.id,dict(action='collect',targetPos=[pos_json(mine)]),1050,
+        'exterior budget fallback: freshly validated adjacent collection'),dict(actor=actor.id,
+        stage='NIGHT_FORAGE',planning_budget_exhausted=True,mine=mine)
+
+
 def _step_from_reach(origin, goals, reach, deadline):
     """Recover the same lexicographic first step without a second flood fill."""
     lengths=[reach[p] for p in goals if p in reach]
@@ -43,6 +65,12 @@ def propose(world, clock, rules, policy, deadline, *, keep_economy=False, allow_
         return None,dict(report,reason='unknown robot kind prevents safe route')
     if any(r.attack_power>0 and distance(m.pos,r.pos)<=r.attack_range for r in threats):
         return None,dict(report,hold=True,reason='current tile exposed; escape takes priority')
+    if allow_resupply and clock.phases=={'night'} and not needs_treatment(world,m,clock):
+        from .maintenance_funding import propose as maintenance_sale
+        command,funding=maintenance_sale(world,clock,rules,policy,m,min(deadline,time.monotonic()+.012))
+        if command:
+            world.night_resupply_commands={**getattr(world,'night_resupply_commands',{}),m.id:[command]}
+            return Candidate(m.id,command,1050,'exterior miner funds personal maintenance'),funding
     blocked=world.occupied|world.navigation_avoided.get(m.pos,set())
     for robot in threats:
         if robot.attack_power<=0:continue

@@ -111,7 +111,8 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
     if not emergency and not any(g.id in stage_ids for g in world.weapons) and actor.id == roster.p and worker and world.shop.get('WallFixer',0)>0:
         # P cannot carry W's maintenance supplies. Preserve the small amount
         # W still needs for its own two repair packs, not an arbitrary gold floor.
-        reserve += max(0,2-worker.inventory['WallFixer'])*world.shop['WallFixer']
+        from .repair_decision import stock_target
+        reserve += max(0,stock_target(world,policy)-worker.inventory['WallFixer'])*world.shop['WallFixer']
     available = max(0, (world.gold or 0)-reserve) if cash is None else max(0,cash-reserve)
     space = actor.capacity-len(actor.backpack)
     prepaid = set(covered)
@@ -124,21 +125,34 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
         front=[u for u in world.ours.values() if u.alive and u.kind=='wall'
                and u.pos in world.monster_front_walls]
         price=world.shop.get('WallFixer',0)
-        count=min(space,available//price,max(0,2-actor.inventory['WallFixer'])) if price>0 and (front or future_repair_sites) else 0
+        from .repair_decision import stock_target
+        count=min(space,available//price,max(0,stock_target(world,policy)-actor.inventory['WallFixer'])) if price>0 and (front or future_repair_sites) else 0
         if limits is not None:count=min(count,limits['WallFixer'])
         if count:
-            world.essential_repair_stock=getattr(world,'essential_repair_stock',{})
+            world.essential_repair_stock=dict(getattr(world,'essential_repair_stock',{}))
             world.essential_repair_stock[actor.id]=dict(count=count,targets=[u.id for u in front],
                 future_targets=sorted(future_repair_sites),
                 round=world.round,basis='personally serviced night front stock')
             planned.extend(dict(name='WallFixer',rank=1.8,level=0,unit=None) for _ in range(count))
             available-=count*price;space-=count
             if limits is not None:limits['WallFixer']-=count
+        # A bounded first control/explosive belongs to W's maintenance duty.
+        for name in ('DizzyWeapon','Bomb'):
+            price=world.shop.get(name,0)
+            count=int(bool(front and actor.inventory[name]<1 and space>0 and 0<price<=available))
+            if limits is not None:count=min(count,limits[name])
+            if count:
+                world.essential_guard_stock=dict(getattr(world,'essential_guard_stock',{}))
+                world.essential_guard_stock[actor.id,name]=dict(round=world.round,count=count,price=price,
+                    actor=actor.id,name=name,purpose='personal front control')
+                planned.append(dict(name=name,rank=1.85,level=0,unit=None))
+                available-=price;space-=1
+                if limits is not None:limits[name]-=1
     # The maintenance worker needs real personal repair stock, not just money
     # reserved in P's basket. Fund a small working stock alongside the wall
     # stage, before its remaining cash is exhausted by upgrade chains.
     if (not emergency and not getattr(world,'critical_base_ids',())
-            and actor.id in (roster.w,roster.p)
+            and (actor.id==roster.w or actor.id==roster.p and not rear_enabled(world))
             and not (actor.id==roster.p and getattr(world,'base_restore_ids',()))
             and len(world.weapons)==rules.weapon_limit
             and not any(g.id in stage_ids for g in world.weapons)):
@@ -204,13 +218,14 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
     stock = []
     if not emergency and (primary or actor.id==roster.w):
         stock.append(('Medicine', 1 if policy.medical_stock_enabled else 2))
-    if (not emergency and actor.id in (roster.w,roster.p) and walls
+    if (not emergency and (actor.id==roster.w or actor.id==roster.p and not rear_enabled(world)) and walls
             and not (actor.id==roster.p and getattr(world,'base_restore_ids',()))):
         from .repair_decision import eligible
         damaged = sum(eligible(world,u,rules,policy) for u in walls)
         target=(max(2,damaged+(len(walls)+3)//4) if actor.id==roster.w else 1)
         if rear_enabled(world) and actor.id==roster.w:
-            target=getattr(world,'caretaker_repair_target',max(2,policy.caretaker_repair_target))
+            from .repair_decision import stock_target
+            target=stock_target(world,policy)
         stock.append(('WallFixer',target))
     # Night actions and bag space bound useful explosive reserves. The budget
     # may buy several in one action rather than stopping at the old one-item cap.
@@ -252,6 +267,9 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
             planned.extend(dict(name=name,rank=4,level=0,unit=None) for _ in range(count))
             available -= count*price;space -= count
     return dict(held=held, planned=planned, reserve=reserve, unspent=available,
+                repair_authorization=dict(getattr(world,'essential_repair_stock',{}).get(actor.id,{})),
+                guard_authorizations={name:dict(value) for (identity,name),value in
+                    getattr(world,'essential_guard_stock',{}).items() if identity==actor.id},
                 prepaid=prepaid, stock_targets=stock, unfunded_defence_reserve=defence_reserve,
                 minimum_stock_reserve=minimum_reserve,
                 cash_funded_investment=cash_funded_investment)

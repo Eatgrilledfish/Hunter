@@ -18,6 +18,8 @@ INSTRUCTIONS = (
     'opening_round:有依据的绝对回合,confidence:high,all_conditions_resolved:true,support:引用。'
     '只有原文明确关闭期限才给closing_round；省略不表示不能执行。'
     '坐标可由原文和current_map唯一推导；解释依据。clock_origin未知时不能猜绝对回合。'
+    '位置推导须分别核对原点、方向、距离单位/格子比例、相对参照物；公里不能默认等于一格。'
+    'WAIT_INFO的unresolved须指出缺哪条原始依据；已有来源能消除缺口时必须复核，不重复笼统说坐标未知。'
     'BUY_READY在purchases给出items数组,confidence:high,all_item_conditions_resolved:true,support:引用。'
     '只有当前所有未排除解释对用品及数量一致，且影响用品的条件已解决，才可采购；'
     '未读原文可能包含否定条件，不可提前购买。地点或时间未知时不声称可以挖宝。'
@@ -99,7 +101,7 @@ class NewsCycle:
             if ('read_clues', key) not in self.repairs:
                 return ('read_clues', key)
         if intel.invalid_candidates:
-            key = fingerprint([c['id'] for c in intel.invalid_candidates])
+            key = fingerprint([corpus,sorted({c['reason'] for c in intel.invalid_candidates})])
             if ('repair_validation',key) not in self.repairs:
                 return ('repair_validation',key)
         feedback = [a for a in intel.attempts if a.get('result') in (2,3)

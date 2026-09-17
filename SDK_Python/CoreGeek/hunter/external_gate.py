@@ -201,7 +201,9 @@ class ExternalGate:
                 keep_economy=False)
         except BudgetExpired:
             self.diagnostic['work_blocked']='exterior route budget exhausted'
-            return candidates
+            from .exterior_work import immediate_fallback
+            command,report=immediate_fallback(world,clock)
+            if not command:return candidates
         if report:self.diagnostic['exterior_work']=report
         if report.get('stage')=='DUSK_WAIT_GUARDS' or report.get('hold'):
             self.commands[report['actor']]=[]

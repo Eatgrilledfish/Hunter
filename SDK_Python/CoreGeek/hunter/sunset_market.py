@@ -39,13 +39,24 @@ class SunsetMarket:
     checkout_primary: str | None = None
     caretaker_day: CaretakerDay = field(default_factory=CaretakerDay)
 
+    def publish_checkout_targets(self,world):
+        """Expose live paid ownership before repair and night candidates run."""
+        self.checkout_targets={i:[(uid,level) for uid,level in targets
+            if uid in world.ours and world.ours[uid].alive
+            and world.ours[uid].level is not None and world.ours[uid].level<=level]
+            for i,targets in self.checkout_targets.items() if i in world.ours and world.ours[i].alive}
+        world.checkout_targets=self.checkout_targets
+
     def prepare(self, world, clock, rules, policy, guidance, jobs, excluded, deadline):
         guidance.market_permit = lambda candidate: permits(world, candidate)
         world.pioneer_trade_stands = guidance.operator_stands
         world.sunset_actions = {}
         world.sunset_buyer = None
         world.checkout_cash_reserve = 0
-        world.essential_repair_stock = {}
+        # NightClear runs before this planner. Preserve its current-round,
+        # route-validated authorization even when daylight work is inactive.
+        world.essential_repair_stock = {i:r for i,r in getattr(world,'essential_repair_stock',{}).items()
+                                        if r.get('round')==world.round}
         self.diagnostic = {'stage':'inactive'}
         for identity, order in list(self.pending.items()):
             actor = world.ours.get(identity)
@@ -133,11 +144,7 @@ class SunsetMarket:
         for actor in world.movers:
             if actor.id not in self.checkout_intents and actor.id in self.checkout_deliveries:
                 world.checkout_order_limits[actor.id]={}
-        self.checkout_targets={i:[(uid,level) for uid,level in targets
-            if uid in world.ours and world.ours[uid].alive
-            and world.ours[uid].level is not None and world.ours[uid].level<=level]
-            for i,targets in self.checkout_targets.items() if i in world.ours and world.ours[i].alive}
-        world.checkout_targets=self.checkout_targets
+        self.publish_checkout_targets(world)
         world.checkout_pending_actors=set(self.pending)
         world.quoted_checkout_targets={}
         if (not policy.day_schedule_enabled or clock.phases != {'day'} or clock.day is None

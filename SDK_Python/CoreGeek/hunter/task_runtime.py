@@ -9,6 +9,7 @@ SOURCE = r'''
 import atexit as _ha, json as _hj, os as _ho, shlex as _hs, shutil as _hh, hashlib as _hhash
 import subprocess as _hsub, sys as _hsys, re as _hre
 _hunter_events = []
+_hunter_checker_outputs = {}
 _hunter_json_pending = False
 _hunter_json_pages = 0
 _hunter_temporal = {}
@@ -42,6 +43,9 @@ def _hunter_report():
             if replace is not None:_hunter_events[replace]=record
     if _hunter_events:
         print('\nHUNTER_RUNTIME:' + _hj.dumps(_hunter_events, ensure_ascii=True), file=_hsys.stderr, flush=True)
+    if _hunter_checker_outputs:
+        print('\nHUNTER_CHECKER_OUTPUTS:' + _hj.dumps(list(_hunter_checker_outputs.values()), ensure_ascii=True),
+              file=_hsys.stderr, flush=True)
 _ha.register(_hunter_report)
 def hunter_collect_offset_pages(fetch, *, rows_path=('data','records'),
         pagination_path=('data','pagination'), total_key='total_count', offset_key='offset',
@@ -150,6 +154,10 @@ _hj.loads=_hunter_loads
 _hunter_excepthook=_hsys.excepthook
 def _hunter_exception(kind,value,tb):
     info={'kind':'exception','error':kind.__name__}
+    if isinstance(value,OSError):
+        name=getattr(value,'filename',None)
+        if isinstance(name,str):info['filename']=name[:160]
+        info['cwd']=_ho.path.relpath(_ho.getcwd(),_hunter_task_root)[:160]
     if isinstance(value,AttributeError):
         info.update(attribute=str(getattr(value,'name',''))[:48],object_type=type(getattr(value,'obj',None)).__name__)
     _hunter_event(**info)
@@ -324,5 +332,23 @@ def _hunter_checked_wait(self,*args,**kwargs):
         _hunter_event(kind='checker_exit',path=path,returncode=result)
     return result
 _HunterPopen.wait=_hunter_checked_wait
+
+_hunter_communicate = _HunterPopen.communicate
+def _hunter_checked_communicate(self,*args,**kwargs):
+    result=_hunter_communicate(self,*args,**kwargs)
+    path=getattr(self,'_hunter_local_program',None)
+    output=result[0]
+    if path and isinstance(output,(str,bytes)):
+        raw=output.encode('utf-8') if isinstance(output,str) else output
+        try:text=raw[:2048].decode('utf-8')
+        except UnicodeDecodeError:text=None
+        _hunter_checker_outputs.pop(path,None)
+        _hunter_checker_outputs[path]=dict(path=path,returncode=self.returncode,
+            stdout=text,complete=len(raw)<=2048 and text is not None,
+            sha256=_hhash.sha256(raw).hexdigest())
+        while len(_hunter_checker_outputs)>2:
+            _hunter_checker_outputs.pop(next(iter(_hunter_checker_outputs)))
+    return result
+_HunterPopen.communicate=_hunter_checked_communicate
 
 '''

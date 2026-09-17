@@ -42,13 +42,17 @@ def checkout_before_task(world, clock, rules, policy, selected, actor, committed
     # The real checkout planner returns to the defence stand. Include its
     # subsequent walk back to the task, rather than proving a different tour.
     duty=home_cells(view,actor)
-    to_task=({p:0 for p in duty} if committed else
-             distance_field(view,{selected['goal']},actor.pos,deadline))
+    to_task=distance_field(view,{selected['goal']},actor.pos,deadline)
     ends=[p for p in duty if p in to_task]
     if not ends:return False
     end=min(ends,key=lambda p:(to_task[p],p))
     home=distance_field(view,{end},actor.pos,deadline)
     task_walk=to_task[end]
+    if committed:
+        solve=selected['minimum_solve_strategy_rounds']
+        if policy.task_full_timeout_guard_enabled:solve=max(solve,offer['timeoutRounds'])
+        available=min(available,clock.until_night-1-solve-
+            task_return_reserve(world,policy,selected['return_rounds'],deadline))
     trip=supply_basket.quote(view,actor,clock,rules,policy,deadline,
         home=home,end=end,margin=task_walk,cash=world.gold or 0)
     return bool(time.monotonic()<deadline and trip and (trip['orders'] or trip['held'])

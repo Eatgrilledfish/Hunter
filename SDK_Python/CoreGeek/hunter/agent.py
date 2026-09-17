@@ -121,6 +121,7 @@ class Agent:
             from . import day_access
             day_access.prepare(world,clock,min(start+self.policy.planning_seconds,time.monotonic()+.025),draft.day_access_choice)
             economy.prepare_wall_cycle(world, clock, self.rules, self.policy)
+            draft.sunset_market.publish_checkout_targets(world)
             draft.wall_service.prepare(world, self.rules)
             daily = draft.sunset_market.caretaker_day
             worker=draft.night_roster.w
@@ -229,7 +230,7 @@ class Agent:
                         draft.tasks.active, bool(task_actor or draft.tasks.active or draft.tasks.accept_pending)),
                     min(deadline,time.monotonic()+.06))
                 evasion,evasion_report=world.duty_budget.run('exterior_evasion', lambda budget_end:
-                    exterior_evasion.propose(world,clock,budget_end,trapped=draft.external_gate.stage=='RETURN_BLOCKED'),min(deadline,time.monotonic()+.01))
+                    exterior_evasion.propose(world,clock,budget_end,trapped=draft.external_gate.stage=='RETURN_BLOCKED',state=draft.exterior_escape),min(deadline,time.monotonic()+.01))
                 if evasion:
                     identity=evasion[0].actor
                     gate_candidates=[c for c in gate_candidates if c.actor!=identity]+evasion
@@ -751,6 +752,7 @@ class Agent:
                       "battery_plan": world.battery_plan,
                       "external_gate":draft.external_gate.diagnostic,
                       "night_clear":draft.night_clear.diagnostic,
+                      "maintenance_funding":getattr(world,'maintenance_funding',{}),
                       "duty_budget":world.duty_budget.diagnostic(),
                       "exterior_evasion":evasion_report,
                       "work_plans":guidance.work_plans,

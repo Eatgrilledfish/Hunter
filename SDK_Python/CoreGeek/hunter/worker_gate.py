@@ -299,6 +299,12 @@ def prepare(state, world, clock, rules, policy, deadline, *, task_busy=False):
     # guards can still visit the shop and the daylight gate is open. Dawn's
     # mandatory liquidation above remains first; neither sale is projected as
     # spendable cash before its next observed receipt.
+    if (clock.phases=={'day'} and miner and miner.id not in state.commands and not supplying):
+        from .maintenance_funding import propose as maintenance_sale
+        command,report=maintenance_sale(world,clock,rules,policy,miner,deadline)
+        if command:
+            offer(miner,command,'fund worker maintenance before its real purchase deadline')
+            state.diagnostic['maintenance_funding']=report
     if (clock.phases == {'day'} and miner and miner.alive and miner.backpack is not None
             and miner.id not in world.night_defenders and miner.pos not in interior
             and miner.id not in state.commands and clock.until_night > 18):
@@ -328,6 +334,19 @@ def prepare(state, world, clock, rules, policy, deadline, *, task_busy=False):
         # Ordinary return/combat/repair planners own the guards at night.
         # Exterior supply uses its own actual routes; no night gate removal.
         return state._independent_work(world,clock,rules,policy,deadline,result)
+    if (clock.phases=={'day','night'} and miner and miner.alive and miner.backpack is not None
+            and miner.capacity is not None and len(miner.backpack)<miner.capacity
+            and miner.id not in state.commands and miner.id not in world.night_defenders):
+        from .robot_threats import active
+        threats=active(world)
+        safe=all(r.attack_range is not None and r.attack_power is not None
+                 and (r.attack_power<=0 or distance(miner.pos,r.pos)>r.attack_range+1) for r in threats)
+        exposure=getattr(world,'previous_opening_exposure',frozenset())
+        mines=[(-world.vendor.get(k,0),p) for k in MINERALS if world.vendor.get(k,0)>0
+               for p in world.zones.get(k,()) if distance(miner.pos,p)<=1]
+        if safe and miner.pos not in exposure and mines:
+            offer(miner,dict(action='collect',targetPos=[pos_json(min(mines)[1])]),
+                  'boundary: adjacent collection legal in both possible phases')
     if clock.phases != {'day'}:
         return result
 

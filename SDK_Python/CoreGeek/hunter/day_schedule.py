@@ -115,7 +115,9 @@ class DaySchedule:
                 blue,yellow=station_rings(world.task_side_plan['anchor'])
                 interior=blue|yellow|world.stations[0].cells
                 if actor.pos not in interior:
-                    reach=distance_field(world,{actor.pos},actor.pos,deadline,extra_blocked=interior)
+                    exposure=(getattr(world,'previous_opening_exposure',frozenset())
+                              if clock.until_night<=18 else frozenset())
+                    reach=distance_field(world,{actor.pos},actor.pos,deadline,extra_blocked=interior|set(exposure))
                     options=[(-world.vendor[name]/(reach[q]+1),reach[q],mine,q)
                              for name in sorted(MINERALS) if world.vendor.get(name,0)>0
                              for mine in world.zones.get(name,()) for q in neighbours(mine) if q in reach]
@@ -123,7 +125,7 @@ class DaySchedule:
                         _,travel,mine,stand=min(options)
                         choices=([Candidate(actor.id,{'action':'collect','targetPos':[pos_json(mine)]},30,
                                     'exterior miner continues through dusk; cashout at dawn')] if not travel else
-                                 self.moves(actor,distance_field(world,{stand},actor.pos,deadline,extra_blocked=interior),
+                                 self.moves(actor,distance_field(world,{stand},actor.pos,deadline,extra_blocked=interior|set(exposure)),
                                     'exterior miner continues through dusk; cashout at dawn'))
                         result.extend(choices)
                         self.active[actor.id]='harvest'

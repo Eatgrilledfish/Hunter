@@ -54,3 +54,30 @@ def validate(task, refs):
             results[posixpath.normpath(data.get('path',''))]=data.get('tool_exit_code')
         if data.get('status')=='ok' and all(type(results.get(p)) is int and results[p]==0 for p in required):return
     raise ValueError('declared checker has no observed successful completion: '+', '.join(required))
+
+
+def token_answer(task, data):
+    """Recover captured output only from this execution's declared checker."""
+    from .answer_contract import contract
+    required=checker_paths(task)
+    schema=contract(task)
+    fields=set(schema['required_fields']) | set((schema.get('schema') or {}).get('required',[]))
+    texts=[task.text]+[r['data'].get('text','') or '' for r in task.evidence.values()
+        if r.get('usable') and r.get('data',{}).get('operation')=='read_slice'
+        and r['data'].get('completeness')=='complete'
+        and (r['data'].get('path')==task.statement_path or str(r['data'].get('path','')).endswith('spec.md'))]
+    if not fields and any(re.search(r'\breturn\s+JSON\s+with\s+(?:field\s+)?[`\"\']?token[`\"\']?\s*[.;\n]',t,re.I) for t in texts):
+        fields={'token'}
+    if not required or fields!={'token'} or not schema['json_required']:
+        return None
+    sources=[r.get('stdout','') for r in data.get('checker_outputs',[])
+             if isinstance(r,dict) and r.get('path') in required and r.get('complete') is True
+             and type(r.get('returncode')) is int and r['returncode']==0]
+    if data.get('operation')=='run_tool' and posixpath.normpath(data.get('path','')) in required:
+        sources.append(data.get('text',''))
+    # A single labelled token is the supported contract; JSON or different
+    # checker formats stay with the existing model/evidence validation path.
+    tokens={m[1] for text in sources if isinstance(text,str)
+            for m in re.finditer(r'(?m)^\s*TOKEN:\s*([A-Za-z0-9_-]+)\s*$',text)}
+    if len(tokens)!=1:return None
+    return {'token':tokens.pop()}
