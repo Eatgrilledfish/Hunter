@@ -152,6 +152,13 @@ def use_permitted(world, candidate):
 def build_permitted(world, candidate):
     command=candidate.command
     if command.get('action')!='build' or command.get('name')!='wall':return True
+    from . import rear_open
+    if rear_open.enabled(world):
+        points=command.get('targetPos',[])
+        point=(points[0].get('x'),points[0].get('y')) if len(points)==1 else None
+        # The rear passage is permanent. The last personal stone belongs to
+        # an actual required wall, not to an imaginary later door closure.
+        return point in rear_open.required(world)
     if getattr(world,'wall_stage',None)=='front10':return True
     roster=getattr(world,'night_roster',None)
     if not roster or candidate.actor!=roster.w:return True

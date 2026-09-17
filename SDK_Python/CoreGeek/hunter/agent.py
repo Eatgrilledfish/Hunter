@@ -143,7 +143,7 @@ class Agent:
             evasion_report={'status':'emergency gate plan active'}
             if not draft.external_gate.emergency_active and not draft.external_gate.deferred_night:
                 evasion,evasion_report=world.duty_budget.run('exterior_evasion', lambda budget_end:
-                    exterior_evasion.propose(world,clock,budget_end,trapped=draft.external_gate.stage=='RETURN_BLOCKED'), min(start+self.policy.planning_seconds,time.monotonic()+.01))
+                    exterior_evasion.propose(world,clock,budget_end,trapped=draft.external_gate.stage=='RETURN_BLOCKED',state=draft.exterior_escape), min(start+self.policy.planning_seconds,time.monotonic()+.01))
                 if evasion:
                     identity=evasion[0].actor
                     gate_candidates=[c for c in gate_candidates if c.actor!=identity]+evasion
@@ -774,7 +774,8 @@ class Agent:
                               "gate_owned":bool(draft.night_roster.traffic.get('gate_owned'))}
                               if draft.night_roster.traffic else None)},
                       "task_side_layout": ({"status":draft.task_layout.status,
-                          **{k:draft.task_layout.plan[k] for k in (
+                          **{k:draft.task_layout.plan.get(k) for k in (
+                              'layout_mode','layout_revision','permanent_openings','required_wall_cells','c_stands',
                               'c','w','gate','primary_task','task_round_trips','gate_detour_rounds',
                               'suggested_gate_worker','worker_gate_steps','front_repair_coverage',
                               'exposure_upper','exposure_unknown','feasible_candidates','rejected_candidates')}}

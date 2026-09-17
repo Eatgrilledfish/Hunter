@@ -28,6 +28,10 @@ class NightClear:
         rule=rules.build_rule(world,'wall')
         if not rule or clock.day is None or clock.day>=10:return 0
         cost=rule.items.get('stone',0)
+        from . import rear_open
+        if rear_open.enabled(world):
+            built={u.pos for u in world.ours.values() if u.alive and u.kind=='wall'}
+            return len(rear_open.required(world)-built)*cost
         count=1
         if getattr(world,'wall_stage',None)=='front10':
             # The first-stage half ring expands tomorrow. Its missing walls

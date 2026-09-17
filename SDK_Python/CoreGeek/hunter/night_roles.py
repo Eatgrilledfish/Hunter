@@ -5,6 +5,22 @@ from .protocol import distance
 from . import defence_duties
 
 
+def _observed_unavailable(world, identity):
+    """Unknown or malformed own-role observations cannot establish a vacancy."""
+    if identity is None:
+        return None
+    actor = world.ours.get(identity)
+    if actor is not None:
+        return actor.health == 0 if actor.health is not None else None
+    records = world.raw.get('teamOur', {}).get('roles')
+    if (not isinstance(records, list) or not records or not world.stations
+            or len(records) != len(world.ours)
+            or any(w.startswith('teamOur:') for w in world.warnings)
+            or any(u.health is None for u in world.ours.values())):
+        return None
+    return True
+
+
 @dataclass
 class NightRoster:
     w: str | None = None
@@ -33,7 +49,11 @@ class NightRoster:
         if defence_duties.enabled(world):
             self.traffic = {}; self.exit_pending = {}
         live = {u.id for u in world.movers}
-        if defence_duties.enabled(world) and self.w not in live and self.m in live:
+        from .rear_open import enabled as rear_enabled
+        rear = rear_enabled(world)
+        worker_unavailable = (_observed_unavailable(world, self.w) is True
+                              if rear else self.w not in live)
+        if defence_duties.enabled(world) and worker_unavailable and self.m in live:
             # Promote the observed surviving worker, including when the dead
             # defender disappears from the complete role snapshot. A revival
             # becomes the exterior worker; distance never swaps a living W.
@@ -45,7 +65,9 @@ class NightRoster:
         # Actual pioneer death retains the existing emergency second guard.
         self.handoff_requested = False
         self.handoff_task = ()
-        self.substituting = self.p not in live
+        unavailable = _observed_unavailable(world, self.p) if rear else self.p not in live
+        if unavailable is not None:
+            self.substituting = unavailable
         second = self.m if self.substituting else self.p
         if self.traffic:
             traveller = world.ours.get(self.traffic["traveller"])
@@ -183,6 +205,11 @@ def weapon_allowed(world, identity, weapon_id):
     plan = getattr(world, 'task_side_plan', None)
     if not plan:
         return True
+    from .rear_open import enabled as rear_enabled
+    if rear_enabled(world):
+        gun = world.ours.get(weapon_id)
+        return bool(identity == defence_duties.rotator(world) and gun
+                    and (gun.kind, gun.pos) in plan['slots'])
     gun = world.ours.get(weapon_id)
     roster = world.night_roster
     sites = (plan['a'], plan['b']) if identity == defence_duties.rotator(world) else (plan['c'],)

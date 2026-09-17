@@ -93,7 +93,11 @@ def prepare(world, rules, policy):
     first_stage = day == 1 and rules.wall_count(world) <= 10
     world.wall_stage = 'front10' if first_stage else 'morning19' if day == 2 else 'replace'
     world.wall_direction_source = 'monster_east' if monster_direction(world, base.pos) > 0 else 'monster_west'
-    world.wall_targets = world.front_walls if first_stage else yellow
+    from . import rear_open
+    world.wall_targets = world.front_walls if first_stage else (
+        frozenset(rear_open.required(world)) if rear_open.enabled(world) else yellow)
+    if rear_open.enabled(world) and not first_stage:
+        world.wall_stage = 'rear_open14'
 
 
 def priority_units(world):

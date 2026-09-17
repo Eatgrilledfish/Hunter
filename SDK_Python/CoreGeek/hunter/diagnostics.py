@@ -203,6 +203,10 @@ class Diagnostics(logging.Handler):
                 'known_damage_before','known_damage_after','route_damage_bound','damage_budget') if key in evasion}
         if layout.get('c'):
             duty['layout'] = {k:point(layout.get(k)) for k in ('c','w','gate')}
+            if layout.get('layout_mode'):
+                duty['layout'].update(mode=layout['layout_mode'],
+                    openings=layout.get('permanent_openings'),
+                    wall_goal=len(layout.get('required_wall_cells') or ()))
         if roster:
             duty['roster'] = {
                 k:self._brief(str(roster[k]),32)+'@'+self._pos(obj(units.get(str(roster[k]))).get('pos'))
@@ -270,6 +274,9 @@ class Diagnostics(logging.Handler):
                 remaining=repair.get('remaining_actions'),cd=repair.get('observed_cooldown'),
                 selected=bool(repair.get('selected')),delayed=repair.get('delayed_fire'),
                 reason=self._brief(repair.get('reason'),80))
+            if repair.get('minimum') is not None:
+                repairs[str(identity)[:32]].update(minimum=repair['minimum'],target=repair.get('target'),
+                    receipt=repair.get('receipt'))
         if repairs:
             duty['repair'] = repairs
         origin = decision.get('origin')

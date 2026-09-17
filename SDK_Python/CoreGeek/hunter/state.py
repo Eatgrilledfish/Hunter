@@ -56,6 +56,7 @@ class Session:
     mover_health_observations: dict = field(default_factory=dict)
     recent_mover_injuries: dict = field(default_factory=dict)
     persistent_mover_injuries: dict = field(default_factory=dict)
+    exterior_escape: dict = field(default_factory=dict)
     enemy_memory: dict = field(default_factory=dict)
     news: list = field(default_factory=list)
     news_observations: dict = field(default_factory=dict)

@@ -30,6 +30,8 @@ class RepairPlan:
     offered: dict = field(default_factory=dict)
     service: dict = field(default_factory=dict)
     diagnostic: dict = field(default_factory=dict)
+    night_usage: dict = field(default_factory=dict)
+    usage_observed_round: int | None = None
 
     def prepare(self, world, clock, rules, policy, deadline, task=None):
         self.offered = {}
@@ -39,6 +41,20 @@ class RepairPlan:
         world.day_repair_steps = {}
         world.repair_service = self.service
         plan = getattr(world, 'task_side_plan', None)
+        from .rear_open import enabled as rear_enabled
+        if rear_enabled(world):
+            actor=world.ours.get(world.night_roster.w)
+            pending=self.active.get(actor.id) if actor else None
+            if (pending and pending.get('phase')=='USE_PENDING'
+                    and pending['command'].get('name')=='WallFixer'
+                    and actor.backpack is not None and world.round==pending['round']+1
+                    and self.usage_observed_round!=world.round
+                    and actor.inventory['WallFixer']<pending['inventory_before']):
+                day=pending.get('day',clock.day)
+                self.night_usage[day]=self.night_usage.get(day,0)+1
+                self.usage_observed_round=world.round
+            world.caretaker_repair_target=max(2,policy.caretaker_repair_target,
+                self.night_usage.get((clock.day or 0)-1,0)+1)
         world.repair_policy_active = bool(policy.repair_plan_enabled and plan)
         if world.repair_policy_active and defence_duties.enabled(world) and clock.phases == {'day'}:
             self.active={}
@@ -63,6 +79,9 @@ class RepairPlan:
         if not world.repair_policy_active or clock.phases != {'night'}:
             self.active = {}
             return []
+        from .rear_open import enabled as rear_enabled
+        if rear_enabled(world):
+            return self._rear_service(world, clock, rules, policy, deadline)
         defender_ids(world)
         roster = world.night_roster
         for identity in set(self.active) - {roster.w, roster.p}:
@@ -340,6 +359,76 @@ class RepairPlan:
         return [self._offer(actor, {'action':'move','targetPos':[pos_json(q)]}, wall, world, phase, actions, why,
                             context)
                 for q in steps]
+
+    def _rear_service(self, world, clock, rules, policy, deadline):
+        """The worker services walls, with no fictional cannon cooldown debt."""
+        from .rear_open import required
+        from .guard_risk import evidence
+        from copy import copy
+        actor = world.ours.get(world.night_roster.w)
+        if not actor or not actor.alive or actor.backpack is None or actor.abnormal == 'dizzy':
+            return []
+        previous = self.active.get(actor.id)
+        receipt = None
+        if previous and previous['phase'] == 'USE_PENDING' and world.round > previous['round']:
+            target = world.ours.get(previous['wall'])
+            item = previous['command']['name']
+            feedback = world.raw.get('lastRoundRoleActionResults')
+            receipt = dict(round=world.round, wall=previous['wall'], item=item,
+                consumed=actor.inventory[item] < previous['inventory_before'],
+                same_target=bool(target and target.alive and target.pos == previous['target_position']),
+                hp=target.health if target else None,
+                feedback=feedback.get(actor.id) if isinstance(feedback, dict) else None)
+        # Every observation can change the most urgent reachable wall. Only
+        # finalized offers record pending uses; failed movement never advances.
+        self.active.pop(actor.id, None)
+        home = defence_duties.stands(world, actor.id)
+        view = copy(world)
+        lethal = {q for q in home if evidence(world, actor, q)['lethal']}
+        view.navigation_avoided = {p:set(c) for p,c in world.navigation_avoided.items()}
+        view.navigation_avoided.setdefault(actor.pos,set()).update(lethal | {world.task_side_plan['w']})
+        reach = distance_field(view, {actor.pos}, actor.pos, deadline)
+        candidates = []
+        for wall in world.ours.values():
+            if not wall.alive or wall.kind != 'wall' or wall.pos not in required(world):
+                continue
+            hit = pressure(world, wall)
+            for stand in interaction_cells(view, [wall.pos], actor.pos) & home & reach.keys():
+                steps = reach[stand]+1
+                if not repair_decision.eligible(world, wall, rules, policy, service_steps=steps, pressure=hit or 0):
+                    continue
+                item = 'WallFixer' if actor.inventory['WallFixer'] else None
+                if wall.level in (1,2) and actor.inventory[f'WallUpgradeVoucher{wall.level}']:
+                    from .procurement import upgrade_allowed
+                    if upgrade_allowed(world,wall,policy,rules):item=f'WallUpgradeVoucher{wall.level}'
+                if item and not evidence(world, actor, stand)['lethal']:
+                    loss=getattr(world,'observed_wall_losses',{}).get(wall.id,0)
+                    urgent=bool(hit is not None and hit>=wall.health or loss and loss*steps>=wall.health)
+                    candidates.append((not urgent,wall.pos not in world.monster_front_walls,
+                                       steps,wall.health,wall.id,stand,item,wall))
+        self.diagnostic[actor.id] = dict(phase='HOLD_FRONT', stock=actor.inventory['WallFixer'],
+            minimum=2, target=getattr(world,'caretaker_repair_target',max(2,policy.caretaker_repair_target)), receipt=receipt,
+            reason='no personally funded reachable wall service')
+        if not candidates or time.monotonic() >= deadline:
+            return []
+        _,_,steps,_,_,stand,item,wall=min(candidates,key=lambda row:row[:6])
+        route=distance_field(view,{stand},actor.pos,deadline)
+        commands=([dict(action='use',name=item,targetPos=[pos_json(wall.pos)])] if actor.pos==stand else
+                  [dict(action='move',targetPos=[pos_json(q)]) for q in sorted(neighbours(actor.pos))
+                   if route.get(q,float('inf')) < route.get(actor.pos,0)][:4])
+        if not commands or time.monotonic() >= deadline:
+            return []
+        result=[]
+        for command in commands:
+            phase='USE_PENDING' if command['action']=='use' else 'MOVE_TO_REPAIR'
+            state=dict(wall=wall.id,phase=phase,round=world.round,command=command,
+                inventory_before=actor.inventory[item],target_position=wall.pos,day=clock.day)
+            self.offered.setdefault(actor.id,[]).append(state)
+            world.repair_commands.setdefault(actor.id,[]).append(command)
+            result.append(Candidate(actor.id,command,90,'front maintenance: '+phase))
+        self.diagnostic[actor.id].update(phase=phase,wall=wall.id,remaining_actions=steps,
+                                        reason='actual wall service without cannon duty')
+        return result
 
     def finalize(self, world, response):
         for identity, offers in self.offered.items():

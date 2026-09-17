@@ -55,7 +55,7 @@ def requirements(world, rules, policy):
         not r.get('pending',False),service_key(world,r['unit'])))
 
 
-def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=None):
+def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=None, future_repair_sites=()):
     """Match every owned tier once, then fund as much useful stock as possible."""
     roster = world.night_roster
     carriers = {u.id:u for u in world.movers if u.backpack is not None}
@@ -117,6 +117,23 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
     prepaid = set(covered)
     planned = []
     limits = Counter(order_limits) if order_limits is not None and not emergency else None
+    from .rear_open import enabled as rear_enabled
+    if (rear_enabled(world) and actor.id==roster.w and not emergency
+            and not getattr(world,'critical_base_ids',())
+            and len(world.weapons)==rules.weapon_limit):
+        front=[u for u in world.ours.values() if u.alive and u.kind=='wall'
+               and u.pos in world.monster_front_walls]
+        price=world.shop.get('WallFixer',0)
+        count=min(space,available//price,max(0,2-actor.inventory['WallFixer'])) if price>0 and (front or future_repair_sites) else 0
+        if limits is not None:count=min(count,limits['WallFixer'])
+        if count:
+            world.essential_repair_stock=getattr(world,'essential_repair_stock',{})
+            world.essential_repair_stock[actor.id]=dict(count=count,targets=[u.id for u in front],
+                future_targets=sorted(future_repair_sites),
+                round=world.round,basis='personally serviced night front stock')
+            planned.extend(dict(name='WallFixer',rank=1.8,level=0,unit=None) for _ in range(count))
+            available-=count*price;space-=count
+            if limits is not None:limits['WallFixer']-=count
     # The maintenance worker needs real personal repair stock, not just money
     # reserved in P's basket. Fund a small working stock alongside the wall
     # stage, before its remaining cash is exhausted by upgrade chains.
@@ -133,7 +150,8 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
             # investment reserve as the final purchase permit. An impossible
             # top-up must not keep prepaid delivery waiting at the shop.
             stock_cash=max(0,available-max(0,investment_reserve-reserve))
-            count=min(space,stock_cash//price,max(0,(2 if actor.id==roster.w else 1)-actor.inventory['WallFixer']))
+            count=min(space,stock_cash//price,max(0,(2 if actor.id==roster.w else 1)-actor.inventory['WallFixer']
+                -sum(e['name']=='WallFixer' for e in planned)))
             if limits is not None:count=min(count,limits['WallFixer'])
             if count:
                 planned.extend(dict(name='WallFixer',rank=1.9,level=0,unit=None) for _ in range(count))
@@ -190,7 +208,10 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
             and not (actor.id==roster.p and getattr(world,'base_restore_ids',()))):
         from .repair_decision import eligible
         damaged = sum(eligible(world,u,rules,policy) for u in walls)
-        stock.append(('WallFixer', max(2, damaged+(len(walls)+3)//4) if actor.id==roster.w else 1))
+        target=(max(2,damaged+(len(walls)+3)//4) if actor.id==roster.w else 1)
+        if rear_enabled(world) and actor.id==roster.w:
+            target=getattr(world,'caretaker_repair_target',max(2,policy.caretaker_repair_target))
+        stock.append(('WallFixer',target))
     # Night actions and bag space bound useful explosive reserves. The budget
     # may buy several in one action rather than stopping at the old one-item cap.
     defence_reserve = sum(world.shop.get(r['name'], available) for r in unfilled
@@ -270,11 +291,12 @@ def use_tour(world, actor, entries, start, home, deadline, fields=None, *, arriv
 
 
 def quote(world, actor, clock, rules, policy, deadline, *, home, tail=None, end=None,
-          cash=None, sale_stock=None, margin=None):
+          cash=None, sale_stock=None, margin=None, future_repair_sites=()):
     """Fit useful purchases, skipping detours that would suppress the whole trip."""
     if actor.backpack is None or actor.capacity is None or not home:return None
     order_limits=getattr(world,'checkout_order_limits',{}).get(actor.id)
-    data = basket(world,actor,rules,policy,deadline,cash=cash,order_limits=order_limits)
+    data = basket(world,actor,rules,policy,deadline,cash=cash,order_limits=order_limits,
+                  future_repair_sites=future_repair_sites)
     if data is None:return None
     tail = home if tail is None else tail
     end = min((p for p in home if home[p]==0), default=None) if end is None else end
@@ -289,7 +311,10 @@ def quote(world, actor, clock, rules, policy, deadline, *, home, tail=None, end=
         # A cash-funded building investment does not need an ore-sale detour.
         # Apply this before fitting subsets, or that unnecessary detour can
         # discard a required voucher even when checkout and delivery fit.
-        funded = (any(e['unit'] is not None for e in entries)
+        from .rear_open import enabled as rear_enabled
+        personal_repair = (rear_enabled(world) and actor.id==world.night_roster.w
+            and actor.inventory['WallFixer']<2 and orders['WallFixer']>0)
+        funded = ((any(e['unit'] is not None for e in entries) or personal_repair)
             and sum(world.shop[name]*n for name,n in orders.items())
                 <= max(0,(world.gold or 0)-data['reserve']))
         sales = {} if funded else sale_stock

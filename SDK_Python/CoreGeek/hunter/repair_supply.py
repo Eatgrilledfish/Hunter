@@ -98,6 +98,9 @@ class RepairSupply:
         result=[]
         from .defence_duties import enabled
         for identity in ((roster.w,roster.m) if enabled(world) else (roster.w,roster.p)):
+            from .rear_open import enabled as rear_enabled
+            if rear_enabled(world) and identity==roster.w:
+                continue  # W's multi-pack order belongs to SunsetMarket, including unknown receipts.
             if time.monotonic()>=deadline or slots<=0 or price>budget:
                 break
             actor=world.ours.get(identity)

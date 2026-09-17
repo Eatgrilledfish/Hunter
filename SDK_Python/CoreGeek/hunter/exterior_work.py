@@ -200,8 +200,10 @@ def propose(world, clock, rules, policy, deadline, *, keep_economy=False, allow_
             if command:return candidate(command,'DUSK_CLOSE_GAP',target=target,steps=travel)
     if dusk:return None,report
     stock={name:m.inventory[name] for name in ('stone','iron','copper') if world.vendor.get(name,0)>0 and m.inventory[name]}
+    from . import rear_open
+    rear_mode=rear_open.enabled(world)
     if 'stone' in stock:
-        stock['stone']=max(0,stock['stone']-max(len(targets),1 if clock.day<10 else 0))
+        stock['stone']=max(0,stock['stone']-max(len(targets),1 if clock.day<10 and not rear_mode else 0))
         if not stock['stone']:stock.pop('stone')
     value=sum(world.vendor[name]*count for name,count in stock.items())
     night_left=min(130-(clock.round-o)%130 for o in clock.offsets)
@@ -230,7 +232,8 @@ def propose(world, clock, rules, policy, deadline, *, keep_economy=False, allow_
     # The next enclosing-ring work needs actual stone, not projected copper
     # proceeds. M can gather its own non-gate share overnight; W's gate stone
     # remains W's responsibility. This is a stock target, not a promised build.
-    next_missing=yellow-walls if getattr(world,'staged_walls',False) else targets
+    next_missing=(rear_open.required(world)-walls if rear_mode else
+                  yellow-walls if getattr(world,'staged_walls',False) else targets)
     non_gate=next_missing-{plan['gate']}
     stone_cost=wall_rule.items.get('stone',0) if wall_rule else 0
     worker_stock=max(0,w.inventory['stone']-stone_cost*int(plan['gate'] in next_missing)) if w and w.backpack is not None else 0

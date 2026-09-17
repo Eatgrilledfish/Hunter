@@ -48,6 +48,8 @@ def stand_rank(world, actor, position, walk):
 def seal_service_steps(world):
     """A carried front-wall coupon needs a real post-seal use and return."""
     if not enabled(world):return 0
+    from .rear_open import enabled as rear_enabled
+    if rear_enabled(world):return 0
     from .day_access import gate
     from .protocol import distance
     opening=gate(world)

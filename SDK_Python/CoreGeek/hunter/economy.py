@@ -38,7 +38,8 @@ def prepare_wall_cycle(world, clock, rules, policy=None):
     world.timed_economy = bool(policy and policy.day_schedule_enabled and len(world.weapons)==3
                               and len(battery.missing_walls(world,rules))<=1)
     if rules.wall_count(world) >= 10:
-        world.defence_cells = blue
+        from . import rear_open
+        world.defence_cells = blue | rear_open.openings(world)
     # Sealing requires the gate planner's observed two-inside/one-outside
     # permission. The former all-three-inside seal is not a fallback strategy.
     builders = [u for u in world.movers if u.kind=='worker' and u.backpack is not None

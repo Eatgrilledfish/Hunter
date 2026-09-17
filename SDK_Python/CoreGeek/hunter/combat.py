@@ -376,7 +376,43 @@ def propose_consumables(world, deadline, task_actor=None):
                                         -40, "joint bomb coverage competes with personal stock and controller turn",
                                         {i: 100 for i in sorted(identities)}))
         if actor.inventory["DizzyWeapon"]:
-            for p, identities in controls[:4]:
+            actor_controls=controls
+            from .rear_open import enabled as rear_enabled
+            if rear_enabled(world) and actor.id==world.night_roster.w:
+                # The dedicated maintainer keeps control for an actual
+                # defensive window. A distant dense spawn is not evidence
+                # that stunning it now protects the miner or a wall.
+                assets=world.movers+world.stations+[
+                    u for u in world.ours.values() if u.alive and u.kind=='wall'
+                    and getattr(world,'observed_wall_losses',{}).get(u.id,0)>0]
+                motion=getattr(world,'observed_robot_motion',{})
+                # Use the same labelled straight-motion scenario as exterior
+                # defence: waiting for actual contact can miss the last control
+                # window. No displacement is invented for a newly seen robot.
+                projected={r.id:(r.pos[0]+motion.get(r.id,(0,0))[0],
+                                 r.pos[1]+motion.get(r.id,(0,0))[1]) for r in robots}
+                immediate={r.id for r in robots if r.attack_power is not None and r.attack_power>0
+                    and r.attack_range is not None and any(
+                        min(distance(r.pos,q),distance(projected[r.id],q))<=r.attack_range
+                        for u in assets for q in u.cells)}
+                actor_controls=[row for row in controls if row[1]&immediate]
+                if actor.inventory['DizzyWeapon']==1:
+                    # The final personal control must cover a survival window,
+                    # using the same two-opportunity bound as guard repairs.
+                    # Healthy wall pressure cannot spend the only remaining
+                    # answer to an exposed mover's lethal pursuers.
+                    known=[r for r in robots if r.attack_power is not None
+                           and r.attack_range is not None and r.abnormal!='dizzy']
+                    critical=set()
+                    protected=world.movers+world.stations+[
+                        u for u in world.ours.values() if u.alive and u.kind=='wall']
+                    for unit in protected:
+                        sources=[r for r in known if any(
+                            distance(r.pos,q)<=r.attack_range for q in unit.cells)]
+                        if 2*sum(r.attack_power for r in sources)>=unit.health:
+                            critical.update(r.id for r in sources)
+                    actor_controls=[row for row in actor_controls if row[1]&critical]
+            for p, identities in actor_controls[:4]:
                 result.append(Candidate(actor.id, {"action": "use", "name": "DizzyWeapon", "targetPos": [pos_json(p)]},
                                         -35, "joint future suppression coverage; uncalibrated opportunity value",
                                         suppression=identities))

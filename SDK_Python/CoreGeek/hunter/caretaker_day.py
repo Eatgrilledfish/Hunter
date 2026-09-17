@@ -13,7 +13,8 @@ from .arbitration import Candidate
 from .day_schedule import DaySchedule, weighted_field
 from .day_division import DayDivision
 from .navigation import distance_field, interaction_cells
-from .protocol import MINERALS, pos_json
+from .protocol import MINERALS, pos_json, distance
+from .rear_open import enabled as rear_enabled
 from .rules import station_rings
 
 
@@ -168,6 +169,27 @@ class CaretakerDay:
             if immediate:
                 return self.finish(world,guidance,jobs,actor,immediate,'use',
                     reason='already at duty: adjacent paid use needs no return buffer')
+        if (rear_enabled(world) and rule and missing
+                and (self.phase=='home' or self.phase=='close'
+                     and clock.until_night<=home.get(actor.pos,float('inf'))+margin+1)
+                and all(actor.inventory[k]>=n for k,n in rule.items.items())
+                and (world.gold or 0)>=rule.gold):
+            # Returning from a helper handoff must not discard a funded wall
+            # already beside W. Prove the return with that wall actually
+            # blocked, including the unchanged buffer and this build action.
+            from .layout import LayoutGuard
+            guard=LayoutGuard(world,deadline)
+            for point in sorted(missing):
+                if distance(actor.pos,point)!=1 or point in world.occupied:continue
+                command=dict(action='build',name='wall',targetPos=[pos_json(point)])
+                choice=Candidate(actor.id,command,240,'finish adjacent funded wall on return')
+                if not guard.check([choice])[0]:continue
+                view=copy(world);view.occupied=world.occupied|{point}
+                back=distance_field(view,home_cells,actor.pos,deadline)
+                required=1+back.get(actor.pos,float('inf'))+margin
+                if time.monotonic()<deadline and required<=clock.until_night:
+                    return self.finish(world,guidance,jobs,actor,[choice],'close',
+                        required=required,reason='adjacent wall and observed return both fit')
         if (self.phase == 'close' and home.get(actor.pos) is not None
                 and clock.until_night <= home[actor.pos] + policy.return_buffer + 1):
             return self.finish(world, guidance, jobs, actor,
@@ -259,6 +281,11 @@ class CaretakerDay:
         trip_world.occupied = world.occupied
         trip = supply_basket.quote(trip_world,actor,clock,rules,policy,deadline,
             home=home,tail=tail,end=end,margin=margin,sale_stock=stock,
+            # A funded wall tour is part of this same checkout/return suffix.
+            # Stock its future service sites without pretending walls already
+            # exist or allowing a purchase before the sale actually settles.
+            future_repair_sites=(set(planned_walls) & set(getattr(world,'monster_front_walls',()))
+                                 if actor.inventory['stone']>=stone else ()),
             cash=(world.gold or 0)+sum(n*world.vendor[k] for k,n in stock.items()))
         cash = max(0,(world.gold or 0)-getattr(world,'treasure_reserved_gold',0))
         order = None; count = 0; held = []; deliveries = {}; use_steps = 0

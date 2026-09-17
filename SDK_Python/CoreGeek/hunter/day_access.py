@@ -15,6 +15,13 @@ def prepare(world, clock, deadline, state=None):
     world.access_diagnostic={}
     world.clear_exit_plan=(state.get('candidate') or state.get('point')) if state else None
     plan=getattr(world,'task_side_plan',None)
+    from . import rear_open
+    if rear_open.enabled(world):
+        world.active_access_gap=plan['gate']
+        world.clear_exit_plan=None
+        world.access_diagnostic=dict(mode=rear_open.MODE,
+            permanent_openings=sorted(rear_open.openings(world)),seal_required=False)
+        return
     if not plan or clock.phases!={'day'} or clock.day<=1:return
     if state is not None and state.get('day')!=clock.day:
         revision=state.get('revision',0)

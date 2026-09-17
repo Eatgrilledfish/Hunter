@@ -293,7 +293,7 @@ class DayDivision:
             if best is None or rank < best[0]:best = (rank,point,planned)
         if best is not None:
             _,point,planned = best
-            self.helper_clearance = dict(worker=worker.id,position=point,last_round=world.round)
+            self.helper_clearance = dict(worker=worker.id,helper=helper.id,position=point,last_round=world.round)
             world.helper_clearance_commands = {
                 worker.id:[dict(action='move',targetPos=[pos_json(point)])], helper.id:[]}
             world.wall_assistance = dict(active=False,reason='await observed worker corridor clearance',
@@ -344,8 +344,21 @@ class DayDivision:
         options = []
         batch = self.helper_batches.get(actor.id)
         if batch and batch.get('last_round') not in (world.round-1,world.round):
-            self.helper_batches.pop(actor.id,None)
-            batch = None
+            from .rear_open import enabled as rear_enabled
+            clearance=self.helper_clearance
+            worker=world.ours.get(clearance.get('worker'))
+            targets=set(batch.get('targets',())) & missing
+            confirmed_yield=(rear_enabled(world) and clearance.get('helper')==actor.id
+                and clearance.get('last_round')==world.round-1
+                and worker and worker.alive and worker.pos==clearance.get('position')
+                and batch.get('last_round')==world.round-2 and batch.get('phase')=='build'
+                and targets and actor.inventory['stone']>=len(targets))
+            # The helper deliberately waited while W moved. Preserve its
+            # funded batch only after that one-turn handoff is observed; a
+            # proposed/failed move cannot reserve work or invent an open route.
+            if not confirmed_yield:
+                self.helper_batches.pop(actor.id,None)
+                batch = None
         if batch and batch.get('mine') not in world.zones.get('stone', ()):
             batch['phase'] = 'build'
         if batch and batch['phase'] == 'build' and not actor.inventory['stone']:

@@ -33,7 +33,7 @@ logging.getLogger("hunter").addHandler(diagnostics)
 logging.getLogger("hunter").propagate = False  # Avoid a second unbounded traceback via the root handler.
 logging.getLogger("werkzeug").setLevel(logging.WARNING)  # Successful POST access lines are redundant.
 agent = Agent(diagnostics=diagnostics, rules=Rules.load(os.environ["HUNTER_RULES_PATH"]) if os.environ.get("HUNTER_RULES_PATH") else None,
-              policy=Policy.load(os.environ.get("HUNTER_POLICY_PATH") or Path(__file__).resolve().parent/'config/strategy.json'))
+              policy=Policy.load(os.environ.get("HUNTER_POLICY_PATH") or Path(__file__).resolve().parent/'config/strategy_rear_open.json'))
 
 try:
     diagnostics.startup(agent)

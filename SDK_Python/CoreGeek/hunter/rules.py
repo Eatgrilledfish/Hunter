@@ -345,6 +345,8 @@ class Policy:
     forward_battery_enabled: bool = False
     task_side_layout_enabled: bool = False
     pioneer_rotation_enabled: bool = False
+    rear_open_enabled: bool = False
+    caretaker_repair_target: int = 3
     external_gate_enabled: bool = False
     gate_seal_choice: str = 'auto'
     gate_dawn_choice: str = 'auto'
@@ -421,6 +423,10 @@ class Policy:
             elif type(value) not in (int, float) or not 0 <= value <= 3:
                 raise ValueError(f"{name} exceeds local timing bounds")
         result = cls(**parameters)
+        if result.rear_open_enabled and not (result.task_side_layout_enabled and result.pioneer_rotation_enabled):
+            raise ValueError('rear-open mode requires task-side layout and pioneer rotation')
+        if not 2 <= result.caretaker_repair_target <= 100:
+            raise ValueError('caretaker repair target must fit a worker backpack')
         if not 1 <= result.news_start_day <= 10 or not 8000 <= result.news_context_chars <= 100000:
             raise ValueError('news scheduling/context limits out of bounds')
         if not 0 < result.gatling_upgrade_health_fraction <= 1:

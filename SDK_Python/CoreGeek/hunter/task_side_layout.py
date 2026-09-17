@@ -246,7 +246,11 @@ class TaskSideLayout:
         if self.plan and (len(world.stations) != 1 or world.stations[0].pos != self.plan['anchor']):
             self.plan = None
         if self.plan is None:
-            self.plan, self.status = select(world, rules, policy, deadline)
+            if policy.rear_open_enabled:
+                from .rear_open import select as select_rear
+                self.plan, self.status = select_rear(world, rules, deadline)
+            if self.plan is None and time.monotonic() < deadline:
+                self.plan, self.status = select(world, rules, policy, deadline)
         if self.plan:
             # Unexpected buildings never cause replacement of observed weapons.
             if any((u.kind, u.pos) not in self.plan['slots'] for u in world.weapons):
@@ -260,6 +264,15 @@ def apply(world, rules, policy):
     if not policy or not policy.task_side_layout_enabled or not plan:
         return False
     blue, yellow = station_rings(plan['anchor'])
+    from . import rear_open
+    if rear_open.enabled(world):
+        world.build_interior = blue | rear_open.openings(world)
+        world.wall_targets = frozenset(rear_open.required(world))
+        world.firing_ports = frozenset()
+        world.battery_plan = dict(mode=rear_open.MODE, enclosure=False, slots=plan['slots'],
+            ports=tuple(sorted(rear_open.openings(world))), wall_goal=14,
+            direction_source='confirmed_monster_side')
+        return True
     world.build_interior = blue
     world.wall_targets = yellow
     world.firing_ports = frozenset()

@@ -523,7 +523,10 @@ class SunsetMarket:
             self.checkout_intents.pop(courier,None)
             self.checkout_deliveries.add(courier)
         for actor,command in response['roleCommandMap'].items():
-            if command.get('action')=='buy' and 'UpgradeVoucher' in command.get('name',''):
+            from .rear_open import enabled as rear_enabled
+            maintenance_order=(rear_enabled(world) and actor==world.night_roster.w
+                               and command.get('name')=='WallFixer')
+            if command.get('action')=='buy' and ('UpgradeVoucher' in command.get('name','') or maintenance_order):
                 self.pending.setdefault(actor,dict(name=command['name'],num=command.get('num',1),
                     prior=world.ours[actor].inventory[command['name']],round=world.round))
             if command.get('action')=='use' and 'UpgradeVoucher' in command.get('name',''):
