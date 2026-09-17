@@ -26,6 +26,8 @@ class SunsetMarket:
     started: bool = False
     settled: set = field(default_factory=set)
     pending: dict = field(default_factory=dict)
+    delivery_pending: dict = field(default_factory=dict)
+    delivery_receipts: list = field(default_factory=list)
     diagnostic: dict = field(default_factory=dict)
     upgrade_travellers: set = field(default_factory=set)
     upgrade_owner: str | None = None
@@ -43,31 +45,58 @@ class SunsetMarket:
         world.sunset_actions = {}
         world.sunset_buyer = None
         world.checkout_cash_reserve = 0
+        world.essential_repair_stock = {}
         self.diagnostic = {'stage':'inactive'}
         for identity, order in list(self.pending.items()):
             actor = world.ours.get(identity)
             feedback = world.raw.get('lastRoundRoleActionResults', {})
             failed = (world.round == order['round']+1 and isinstance(feedback,dict)
                       and feedback.get(identity) is False)
-            arrived = actor and actor.backpack is not None and actor.inventory[order['name']]>order['prior']
-            if arrived and identity in self.checkout_intents:
+            known=bool(actor and actor.backpack is not None)
+            if known:
+                current=actor.inventory[order['name']]
+                order['received']=order.get('received',0)+max(0,current-order.get('last_inventory',order['prior']))
+                order['last_inventory']=current
+            delta=order.get('received',0)
+            settled=(world.round==order['round']+1 and isinstance(feedback,dict)
+                     and feedback.get(identity) is True and known)
+            arrived=delta>=order.get('num',1) or settled and delta>0
+            if (arrived or failed) and delta and identity in self.checkout_intents:
                 intent=self.checkout_intents[identity]
                 name=order['name']
-                intent[name]=max(0,intent.get(name,0)-(actor.inventory[name]-order['prior']))
+                intent[name]=max(0,intent.get(name,0)-delta)
                 if not any(intent.values()):
                     self.checkout_intents.pop(identity)
                     self.checkout_deliveries.add(identity)
-            absent = (world.round > order['round']+1 and actor and actor.backpack is not None
-                      and actor.inventory[order['name']]<=order['prior'])
+            absent=(world.round>order['round']+1 and known and delta==0
+                    and actor.inventory[order['name']]<=order['prior'])
             if failed or arrived or absent:
                 self.pending.pop(identity)
+        for identity,order in list(self.delivery_pending.items()):
+            if world.round<=order['round']:continue
+            actor=world.ours.get(identity);target=world.ours.get(order['target'])
+            feedback=world.raw.get('lastRoundRoleActionResults',{})
+            failed=world.round==order['round']+1 and isinstance(feedback,dict) and feedback.get(identity) is False
+            changed=not target or not target.alive or target.pos!=order['position'] or target.level!=order['level']
+            consumed=bool(actor and actor.backpack is not None and actor.inventory[order['name']]<order['prior'])
+            not_applied=bool((world.round>order['round']+1 or not isinstance(feedback,dict)
+                or identity not in feedback) and actor and actor.alive
+                and actor.backpack is not None and actor.inventory[order['name']]==order['prior']
+                and target and target.alive and target.pos==order['position'] and target.level==order['level'])
+            if failed or changed or consumed or not_applied:
+                self.delivery_receipts.append(dict(actor=identity,item=order['name'],target=order['target'],
+                    issued=order['round'],observed=world.round,consumed=consumed,
+                    confirmed=bool(not failed and consumed and target and target.alive and target.pos==order['position']
+                                   and target.level==order['level']+1),failed=failed,not_applied=not_applied))
+                self.delivery_receipts=self.delivery_receipts[-40:]
+                self.delivery_pending.pop(identity)
+        world.checkout_use_pending=set(self.delivery_pending)
         if self.day != clock.day:
             self.day = clock.day; self.started = False; self.settled.clear()
             self.upgrade_travellers.clear()
             self.upgrade_owner=None
             self.checkout_intents.clear()
-            self.checkout_targets.clear()
-            self.checkout_deliveries.clear()
+            # A new day expires the route/quote, not personally paid delivery.
         from .day_access import gate as access_gate
         context=(world.gold,access_gate(world),
             tuple(sorted((u.id,u.pos) for u in world.ours.values() if u.alive and u.kind in WEAPONS|{'wall','station'})),
@@ -109,6 +138,7 @@ class SunsetMarket:
             and world.ours[uid].level is not None and world.ours[uid].level<=level]
             for i,targets in self.checkout_targets.items() if i in world.ours and world.ours[i].alive}
         world.checkout_targets=self.checkout_targets
+        world.checkout_pending_actors=set(self.pending)
         world.quoted_checkout_targets={}
         if (not policy.day_schedule_enabled or clock.phases != {'day'} or clock.day is None
                 or not world.phase_task_observed or time.monotonic()>=deadline):
@@ -117,6 +147,10 @@ class SunsetMarket:
         if enabled(world):
             if policy.staged_walls_enabled and policy.upgrade_commitment_enabled:
                 roster = world.night_roster
+                if (getattr(world,'news_task_hold',False) and roster.p not in self.pending
+                        and roster.p in world.ours and not any(n and 'UpgradeVoucher' in k
+                            for k,n in world.ours[roster.p].inventory.items())):
+                    excluded=set(excluded)|{roster.p}  # Only new, unpaid departures wait for dawn analysis.
                 free = {i for i in (roster.w,roster.p) if i not in excluded and i in world.ours
                         and world.ours[i].alive and world.ours[i].backpack is not None}
                 # Only one guard budgets the team's upgrade basket. Otherwise
@@ -489,6 +523,15 @@ class SunsetMarket:
             self.checkout_intents.pop(courier,None)
             self.checkout_deliveries.add(courier)
         for actor,command in response['roleCommandMap'].items():
+            if command.get('action')=='buy' and 'UpgradeVoucher' in command.get('name',''):
+                self.pending.setdefault(actor,dict(name=command['name'],num=command.get('num',1),
+                    prior=world.ours[actor].inventory[command['name']],round=world.round))
+            if command.get('action')=='use' and 'UpgradeVoucher' in command.get('name',''):
+                target=next((u for u in world.ours.values() if u.pos==tuple(
+                    command['targetPos'][0][k] for k in ('x','y'))),None)
+                if target and actor not in self.delivery_pending:
+                    self.delivery_pending[actor]=dict(name=command['name'],prior=world.ours[actor].inventory[command['name']],
+                        target=target.id,position=target.pos,level=target.level,round=world.round)
             if (command.get('action')=='buy' and 'UpgradeVoucher' in command.get('name','')
                     and actor in getattr(world,'quoted_checkout_targets',{})):
                 # Preserve the feasible delivery subset, not hypothetical
@@ -511,7 +554,7 @@ class SunsetMarket:
             self.upgrade_owner=worker
         if cmd.get('action')=='buy':
             self.pending[identity]={'name':cmd['name'],'prior':world.ours[identity].inventory[cmd['name']],
-                                    'round':world.round}
+                                    'round':world.round,'num':cmd.get('num',1)}
 
 
 def permits(world, candidate):
@@ -520,6 +563,9 @@ def permits(world, candidate):
     allowed=getattr(world,'sunset_actions',{})
     buyer=getattr(world,'sunset_buyer',None)
     actor=world.ours.get(identity)
+    if command.get('action')=='buy' and identity in getattr(world,'checkout_pending_actors',()):return False
+    if (command.get('action')=='use' and 'UpgradeVoucher' in command.get('name','')
+            and identity in getattr(world,'checkout_use_pending',())):return False
     personal_dose = (command.get('action')=='buy' and command.get('name')=='Medicine'
         and command.get('num',1)==1 and actor and actor.backpack is not None
         and not actor.inventory['Medicine']

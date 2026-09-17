@@ -92,6 +92,15 @@ class Directive:
                 setattr(view, name, {i: commands for i, commands in commitments.items() if i != actor})
         return view
 
+    permission_rejections: dict = field(default_factory=dict)
+
+    def _permission(self, allowed, candidate, source):
+        if not allowed and candidate.command.get('action') in {'buy','use','build','move'}:
+            rows=self.permission_rejections.setdefault(candidate.actor,[])
+            row=dict(source=source,command=candidate.command)
+            if row not in rows and len(rows)<4:rows.append(row)
+        return allowed
+
     def permit(self, candidate):
         """A due return is a macro commitment, not a price-dependent bid.
 
@@ -99,7 +108,7 @@ class Directive:
         work, while ordinary movement cannot spend an already exhausted buffer.
         """
         if self.purchase_permit is not None and not self.purchase_permit(candidate):
-            return False
+            return self._permission(False,candidate,'purchase')
         identity = candidate.command.get('controllerId') if candidate.command.get('action')=='attack' else candidate.actor
         # A survival planner owns the actor, but cannot override an independently
         # established lethal destination. Apply this before its exclusive lock.
@@ -110,11 +119,11 @@ class Directive:
         if identity in self.survival_actions:
             return candidate.command in self.survival_actions[identity]
         if self.market_permit is not None and not self.market_permit(candidate):
-            return False
+            return self._permission(False,candidate,'market')
         if self.duty_permit is not None:
             allowed=self.duty_permit(candidate)
             if allowed is not None:
-                return allowed
+                return self._permission(allowed,candidate,'duty')
         if candidate.command.get("action") == "move":
             targets = candidate.command.get("targetPos", [])
             if len(targets) == 1 and (targets[0].get("x"), targets[0].get("y")) in self.blocked_moves.get(candidate.actor, set()):
@@ -149,7 +158,8 @@ class Directive:
         if plan and plan['commands']:
             triage = (candidate.command.get('action')=='use' and candidate.command.get('name')=='Medicine'
                       and any(candidate is c for c in self.candidates))
-            return triage or candidate.command in plan['commands']
+            return self._permission(triage or candidate.command in plan['commands'],candidate,
+                'work_plan:'+str(plan.get('owner'))+':'+str(plan.get('phase')))
         if candidate.actor in self.roster_transit_actions:
             return candidate.command in self.roster_transit_actions[candidate.actor] or (
                 candidate.command.get('action') == 'use'

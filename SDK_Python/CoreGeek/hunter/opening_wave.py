@@ -46,6 +46,19 @@ def dusk_exit(world, clock, actor, interior, deadline):
     goals={(x,y) for x in range(world.width) for y in range(world.height)
            if (x,y) not in cells|interior|world.occupied}
     route=distance_field(world,goals,actor.pos,deadline,extra_blocked=interior)
+    # Another visible mover can contest an adjacent destination even when that
+    # cell is empty now. For this deadline-bound retreat, prefer a complete
+    # route outside those first-step destinations when one exists. This is a
+    # collision precaution, not a prediction of the opponent's command.
+    contested={q for unit in world.enemies.values()
+               if unit.alive and unit.kind in {'worker','pioneer'}
+               for q in neighbours(unit.pos)}
+    if contested:
+        alternate=distance_field(world,goals,actor.pos,deadline,
+                                 extra_blocked=interior|contested)
+        if actor.pos in alternate:
+            route=alternate
+            report['collision_precaution']='visible opposing mover adjacent destinations'
     length=route.get(actor.pos)
     if length is None or clock.until_night>length+1:
         return None,{}

@@ -30,7 +30,7 @@ class CaretakerDay:
 
     @staticmethod
     def adjacent_paid(world, actor, rules, policy):
-        from .wall_policy import upgrade_rank
+        from .wall_policy import upgrade_rank, priority_units
         from .wall_service import service_key, use_permitted
         choices=[]
         for target in world.ours.values():
@@ -38,7 +38,9 @@ class CaretakerDay:
                     or not procurement.upgrade_allowed(world,target,policy,rules)
                     or max(abs(actor.pos[0]-target.pos[0]),abs(actor.pos[1]-target.pos[1]))>1):
                 continue
-            prefix='Weapon' if target in world.weapons else 'Wall' if target.kind=='wall' else None
+            prefix=('Weapon' if target in world.weapons else 'Wall' if target.kind=='wall'
+                    else 'Station' if target.kind=='station' and (target.id in getattr(world,'base_restore_ids',())
+                        or target.id in {u.id for u in priority_units(world)}) else None)
             name=f'{prefix}UpgradeVoucher{target.level}'
             if not prefix or not actor.inventory[name]:continue
             candidate=Candidate(actor.id,dict(action='use',name=name,targetPos=[pos_json(target.pos)]),240,
@@ -225,6 +227,30 @@ class CaretakerDay:
         if tail is None or end is None or time.monotonic() >= deadline:
             return self.finish(world, guidance, jobs, actor, [], 'close', reason='route budget unavailable')
 
+        # One already-paid adjacent base recovery can precede ordinary work.
+        # The same remaining construction/closure tail still has to fit.
+        if 1+tail.get(actor.pos,float('inf'))+margin <= clock.until_night:
+            immediate=[c for c in self.adjacent_paid(world,actor,rules,policy)
+                       if c.command['name'].startswith('StationUpgradeVoucher')]
+            if immediate:
+                return self.finish(world,guidance,jobs,actor,immediate,'use',
+                    reason='paid adjacent base recovery with construction suffix reserved')
+
+        # Treatment at the counter is part of this itinerary, not a competing
+        # medical plan that its checkout lock can later reject. No spare dose.
+        from .medical import needs_treatment
+        price=world.shop.get('Medicine',0)
+        if (policy.medical_supply_enabled and world.near_zone(actor.pos,'weaponShop')
+                and needs_treatment(world,actor,clock)
+                and actor.id not in getattr(world,'checkout_pending_actors',())
+                and 2+tail.get(actor.pos,float('inf'))+margin<=clock.until_night):
+            if actor.inventory['Medicine']:
+                return self.finish(world,guidance,jobs,actor,[Candidate(actor.id,
+                    dict(action='use',name='Medicine'),260,'treat current injury before continuing checkout')],'repair')
+            if len(actor.backpack)<actor.capacity and price>0 and (world.gold or 0)>=price:
+                return self.finish(world,guidance,jobs,actor,[Candidate(actor.id,
+                    dict(action='buy',name='Medicine',num=1),260,'buy one treatment dose at current counter')],'buy')
+
         # One shopping basket covers successive voucher tiers and personal
         # night stock. Forecast sale proceeds are timing-only; the buy below
         # still caps its quantity by the observed balance after receipts.
@@ -244,6 +270,17 @@ class CaretakerDay:
             if trip['orders']:
                 name,count = next(iter(trip['orders'].items()))
                 order = dict(name=name)
+        # Checkout/paid delivery must not strand a repair pack that was bought
+        # for a current eligible wall. Reuse the same service candidate, while
+        # reserving a conservative round trip plus all quoted use/closure work.
+        repairs=getattr(world,'repair_commands',{}).get(actor.id,[])
+        repair_steps=getattr(world,'day_repair_steps',{}).get(actor.id)
+        if (self.phase!='harvest' and repairs and repair_steps is not None
+                and actor.id not in getattr(world,'checkout_pending_actors',())
+                and 2*repair_steps+tail.get(actor.pos,float('inf'))+use_steps+margin<=clock.until_night):
+            return self.finish(world,guidance,jobs,actor,
+                [Candidate(actor.id,c,260,'perform current funded repair within remaining delivery circuit') for c in repairs],
+                'repair',reason='repair and paid delivery share the same remaining deadline')
         fields = {}
         def route(carrier,target):
             key = carrier.id,target['unit'].id
@@ -252,10 +289,11 @@ class CaretakerDay:
                     interaction_cells(trip_world,[target['unit'].pos],carrier.pos),carrier.pos,deadline)
             return fields[key]
         from .wall_pressure import priority
-        ready = [(t['rank'],priority(world,t['unit']),route(actor,t).get(actor.pos,float('inf')),t['unit'].id,t)
+        ready = [(0 if t['unit'].id in getattr(world,'base_restore_ids',()) else 1,
+                  t['rank'],priority(world,t['unit']),route(actor,t).get(actor.pos,float('inf')),t['unit'].id,t)
                  for t in held if not t.get('pending') and t['level']==t['unit'].level]
         if ready:
-            _,_,length,_,target = min(ready,key=lambda t:t[:4])
+            _,_,_,length,_,target = min(ready,key=lambda t:t[:5])
             if length != float('inf'):deliveries[actor.id]=(target,length)
         if self.construction_only:
             # Paid coupons may still be used after construction, but new
@@ -291,8 +329,8 @@ class CaretakerDay:
             weapon=target['name'].startswith('WeaponUpgradeVoucher')
             wall=(target['unit'].kind=='wall' and not missing-{plan['gate']})
             from .wall_policy import priority_units
-            station=(target['unit'].kind=='station' and not missing-{plan['gate']}
-                     and target['unit'].id in {u.id for u in priority_units(world)})
+            station=(target['unit'].kind=='station' and (target['unit'].id in getattr(world,'base_restore_ids',())
+                     or not missing-{plan['gate']} and target['unit'].id in {u.id for u in priority_units(world)}))
             if weapon or wall or station:
                 # Paid tiers can need the open passage, including front-wall
                 # corners served from outside. Do not budget them only after

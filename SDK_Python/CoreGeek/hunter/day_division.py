@@ -179,6 +179,17 @@ class DayDivision:
             late = tour is None or max(tour['steps'],material_steps)+policy.return_buffer >= clock.until_night
             if late or rescue or (deficit and other.inventory['stone']) or other.id in self.helper_batches:
                 helper = self.assistance(world,clock,policy,other,missing,ring,job,guard,deadline)
+                if (helper and (not self.helper_clearance or actor.pos != self.helper_clearance.get('position'))
+                        and not helper.get('helper_collect')
+                        and not getattr(world,'ordered_ingress_due',False)
+                        and distance(actor.pos,other.pos)<=2
+                        and len(helper['helper_targets'])<other.inventory['stone']):
+                    # Opening ordinary construction at the former gate can
+                    # expose a long one-wall detour. Do not let that merely
+                    # feasible route hide a better observed corridor handoff.
+                    improved=self.clear_helper_corridor(world,clock,policy,actor,other,missing,ring,job,deadline,
+                        minimum_targets=len(helper['helper_targets']))
+                    if improved:return result
                 if helper:
                     clearance = self.helper_clearance
                     if (clearance.get('worker') == actor.id and actor.pos == clearance.get('position')
@@ -249,7 +260,7 @@ class DayDivision:
                 current.setdefault('target_steps',{})[target]=walk+1
         return result
 
-    def clear_helper_corridor(self, world, clock, policy, worker, helper, missing, ring, job, deadline):
+    def clear_helper_corridor(self, world, clock, policy, worker, helper, missing, ring, job, deadline, *, minimum_targets=0):
         """Move the blocking worker first; reserve no build on imagined occupancy."""
         self.helper_clearance.clear()
         if (not policy.pioneer_rotation_enabled or not helper.inventory['stone']
@@ -271,7 +282,8 @@ class DayDivision:
             trial = deepcopy(self)
             planned = trial.assistance(preview,clock,policy,helper,missing,ring,job,
                                        LayoutGuard(preview,deadline),deadline)
-            if not planned or planned.get('helper_collect'):
+            if (not planned or planned.get('helper_collect')
+                    or len(planned['helper_targets'])<=minimum_targets):
                 continue
             home = distance_field(preview,defence_duties.stands(world,worker.id),point,deadline)
             required = planned['construction_steps']+home.get(point,float('inf'))+policy.return_buffer+1
@@ -286,7 +298,7 @@ class DayDivision:
                 worker.id:[dict(action='move',targetPos=[pos_json(point)])], helper.id:[]}
             world.wall_assistance = dict(active=False,reason='await observed worker corridor clearance',
                 worker=helper.id,supplier=worker.id,clearance=list(point),steps=planned['construction_steps'])
-            return
+            return planned
 
     def front_worker_targets(self, world, clock, policy, worker, helper, missing, ring, guard, deadline):
         """Reserve only personally funded front work W can finish sooner.

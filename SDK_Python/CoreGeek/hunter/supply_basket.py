@@ -139,6 +139,31 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
                 planned.extend(dict(name='WallFixer',rank=1.9,level=0,unit=None) for _ in range(count))
                 available-=count*price;space-=count
                 if limits is not None:limits['WallFixer']-=count
+    # Current repair work is different from predictive spare stock. Only the
+    # actual maintenance carrier already at the shop can fund this exception.
+    # Its own route to an eligible wall and back to duty must fit today's clock.
+    clock=getattr(world,'strategy_clock',None)
+    if (not emergency and actor.id==roster.w and clock and clock.phases=={'day'}
+            and world.near_zone(actor.pos,'weaponShop') and world.shop.get('WallFixer',0)>0):
+        from .repair_decision import eligible
+        from .wall_policy import minimum_stock
+        home=defence_duties.stands(world,actor.id) if getattr(world,'task_side_plan',None) else set()
+        back=distance_field(world,home,actor.pos,deadline) if home else {}
+        service=[u for u in world.ours.values() if eligible(world,u,rules,policy)
+            and any(fields[actor.id][p]+2+back[p]+policy.return_buffer<=clock.until_night
+                for p in interaction_cells(world,[u.pos],actor.pos)
+                if p in fields[actor.id] and p in back)]
+        if service and time.monotonic()<deadline:
+            count=max(0,min(len(service),minimum_stock(world,actor,'WallFixer'))
+                -actor.inventory['WallFixer']-sum(e['name']=='WallFixer' for e in planned))
+            count=min(count,space,available//world.shop['WallFixer'])
+            if limits is not None:count=min(count,limits['WallFixer'])
+            if count:
+                world.essential_repair_stock=getattr(world,'essential_repair_stock',{})
+                world.essential_repair_stock[actor.id]=dict(count=count,targets=[u.id for u in service],round=world.round)
+                planned.extend(dict(name='WallFixer',rank=1.8,level=0,unit=None) for _ in range(count))
+                available-=count*world.shop['WallFixer'];space-=count
+                if limits is not None:limits['WallFixer']-=count
     for req in unfilled:
         if not primary:break
         if space <= 0 or time.monotonic() >= deadline:

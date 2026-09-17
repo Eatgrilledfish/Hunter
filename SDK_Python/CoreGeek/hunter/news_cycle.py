@@ -66,6 +66,7 @@ class NewsCycle:
         intel.unresolved.clear()
         intel.invalid_candidates.clear()
         intel.execution.clear()
+        intel.preparation_trip.clear()
         intel.execution_blockers.clear()
         self.repairs.clear()
 
@@ -155,11 +156,16 @@ class NewsCycle:
                   and a['round'] not in intel.reviewed_attempts]
         payload=dict(request_id=fingerprint(context['nonce'])[:16],context=context,round=world.round,
             day=clock.day,clock_origin=clock.origin,cycle_id=self.number,analysis_stage=stage,
+            clock_rules=dict(day_rounds=70,night_rounds=60,origin_candidates=list(clock.offsets),
+                             until_night=clock.until_night),
             sources=sources,known_clues=clues,unresolved=intel.unresolved,
             previous_events=intel.events,previous_rejections=intel.rejections,
             validation_feedback=list(intel.invalid_candidates),treasure_attempt_feedback=feedback,
             shop=world.shop,vendor=world.vendor,offering_descriptions={k:v for k,v in descriptions.items() if k in world.shop},
             current_map={'width':world.width,'height':world.height,
+                'coordinate_rules':{'origin':'bottom_left','x_positive':'right','y_positive':'up',
+                    'distance':'chebyshev','station_anchor':'top_left',
+                    'source':'taskbook sections 4.1 and 4.5'},
                 'zones':{k:sorted(v) for k,v in world.zones.items()},
                 'bases':[{'side':side,'pos':u.pos} for side,units in
                     ((world.side,world.ours),('enemy',world.enemies)) for u in units.values() if u.kind=='station' and u.alive]},

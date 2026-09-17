@@ -50,6 +50,37 @@ class BaseRecovery:
                 result.add(base.id)
         return result
 
+    def adjacent_night(self, world, clock, targets, alternatives, task_actor=None):
+        """One-step paid rescue, with a conservative effective-fire fallback.
+
+        Unknown simultaneous damage ordering cannot prove that losing a useful
+        shot saves the base. Keep that shot/control and report the conflict.
+        No remote delivery or role reservation is created by this preview.
+        """
+        if clock.phases!={'night'}:return []
+        from .arbitration import Candidate
+        from .protocol import distance,pos_json
+        result=[]
+        for actor in world.movers:
+            if actor.id==task_actor or actor.backpack is None:continue
+            for base in world.stations:
+                name=f'StationUpgradeVoucher{base.level}'
+                if base.id not in targets or not actor.inventory[name] or distance(actor.pos,base.pos)>1:continue
+                fire=[c for c in alternatives if
+                    (c.command.get('controllerId')==actor.id or c.actor==actor.id)
+                    and (any(n>0 for n in c.damage.values()) or c.suppression
+                         or c.command.get('name') in {'Bomb','DizzyWeapon'})]
+                report=self.diagnostic['bases'][base.id]
+                if fire:
+                    report.update(night_rescue='effective_defence_preserved',carrier=actor.id,
+                        reason='simultaneous restoration and threat settlement not proven',
+                        alternatives=len(fire))
+                    continue
+                report.update(night_rescue='adjacent_paid_candidate',carrier=actor.id)
+                result.append(Candidate(actor.id,dict(action='use',name=name,targetPos=[pos_json(base.pos)]),
+                    90,'adjacent paid base restoration without displacing effective fire'))
+        return result
+
     def ready(self, world, clock, policy, plans, targets, operator_stands, deadline):
         if not targets or clock.phases != {"day"} or time.monotonic() >= deadline:
             return []

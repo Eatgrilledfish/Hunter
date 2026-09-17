@@ -29,6 +29,7 @@ OFFERING_DESCRIPTIONS = {
 class Intelligence:
     cycle: NewsCycle = field(default_factory=NewsCycle)
     preparations: list = field(default_factory=list)
+    preparation_trip: dict = field(default_factory=dict)
     return_plan: dict = field(default_factory=dict)
     pending: dict | None = None
     analyzed: set = field(default_factory=set)
@@ -83,6 +84,15 @@ class Intelligence:
 
     def reconcile(self, world, clock, session):
         policy = getattr(world, 'strategy_policy', Policy())
+        trip = self.preparation_trip
+        carrier = world.ours.get(trip.get('actor'))
+        if (trip and trip.get('phase') not in {'completed','handed_over'}
+                and carrier and carrier.alive and carrier.backpack is not None
+                and carrier.id not in self.pending_purchases
+                and carrier.pos == tuple(trip['home'])
+                and not (Counter(trip['items'])-carrier.inventory)):
+            trip.update(phase='completed',completed_round=world.round)
+            if self.execution.get('phase') == 'prepare':self.execution.clear()
         if policy.news_daily_enabled:
             self.cycle.entries(session.news, clock)
         for identity, purchase in list(self.pending_purchases.items()):
@@ -147,6 +157,12 @@ class Intelligence:
                         self.treasures.clear()
                         self.preparations.clear()
                     self._ingest(world, data, self.pending.get("citation_sources",self.pending["sources"]))
+                    trip=self.preparation_trip
+                    if (policy.news_daily_enabled and not self.preparations and not self.treasures
+                            and trip and trip.get('phase') not in {'completed','handed_over'}):
+                        self.return_plan=dict(actor=trip['actor'],home=trip['home'])
+                        trip.update(phase='handed_over',reason='preparation withdrawn; retain physical return')
+                        if self.execution.get('phase')=='prepare':self.execution.clear()
                     self.analyzed.update(self.pending["sources"])
                     self.reviewed_sources.update(self.pending.get('review_sources',()))
                     if self.pending.get('synthesis_corpus'):
@@ -414,7 +430,11 @@ class Intelligence:
                     for y in range(max(0,r.pos[1]-radius),min(world.height,r.pos[1]+radius+1)))
             world=view
         stands=getattr(world,'pioneer_trade_stands',{})
-        if actor.id in stands:home_goals={stands[actor.id]}
+        trip=self.preparation_trip
+        if (not self.treasures and trip.get('actor')==actor.id
+                and trip.get('phase') not in {'completed','handed_over'} and trip.get('home')):
+            home_goals={tuple(trip['home'])}
+        elif actor.id in stands:home_goals={stands[actor.id]}
         elif getattr(world,'task_side_plan',None):home_goals=set(world.task_side_plan['c_stands'])
         elif self.execution.get('home'):home_goals={tuple(self.execution['home'])}
         else:
@@ -568,8 +588,13 @@ class Intelligence:
         if needed and (world.gold is None or cost+reserve>world.gold or self.treasure_spent+cost>policy.treasure_gold_limit):return []
         goal=min(home_goals,key=lambda p:(start.get(p,float('inf')),p))
         if not needed:
-            if home.get(actor.pos)==0:
+            active_trip=(self.preparation_trip.get('actor')==actor.id
+                and self.preparation_trip.get('phase') not in {None,'completed','handed_over'})
+            if not active_trip or home.get(actor.pos)==0:
                 self.diagnostic=dict(stage='prepared',actor=actor.id,cost=0)
+                if active_trip:
+                    self.preparation_trip.update(phase='completed',completed_round=world.round)
+                if self.execution.get('phase')=='prepare':self.execution.clear()
                 return []
             if actor.pos not in home or home[actor.pos]+margin>clock.until_night:return []
             steps=[p for p in neighbours(actor.pos) if home.get(p,float('inf'))<home[actor.pos]]
@@ -592,7 +617,8 @@ class Intelligence:
             stage='procure'
         if time.monotonic()>=deadline:return []
         self.diagnostic=dict(stage=stage,actor=actor.id,phase='prepare',cost=cost,items=plan['items'])
-        self.offered_plan=dict(actor=actor.id,hypothesis=plan['id'],phase='prepare',stage=stage,home=goal)
+        self.offered_plan=dict(actor=actor.id,hypothesis=plan['id'],phase='prepare',stage=stage,home=goal,
+                              items=sorted(plan['items']))
         return result
 
     def finalize(self, world, clock, session, response, policy):
@@ -600,6 +626,12 @@ class Intelligence:
         if (identity in getattr(world,'treasure_actions',{}) and
                 response['roleCommandMap'].get(identity) in world.treasure_actions[identity]):
             self.execution=dict(self.offered_plan,selected_round=world.round)
+            if self.offered_plan.get('phase')=='prepare' and self.offered_plan.get('items'):
+                self.preparation_trip=dict(actor=identity,items=self.offered_plan['items'],
+                    requirement=fingerprint([self.cycle.number,identity,self.offered_plan['items']]),
+                    home=self.offered_plan['home'],phase=self.offered_plan['stage'],selected_round=world.round)
+            elif self.offered_plan.get('phase')!='prepare' and self.preparation_trip:
+                self.preparation_trip.update(phase='handed_over',completed_round=world.round)
         for identity, action in response["roleCommandMap"].items():
             actor = world.ours[identity]
             if action["action"] == "summonTreasure":

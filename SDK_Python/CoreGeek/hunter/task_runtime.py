@@ -126,9 +126,17 @@ def _hunter_loads(*args,**kwargs):
                         if merged and start<=merged[-1][1]:merged[-1][1]=max(merged[-1][1],end)
                         else:merged.append([start,end])
                     covered=sum(max(0,min(end,total)-min(start,total)) for start,end in merged)
+                    missing=[];cursor=0
+                    for start,end in merged:
+                        if start>cursor:missing.append([cursor,min(start,total)])
+                        cursor=max(cursor,min(end,total))
+                    if cursor<total:missing.append([cursor,total])
+                    missing=[r for r in missing if r[0]<r[1]]
                     record['pagination_coverage']={'total_count':total,'covered_records':covered,
-                        'complete': covered==total,'ranges':merged[:8],'ranges_partial':len(merged)>8}
+                        'complete': covered==total,'ranges':merged[:8],'ranges_partial':len(merged)>8,
+                        'missing_ranges':missing[:8],'missing_ranges_partial':len(missing)>8}
                     _hunter_coverages[key]=dict(record['pagination_coverage'],path=_hunter_json_dataset[2],
+                        query_fields=sorted({k for k,v in _hunter_json_dataset[3]}),
                         dataset_id=_hhash.sha256(repr(_hunter_json_dataset).encode()).hexdigest()[:16])
         if _hunter_coverages:
             # Preserve each separately keyed population when a later request

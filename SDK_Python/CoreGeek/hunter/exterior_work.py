@@ -50,10 +50,14 @@ def propose(world, clock, rules, policy, deadline, *, keep_economy=False, allow_
         # as treatment routes, including a fallback from an unavailable shop.
         # Healthy workers keep the original productive range boundary.
         radius=robot.attack_range + int(needs_treatment(world,m,clock))
-        for x in range(max(0,robot.pos[0]-radius),min(world.width,robot.pos[0]+radius+1)):
-            if time.monotonic()>=deadline:raise BudgetExpired
-            for y in range(max(0,robot.pos[1]-radius),min(world.height,robot.pos[1]+radius+1)):
-                blocked.add((x,y))
+        # Economic work cannot undo evasion by moving into the same
+        # observed-direction scenario that the survival planner avoids.
+        dx,dy=getattr(world,'observed_robot_motion',{}).get(robot.id,(0,0))
+        for center in {robot.pos,(robot.pos[0]+dx,robot.pos[1]+dy)}:
+            for x in range(max(0,center[0]-radius),min(world.width,center[0]+radius+1)):
+                if time.monotonic()>=deadline:raise BudgetExpired
+                for y in range(max(0,center[1]-radius),min(world.height,center[1]+radius+1)):
+                    blocked.add((x,y))
     blocked.discard(m.pos)
     if clock.phases == {'night'} and policy.pioneer_rotation_enabled and allow_resupply:
         from .night_resupply import propose as resupply

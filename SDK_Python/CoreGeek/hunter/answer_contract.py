@@ -153,8 +153,13 @@ def validate(task, spec, value, refs):
                     if identity:datasets_by_id[identity]=dataset
         relevant=list(datasets_by_id.values())
         relevant=[d for d in relevant if d.get('path') in scope['paths']] or relevant
-        if any(d.get('complete') is False for d in relevant):
-            raise ValueError('API pagination incomplete: current task dataset remains uncovered')
+        blocked=[{k:d.get(k) for k in ('dataset_id','path','query_fields','total_count','covered_records',
+                                       'missing_ranges','missing_ranges_partial') if k in d}
+                 for d in relevant if d.get('complete') is False]
+        if blocked:
+            raise ValueError('API pagination incomplete: current task dataset remains uncovered; blocked='+
+                             json.dumps(blocked,ensure_ascii=False,separators=(',',':'))+
+                             '; re-read complete raw records and recompute; samples are not the dataset')
         if not any(any(e.get('kind')=='json_shape' for e in result.get('runtime_events',[])) for result in results):
             # Only the selected evidence's prefix; a later failed exploration
             # cannot invalidate an earlier explicitly validated checkpoint.

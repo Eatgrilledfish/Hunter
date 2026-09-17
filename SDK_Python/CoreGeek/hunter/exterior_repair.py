@@ -58,8 +58,13 @@ class ExteriorRepair:
             if r.attack_power<=0:continue
             if distance(actor.pos,r.pos)<=r.attack_range:
                 self.diagnostic['stage']='ESCAPE_FIRST';return []
-            blocked.update((x,y) for x in range(max(0,r.pos[0]-r.attack_range),min(world.width,r.pos[0]+r.attack_range+1))
-                           for y in range(max(0,r.pos[1]-r.attack_range),min(world.height,r.pos[1]+r.attack_range+1)))
+            # Use the same one-step observed-motion scenario as evasion.
+            # A safe current cell must not send M back into the pursuing
+            # robot's next observed-direction footprint to service a wall.
+            dx,dy=getattr(world,'observed_robot_motion',{}).get(r.id,(0,0))
+            for center in {r.pos,(r.pos[0]+dx,r.pos[1]+dy)}:
+                blocked.update((x,y) for x in range(max(0,center[0]-r.attack_range),min(world.width,center[0]+r.attack_range+1))
+                               for y in range(max(0,center[1]-r.attack_range),min(world.height,center[1]+r.attack_range+1)))
         view=copy(world);view.occupied=world.occupied|blocked
         reach=distance_field(view,{actor.pos},actor.pos,deadline)
         left=min(130-(clock.round-o)%130 for o in clock.offsets)

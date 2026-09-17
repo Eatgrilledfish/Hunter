@@ -283,6 +283,11 @@ def purchase_permitted(world, rules, candidate):
         if actor.health <= (200 if actor.kind=='pioneer' else 220)*.5 or clock and needs_treatment(world,actor,clock):
             return True
     if name=='WallFixer' and getattr(world,'critical_base_ids',()):return True
+    repair=getattr(world,'essential_repair_stock',{}).get(actor.id,{})
+    if (name=='WallFixer' and repair.get('round')==world.round
+            and 0<command.get('num',1)<=repair.get('count',0)):
+        candidate.gold_reserve=max(candidate.gold_reserve,getattr(world,'treasure_reserved_gold',0))
+        return True
     if name.endswith('SummonOrder') and not pressure_ready(world):return False
     minimum = max(0,minimum_stock(world,actor,name)-actor.inventory[name])
     reserve,item=investment_fund(world,preserve_reconstruction=command.get('num',1)>minimum)

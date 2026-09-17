@@ -50,6 +50,11 @@ def prepare(state, world, clock, rules, policy, deadline, *, task_busy=False):
         state.commands[actor.id] = [command] if command else []
         if command:
             result.append(Candidate(actor.id, command, 1100, reason))
+            if command.get('action') in {'build','remove'} and command.get('targetPos')==[pos_json(gate if command['action']=='build' else (getattr(world,'clear_exit_plan',None) or gate))]:
+                action_gate=tuple(command['targetPos'][0][k] for k in ('x','y'))
+                kind='seal' if command['action']=='build' else 'dawn'
+                state.gate_offer=dict(row=dict(kind=kind,worker=actor.id,gate=action_gate,planned={}),
+                    mode='ordered',alternatives=[],commands=[(actor.id,command)],held=[])
         return command
 
     def step(actor, goals, extra=()):
@@ -327,11 +332,12 @@ def prepare(state, world, clock, rules, policy, deadline, *, task_busy=False):
         return result
 
     # The worker next to C opens the daytime exit. M never returns to do it.
-    if (clock.day > 1 and gate in walls and clock.until_night > 35 and walls[gate].level == 1
+    opening_gate=getattr(world,'clear_exit_plan',None) or gate
+    if (clock.day > 1 and opening_gate in walls and clock.until_night > 35 and walls[opening_gate].level == 1
             and not getattr(world,'worker_close_requested',False)):
         state.stage = 'WORKER_DAWN_OPEN'
-        goals = (set(neighbours(gate)) & blue) - {plan['w']}
-        command = (dict(action='remove',targetPos=[pos_json(gate)]) if distance(worker.pos,gate)==1
+        goals = (set(neighbours(opening_gate)) & blue) - {plan['w']}
+        command = (dict(action='remove',targetPos=[pos_json(opening_gate)]) if distance(worker.pos,opening_gate)==1
                    else step(worker,goals))
         if command and command['action']=='remove':
             world.ordered_gate_actions[worker.id] = [command]

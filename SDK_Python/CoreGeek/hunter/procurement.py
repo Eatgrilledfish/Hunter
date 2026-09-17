@@ -54,14 +54,11 @@ def urgent_gatling_upgrades(world, policy, rules, task_actor=None, *, priority_i
 
     Eligibility alone cannot beat the attack selector. The caller must install
     these actions as emergency commitments, including both actor and gun locks.
-    A carrier with a matching voucher for a critical base remains available to
-    the base-recovery plan. No future purchase, transfer, or healing is assumed.
+    A carrier with an already validated executable base rescue remains available
+    to that plan; merely holding a base voucher creates no reservation. No future purchase, transfer, or healing is assumed.
     """
-    critical = [world.ours[i] for i in priority_ids if i in world.ours
-                and world.ours[i].alive and world.ours[i].kind == 'station'
-                and world.ours[i].level in (1, 2)]
     actors = sorted((u for u in world.movers if u.id != task_actor and u.backpack is not None
-                     and not any(u.inventory[f'StationUpgradeVoucher{b.level}'] for b in critical)),
+                     and u.id not in getattr(world,'executable_base_rescue_actors',())),
                     key=lambda u:u.id)[:3]
     def priority(gun):
         state, _ = gatling_upgrade_status(world,gun,policy,rules)

@@ -143,8 +143,8 @@ def construction_cells(world, name, legal):
     """
     result = cells(world, name, legal)
     if name == 'wall' and getattr(world, 'wall_stage', None) != 'front10':
-        from .wall_policy import planned_gate
-        gate = planned_gate(world)
+        from .day_access import gate as access_gate
+        gate = access_gate(world)
         if gate not in world.seal_cells:
             result.discard(gate)
     return result

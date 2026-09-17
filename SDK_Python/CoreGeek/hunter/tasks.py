@@ -50,6 +50,29 @@ def execution_failure(data):
     return None
 
 
+
+def pagination_progress(task):
+    """Observed coverage and inspected contracts, not request IDs or prose."""
+    datasets={};documents={}
+    for evidence in task.evidence.values():
+        data=evidence.get('data',{})
+        if evidence.get('usable') and data.get('operation')=='read_slice':
+            documents[data.get('path')]=[data.get('file_sha256'),data.get('text'),data.get('completeness')]
+        for event in data.get('runtime_events',[]):
+            for item in event.get('pagination_datasets',[]):
+                datasets[item.get('dataset_id') or 'unknown']={k:item.get(k) for k in
+                    ('complete','total_count','covered_records','missing_ranges','missing_ranges_partial')}
+    return fingerprint(dict(datasets=datasets,documents=documents))
+
+
+def record_pagination_block(task, reason, number):
+    if 'pagination incomplete' not in reason:return
+    signature=pagination_progress(task)
+    prior=task.pagination_block
+    task.pagination_block=dict(signature=signature,count=prior.get('count',0)+1
+        if prior.get('signature')==signature else 1,round=number,reason=reason[:1800])
+
+
 def result_excerpt(value, limit=480):
     text = str(value)
     if len(text) <= limit:
@@ -157,6 +180,7 @@ class TaskInstance:
     timing_descriptor: tuple | None = None
     checkpoints: list = field(default_factory=list)
     task_family: str | None = None
+    pagination_block: dict = field(default_factory=dict)
     diagnostic_events: list = field(default_factory=list)  # Never included in model prompts.
     metrics: dict = field(default_factory=dict)
 
@@ -859,6 +883,7 @@ class TaskEngine:
                 task.answer = candidate if candidate["hash"] not in {s["hash"] for s in task.submitted} else None
             task.events.append({"kind": "llm_consumed", "round": world.round, "nonce": pending["context"]["nonce"]})
         except (ValueError, TypeError, KeyError) as exc:
+            record_pagination_block(task,str(exc),world.round)
             task.events.append({"kind": "invalid_llm", "round": world.round, "reason": str(exc)[:200],
                                 "expected":fingerprint(pending["context"]["nonce"])[:16],
                                 "received":data.get("request_id") if isinstance(locals().get("data"), dict) else None,
@@ -1017,6 +1042,7 @@ class TaskEngine:
                         from .task_checkpoints import remember_complete
                         remember_complete(task,task.answer['spec'])
                 except (ValueError, KeyError, TypeError) as exc:
+                    record_pagination_block(task,str(exc),world.round)
                     task.events.append({'kind':'answer_output_rejected','round':world.round})
                     task.diagnostic_events.append({'kind':'answer_output_rejected','round':world.round,
                         'reason':str(exc),'answer_candidate':{'evidence_refs':[evidence_id],
@@ -1266,6 +1292,14 @@ class TaskEngine:
                 task.command_plan = None
         if stopping and not final_answer_only:
             return  # A failed final execution cannot start another model cycle.
+        block=task.pagination_block
+        if (block.get('count',0)>=3 and block.get('signature')==pagination_progress(task)
+                and not task.answer and not response['executeCmd']):
+            if not block.get('reported'):
+                task.events.append(dict(kind='pagination_no_progress',round=world.round,
+                    count=block['count'],reason=block['reason']))
+                block['reported']=True
+            return  # Three identical coverage failures: no blind fourth model round.
         if task.llm_pending is None and not response["executeCmd"] and task.sandbox_pending is None:
             if self.budget.reserve(active_task=True):
                 context = self._context(task, "choose_next_task_step")

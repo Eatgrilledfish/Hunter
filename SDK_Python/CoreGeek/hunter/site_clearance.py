@@ -30,6 +30,13 @@ def propose(world, clock, rules, guidance, deadline, task_actor=None):
         work_cells={p for p in world.build_interior if distance(p,actor.pos)<=1
                     and p not in world.occupied-{u.pos for u in builders}
                     and any(distance(p,g.pos)<=1 for g in world.weapons)}
+        if getattr(world,'night_roster',None) and getattr(world,'task_side_plan',None):
+            from .defence_duties import stands
+            # Exterior M is not a turret operator. Its wall work must not
+            # evict P from P's own valid interior arrival cell merely because
+            # that cell could operate a gun. Preserve actual builders' duties.
+            work_cells &= {p for builder in builders if builder.id in world.night_defenders
+                           for p in stands(world,builder.id)}
         occupied_stands={p for i,p in guidance.operator_stands.items() if i != actor.id}
         options=[p for p in neighbours(actor.pos) if world.inside(p) and p not in
                  world.occupied|set(reserved)|destinations|occupied_stands

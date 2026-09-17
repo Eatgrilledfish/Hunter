@@ -13,11 +13,12 @@ def gate(world):
 def prepare(world, clock, deadline, state=None):
     world.active_access_gap=None
     world.access_diagnostic={}
-    world.clear_exit_plan=state.get('point') if state else None
+    world.clear_exit_plan=(state.get('candidate') or state.get('point')) if state else None
     plan=getattr(world,'task_side_plan',None)
     if not plan or clock.phases!={'day'} or clock.day<=1:return
     if state is not None and state.get('day')!=clock.day:
-        state.clear();state['day']=clock.day
+        revision=state.get('revision',0)
+        state.clear();state.update(day=clock.day,revision=revision)
     blue,yellow=station_rings(plan['anchor'])
     walls={u.pos:u for u in world.ours.values() if u.alive and u.kind=='wall'}
     gaps=yellow-walls.keys()
@@ -87,10 +88,19 @@ def prepare(world, clock, deadline, state=None):
         preferred=[o for o in options if o[2] not in front] or options
         chosen=next((o for o in preferred if state and o[2]==state.get('point')),None)
         _,needs_remove,point=chosen or min(preferred)
-        if state is not None:state['point']=point
-        if not needs_remove or point!=fixed:world.active_access_gap=point
+        if not needs_remove:
+            if state is not None:
+                if state.get('point')!=point:state['revision']=state.get('revision',0)+1
+                state['point']=point
+                state.pop('candidate',None)
+            world.active_access_gap=point
+        elif state is not None:
+            # A selected removal is only an intent. Keep the committed passage
+            # until a later snapshot proves the candidate physically open.
+            state['candidate']=point
         world.clear_exit_plan=point
-        world.access_diagnostic=dict(gap=point,reused=not needs_remove,
+        world.access_diagnostic=dict(gap=gate(world),candidate=point if needs_remove else None,
+            revision=state.get('revision',0) if state else 0,reused=not needs_remove,
             candidates=[dict(cost=c,remove=r,pos=p) for c,r,p in sorted(options)])
     elif upgraded_fixed:
         world.clear_exit_plan=None

@@ -240,7 +240,8 @@ class ExternalGate:
         wall=next((u for u in world.ours.values() if u.alive and u.kind=='wall' and u.pos==assignment['gate']),None)
         if (wall is not None)==(assignment['kind']=='seal'):
             assignment.setdefault('gate_confirmed_round',world.round)
-            if assignment.get('worker')==self.m:assignment['completed_observed']=True
+            if assignment.get('worker')==self.m or assignment.get('mode')=='ordered':
+                assignment['completed_observed']=True
 
     def _gate_options(self, world, plan, deadline, kind, policy, task_busy=False):
         """At most M direct, W direct and one real P yield; costs are previews."""
@@ -1013,7 +1014,8 @@ class ExternalGate:
                 from copy import deepcopy
                 row=offer['row']
                 if (not self.gate_assignment or self.gate_assignment.get('kind')!=row['kind']
-                        or self.gate_assignment.get('worker')!=row['worker'] or self.gate_assignment.get('completed_observed')):
+                        or self.gate_assignment.get('worker')!=row['worker']
+                        or self.gate_assignment.get('gate')!=row['gate'] or self.gate_assignment.get('completed_observed')):
                     self.gate_assignment=dict(kind=row['kind'],worker=row['worker'],gate=row['gate'],
                         row=deepcopy(row),planned=deepcopy(row['planned']),mode=offer['mode'],
                         started_round=world.round,selected_actions=0,confirmed_actions=0,observed=[],

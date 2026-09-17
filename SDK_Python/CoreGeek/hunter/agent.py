@@ -464,10 +464,24 @@ class Agent:
                 market_excluded,min(deadline,time.monotonic()+.30))
             candidates.extend(draft.filter_failures(market,world.round))
             recovery_targets = draft.recovery.targets(world, self.rules, self.policy)
-            urgent_upgrades = draft.filter_failures(economy.procurement.urgent_gatling_upgrades(
-                world,self.policy,self.rules,task_actor,priority_ids=recovery_targets),world.round)
             from .night_roles import permits
             from .validation import check_action, Verdict
+            adjacent_recovery=draft.recovery.adjacent_night(world,clock,recovery_targets,
+                [c for c in candidates+guidance.candidates if guidance.permit(c)],task_actor)
+            adjacent_recovery=[c for c in draft.filter_failures(adjacent_recovery,world.round)
+                if guidance.permit(c) and permits(world,clock,c)
+                and check_action(world,clock,self.rules,c.actor,c.command,
+                    task_actor=task_actor,task_moves=guidance.task_moves,
+                    allow_task_control=guidance.allow_task_control).verdict==Verdict.VALID]
+            candidates.extend(adjacent_recovery)
+            world.executable_base_rescue_actors={c.actor for c in candidates
+                if c.command.get('action')=='use' and c.command.get('name','').startswith('StationUpgradeVoucher')
+                and guidance.permit(c) and permits(world,clock,c)
+                and check_action(world,clock,self.rules,c.actor,c.command,
+                    task_actor=task_actor,task_moves=guidance.task_moves,
+                    allow_task_control=guidance.allow_task_control).verdict==Verdict.VALID}
+            urgent_upgrades = draft.filter_failures(economy.procurement.urgent_gatling_upgrades(
+                world,self.policy,self.rules,task_actor,priority_ids=recovery_targets),world.round)
             # An exclusive commitment must be executable under this frame's
             # duty rules before it can suppress the checked return incumbent.
             urgent_upgrades = [c for c in urgent_upgrades
@@ -740,6 +754,7 @@ class Agent:
                       "duty_budget":world.duty_budget.diagnostic(),
                       "exterior_evasion":evasion_report,
                       "work_plans":guidance.work_plans,
+                      "permission_rejections":guidance.permission_rejections,
                       "repair":draft.repair.diagnostic,
                       "repair_supply":draft.repair_supply.diagnostic,
                       "exterior_repair":draft.exterior_repair.diagnostic,

@@ -58,9 +58,27 @@ class Diagnostics(logging.Handler):
 
     def _write_compact(self, event, **data):
         record = dict(schema=2, run=self.run_id[:8], round=getattr(self.local,"round",None), event=event, **data)
+        if isinstance(record.get('duty'),dict):
+            duty=record['duty']
+            for section in ('rumour','treasure'):
+                detail=duty.get(section)
+                if isinstance(detail,dict):
+                    duty[section]=llm_trace.fit(detail,350)
+            # Verbose interpretation cannot displace action/repair observations.
+            if len(json.dumps(record,ensure_ascii=False).encode())>1400:
+                for section in ('rumour','treasure','return_recovery','denials'):
+                    detail=duty.get(section)
+                    if not detail:continue
+                    ref=llm_trace.digest(json.dumps(detail,sort_keys=True,ensure_ascii=False))
+                    self._write_compact('duty_detail',ref=ref,section=section,
+                        detail=llm_trace.fit(detail,850))
+                    duty[section]={'ref':ref,'stage':detail.get('stage',detail.get('status'))}
+        if isinstance(record.get('work'),dict):
+            record['work']={i:{k:v for k,v in row.items() if v is not None}
+                if isinstance(row,dict) else row for i,row in record['work'].items()}
         # Valid single-line JSON, never a byte slice of a serialized record.
         # Essential issue details take precedence over optional current context.
-        for optional in ("reasons", "channels", "work", "commands", "units", "task", "defence", "docs", "root_entries", "entries"):
+        for optional in ("reasons", "channels", "units", "task", "defence", "docs", "root_entries", "entries"):
             if len(json.dumps(record,ensure_ascii=False,separators=(",", ":")).encode()) <= 1400:
                 break
             if optional=='task' and isinstance(record.get('task'),str):continue
@@ -156,6 +174,8 @@ class Diagnostics(logging.Handler):
         commands = obj(response.get('roleCommandMap'))
         point = lambda p: list(p) if isinstance(p, (list, tuple)) and len(p) == 2 else None
         duty = {}
+        rejected=obj(decision.get('permission_rejections'))
+        if rejected:duty['denials']={i:rows[:1] for i,rows in list(rejected.items())[:3]}
         rumour = obj(decision.get('rumour_llm'))
         recovery = obj(decision.get('return_recovery'))
         if recovery.get('stage') not in (None,'inactive'):
@@ -583,10 +603,20 @@ class Diagnostics(logging.Handler):
                 api=next((e for e in record.get('data',{}).get('runtime_events',[])
                           if e.get('kind')=='json_shape' and (e.get('temporal_value_counts') or e.get('pagination_coverage'))),None)
                 if api:
+                    for dataset in api.get('pagination_datasets',[])[:8]:
+                        # One dataset per bounded record: large temporal samples
+                        # cannot evict the identity of the blocked population.
+                        self._write_compact('task_dataset',task=task['id'],evidence=eid,
+                            dataset_id=dataset.get('dataset_id'),complete=dataset.get('complete'),
+                            total=dataset.get('total_count'),covered=dataset.get('covered_records'),
+                            missing=dataset.get('missing_ranges'),partial=dataset.get('missing_ranges_partial'))
                     self._write_compact('task_api',**llm_trace.fit(dict(task=task['id'],left=task.get('left'),
                         evidence=eid,fields=api.get('record_fields'),pagination=api.get('pagination'),
                         observed=api.get('records_observed'),responses=api.get('responses_observed'),
                         coverage=api.get('pagination_coverage'),
+                        datasets=[{k:d.get(k) for k in ('dataset_id','path','query_fields','complete','total_count',
+                            'covered_records','missing_ranges','missing_ranges_partial') if k in d}
+                            for d in api.get('pagination_datasets',[])],
                         temporal=api.get('temporal_value_counts'),partial=True)))
                 state["task_tools"].add(tool_key)
                 if len(state["task_tools"]) > 32:state["task_tools"]={tool_key}

@@ -42,8 +42,12 @@ def propose(world, clock, deadline, trapped=False):
         # observation is immutable for this call; cache only within this turn
         # so the real deadline is spent exploring, not recomputing exposure.
         # Keep the stationary scenario too; moving enemies may change target.
-        return 2*sum(r.attack_power for r in known if min(distance(q,r.pos),
-                     distance(q,projected(r,depth))) <= r.attack_range)
+        # A measured displacement need not continue straight. Evaluate the
+        # same bounded turning scenario used below across the short route,
+        # not merely after a straight-line route has already won. Depth zero
+        # remains observed range; this is a scenario, not a speed/cadence rule.
+        return 2*sum(r.attack_power for r in known if distance(q,r.pos)
+                     <= r.attack_range+max(map(abs,motion.get(r.id,(0,0))))*depth)
 
     current = damage(actor.pos)
     closing = [r for r in known if motion.get(r.id, (0,0)) != (0,0)
@@ -117,7 +121,10 @@ def propose(world, clock, deadline, trapped=False):
         score = total+sum(damage(path[-1],t) for t in range(len(path)+1,4))
         if score < stay or (not current and trapped and end == 0):
             ranked.append((score,damage(path[0],1),exits,len(path),path,total))
-    if not ranked or trapped:
+    if not ranked or trapped or all(damage(row[4][-1])>0 for row in ranked):
+        # A locally improving prefix can still end in the observed firing
+        # strip. Search the existing complete-exit fallback before accepting
+        # that prefix; retain it if the bounded search finds no better exit.
         plan = getattr(world,'task_side_plan',None)
         goals = ({q for q in neighbours(plan['gate']) if world.inside(q) and q not in blocked
                   and not damage(q) and not uncertain(q)} if trapped and plan else None)
@@ -186,6 +193,6 @@ def propose(world, clock, deadline, trapped=False):
                   decision='move',hold_scenario=stay,move_scenario=score,
                   turning_exposure_scenario=turning(chosen),
                   staffed_distance=min((distance(g.pos,route[-1]) for g in staffed),default=None),
-                  turning_basis='observed displacement; tie-break only, not a movement rule')
+                  turning_basis='observed displacement short-route scenario; not a movement rule')
     return [Candidate(actor.id,dict(action='move',targetPos=[pos_json(point)]),1200,
                       'exterior survival: improving escape before personal treatment')],report
