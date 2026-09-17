@@ -136,7 +136,21 @@ def priority_units(world):
     return [u for u in world.stations if u.level != 3]
 
 
-def investment_fund(world):
+def reconstruction_pending(world):
+    observed={u.pos:u for u in world.ours.values() if u.alive and u.kind=='wall'}
+    sites=getattr(world,'wall_service',{})
+    return any(p not in observed or sites.get(p,{}).get('reconstruction') and observed[p].level!=3
+               for p in upgrade_targets(world))
+
+
+def minimum_stock(world, actor, name):
+    if name=='Medicine':return 1
+    if name=='WallFixer':
+        return 2 if actor.id==getattr(getattr(world,'night_roster',None),'w',None) else 1
+    return 0
+
+
+def investment_fund(world, *, preserve_reconstruction=True):
     """Observed next-priority quote, without spending hypothetical sale income."""
     if not getattr(getattr(world, 'strategy_policy', None), 'upgrade_commitment_enabled', True):
         return 0, None
@@ -151,7 +165,9 @@ def investment_fund(world):
     # Funding continues into the wall stage when the weapon stage is prepaid.
     # A destroyed position still owes its reconstruction upgrade; it must not
     # become optional cash merely because there is no current building ID.
-    if not getattr(world,'critical_base_ids',()):
+    healable_emergency = any(u.id in getattr(world,'critical_base_ids',())
+                             and u.level in (1,2) for u in world.stations)
+    if not healable_emergency:
         ids = {u.id for u in units}
         units += [u for u in world.ours.values() if u.alive and u.kind=='wall'
                   and u.pos in upgrade_targets(world) and u.level in (1,2) and u.id not in ids]
@@ -166,9 +182,10 @@ def investment_fund(world):
             price = world.shop.get(name)
             if price is None or price <= 0:
                 return max(0, world.gold or 0), None
-            quotes.append((upgrade_rank(world,unit),level,price,name))
+            rebuilding=(unit.kind=='wall' and getattr(world,'wall_service',{}).get(unit.pos,{}).get('reconstruction',False))
+            quotes.append((upgrade_rank(world,unit),level,price,name,rebuilding))
     observed = {u.pos for u in world.ours.values() if u.alive and u.kind=='wall'}
-    if not getattr(world,'critical_base_ids',()):
+    if not healable_emergency:
         for point in sorted(upgrade_targets(world)-observed):
             for level in (1,2):
                 name = f'WallUpgradeVoucher{level}'
@@ -177,11 +194,15 @@ def investment_fund(world):
                     continue
                 price = world.shop.get(name)
                 if price is None or price<=0:return max(0,world.gold or 0),None
-                quotes.append((2,level,price,name))
+                quotes.append((2,level,price,name,True))
     if not quotes:
         return 0, None
-    _, _, price, name = min(quotes)
-    return price, name
+    _, _, price, name, _ = min(quotes)
+    if preserve_reconstruction and getattr(world,'critical_base_ids',()) and not healable_emergency:
+        return sum(q[2] for q in quotes),name
+    # A normal base reserves the complete damaged reconstruction chain, not
+    # every routine low-level wall as well. Keep room for personal repair stock.
+    return max(price,sum(q[2] for q in quotes if q[4])) if preserve_reconstruction else price, name
 
 
 def pressure_ready(world):
@@ -225,9 +246,11 @@ def pressure_ready(world):
 def purchase_units(world):
     """Allow next-stage checkout once weapon purchases are fully funded."""
     current = priority_units(world)
-    if (getattr(world,'critical_base_ids',()) or
-            any(u.id in getattr(world,'base_restore_ids',()) for u in current)):
+    if any(u.kind == 'station' for u in current):
         return current
+    if getattr(world,'critical_base_ids',()):
+        from .wall_service import pending_targets
+        return current + pending_targets(world)
     held = Counter()
     for actor in world.movers:
         if actor.backpack is not None:held.update(actor.inventory)
@@ -261,7 +284,8 @@ def purchase_permitted(world, rules, candidate):
             return True
     if name=='WallFixer' and getattr(world,'critical_base_ids',()):return True
     if name.endswith('SummonOrder') and not pressure_ready(world):return False
-    reserve,item=investment_fund(world)
+    minimum = max(0,minimum_stock(world,actor,name)-actor.inventory[name])
+    reserve,item=investment_fund(world,preserve_reconstruction=command.get('num',1)>minimum)
     candidate.gold_reserve=max(candidate.gold_reserve,reserve)
     candidate.gold_reserve_item=item
     price=world.shop.get(name)

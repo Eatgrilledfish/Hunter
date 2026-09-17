@@ -5,6 +5,7 @@ motion is extrapolated only as a labelled scenario, never a game speed rule.
 """
 import time
 import heapq
+from functools import lru_cache
 from .arbitration import Candidate
 from .navigation import neighbours
 from .protocol import distance, pos_json
@@ -31,10 +32,15 @@ def propose(world, clock, deadline, trapped=False):
         dx, dy = motion.get(r.id, (0, 0))
         return r.pos[0]+dx*depth, r.pos[1]+dy*depth
 
+    @lru_cache(maxsize=None)
     def uncertain(q):
         return any(r.attack_range is not None and distance(q,r.pos)<=r.attack_range for r in unknown)
 
+    @lru_cache(maxsize=None)
     def damage(q, depth=0):
+        # Search revisits the same cell/horizon across many routes. The
+        # observation is immutable for this call; cache only within this turn
+        # so the real deadline is spent exploring, not recomputing exposure.
         # Keep the stationary scenario too; moving enemies may change target.
         return 2*sum(r.attack_power for r in known if min(distance(q,r.pos),
                      distance(q,projected(r,depth))) <= r.attack_range)
@@ -54,7 +60,7 @@ def propose(world, clock, deadline, trapped=False):
     injury = getattr(world,'recent_mover_injuries',{}).get(actor.id)
     edge = [r for r in known if r.attack_power > 0
             and distance(actor.pos,r.pos) == r.attack_range+1]
-    if ((hit > 0 or injury) and actor.health <= 110 and not actor.inventory['Medicine']
+    if ((hit > 0 or injury) and not actor.inventory['Medicine']
             and not current and not unknown and edge):
         choices=[]
         for q in neighbours(actor.pos):
@@ -117,12 +123,18 @@ def propose(world, clock, deadline, trapped=False):
                   and not damage(q) and not uncertain(q)} if trapped and plan else None)
         queue = [(0,0,actor.pos,())]
         best = {actor.pos:(0,0)}
+        escapes = []
+        escape_loss = None
         while queue and time.monotonic() < deadline:
             loss,steps,point,path = heapq.heappop(queue)
             if best.get(point) != (loss,steps):continue
+            if escape_loss is not None and loss > escape_loss:break
             if path and damage(point)==0 and (goals is None or point in goals):
-                ranked = [(loss,damage(path[0],1),0,len(path),path,loss)]
-                break
+                # Equal-loss exits must reach the common support/tie-break
+                # ranking. Heap coordinate order is not a survival policy.
+                escape_loss = loss
+                escapes.append((loss,damage(path[0],1),0,len(path),path,loss))
+                continue
             for q in neighbours(point):
                 if not world.inside(q) or q in blocked or uncertain(q) or q in avoided.get(point,()):continue
                 if not path and damage(q,1)/2 >= actor.health:continue
@@ -130,6 +142,7 @@ def propose(world, clock, deadline, trapped=False):
                 if cost < best.get(q,(float('inf'),0)):
                     best[q]=cost
                     heapq.heappush(queue,(*cost,q,path+(q,)))
+        if escapes:ranked = escapes
         if not ranked:
             if actor.inventory['Medicine'] and actor.health < 220 and damage(actor.pos,1) < 220:
                 return [Candidate(actor.id,dict(action='use',name='Medicine'),1200,

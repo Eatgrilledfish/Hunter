@@ -87,7 +87,9 @@ class ExternalGate:
     miner_exit_clearer: str | None = None
     pioneer_exit_clearance_day: int | None = None
     pioneer_return_clearance_day: int | None = None
+    pioneer_return_clearance_position: tuple | None = None
     worker_return_clearance_day: int | None = None
+    worker_return_clearance_position: tuple | None = None
     gate_assignment: dict = field(default_factory=dict)
     gate_offer: dict = field(default_factory=dict)
     gate_before: dict = field(default_factory=dict)

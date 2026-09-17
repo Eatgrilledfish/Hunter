@@ -252,10 +252,18 @@ class NightClear:
         shops=interaction_cells(view,world.zones.get('weaponShop',()),worker.pos)&reach.keys()&home.keys()
         held=[r for r in data['held'] if not r.get('pending') and r['unit'] is not None]
         choices=[]
+        fields={}
+        before_blocked=(view.occupied|view.navigation_avoided.get(worker.pos,set()))-{worker.pos}
         for shop in sorted(shops):
             onward=distance_field(view,{shop},worker.pos,deadline)
+            if time.monotonic()>=deadline:return None
+            # The sale route and post-purchase tour often search the same
+            # graph from this shop. Reuse only a complete field with exactly
+            # the same obstacles, including actor-specific avoidance.
+            after_blocked=((view.occupied-{worker.pos})|view.navigation_avoided.get(shop,set()))-{shop}
+            if before_blocked==after_blocked:fields[shop]=onward
             for entry in needs:
-                use=supply_basket.use_tour(view,worker,held+[entry],shop,home,deadline)
+                use=supply_basket.use_tour(view,worker,held+[entry],shop,home,deadline,fields)
                 if use is None:continue
                 for vendor in vendors&onward.keys():
                     required=reach[vendor]+len(stock)+onward[vendor]+1+use+policy.return_buffer

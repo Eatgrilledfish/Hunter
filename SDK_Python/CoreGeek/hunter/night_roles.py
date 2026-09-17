@@ -88,16 +88,18 @@ def permits(world, clock, candidate):
     if not market_permits(world, candidate):
         return False
     command = candidate.command
+    from .day_access import gate as access_gate
+    current_gate = access_gate(world)
     if defence_duties.enabled(world) and command.get('action')=='remove':
         from .protocol import pos_json
-        if command.get('targetPos')==[pos_json(world.task_side_plan['gate'])]:
+        if command.get('targetPos')==[pos_json(current_gate)]:
             return command in getattr(world,'ordered_gate_actions',{}).get(candidate.actor,())
     if defence_duties.enabled(world) and command.get('action')=='build' and command.get('name')=='wall':
         from .protocol import pos_json
         from .rules import station_rings
         _, yellow = station_rings(world.task_side_plan['anchor'])
         if (set(world.wall_targets or ()) == yellow
-                and command.get('targetPos')==[pos_json(world.task_side_plan['gate'])]):
+                and command.get('targetPos')==[pos_json(current_gate)]):
             return command in getattr(world,'ordered_gate_actions',{}).get(candidate.actor,())
     treasure = getattr(world,'treasure_actions',{})
     if candidate.actor in treasure and not (command.get('action')=='use' and command.get('name') in {'Medicine','Bomb','DizzyWeapon'}):

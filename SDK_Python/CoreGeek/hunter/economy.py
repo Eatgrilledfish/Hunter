@@ -10,7 +10,7 @@ from . import procurement
 from .layout import LayoutGuard
 from .weapon_portfolio import WeaponPortfolio
 from . import battery
-from .wall_policy import planned_gate
+from .day_access import gate as planned_gate
 from .night_roles import defender_ids, economic_endpoints
 
 

@@ -31,6 +31,10 @@ class SunsetMarket:
     upgrade_owner: str | None = None
     checkout_intents: dict = field(default_factory=dict)
     checkout_targets: dict = field(default_factory=dict)
+    checkout_context: tuple = ()
+    checkout_deliveries: set = field(default_factory=set)
+    checkout_stage: tuple = ()
+    checkout_primary: str | None = None
     caretaker_day: CaretakerDay = field(default_factory=CaretakerDay)
 
     def prepare(self, world, clock, rules, policy, guidance, jobs, excluded, deadline):
@@ -38,6 +42,7 @@ class SunsetMarket:
         world.pioneer_trade_stands = guidance.operator_stands
         world.sunset_actions = {}
         world.sunset_buyer = None
+        world.checkout_cash_reserve = 0
         self.diagnostic = {'stage':'inactive'}
         for identity, order in list(self.pending.items()):
             actor = world.ours.get(identity)
@@ -49,8 +54,12 @@ class SunsetMarket:
                 intent=self.checkout_intents[identity]
                 name=order['name']
                 intent[name]=max(0,intent.get(name,0)-(actor.inventory[name]-order['prior']))
-                if not any(intent.values()):self.checkout_intents.pop(identity)
-            if failed or arrived:
+                if not any(intent.values()):
+                    self.checkout_intents.pop(identity)
+                    self.checkout_deliveries.add(identity)
+            absent = (world.round > order['round']+1 and actor and actor.backpack is not None
+                      and actor.inventory[order['name']]<=order['prior'])
+            if failed or arrived or absent:
                 self.pending.pop(identity)
         if self.day != clock.day:
             self.day = clock.day; self.started = False; self.settled.clear()
@@ -58,10 +67,43 @@ class SunsetMarket:
             self.upgrade_owner=None
             self.checkout_intents.clear()
             self.checkout_targets.clear()
+            self.checkout_deliveries.clear()
+        from .day_access import gate as access_gate
+        context=(world.gold,access_gate(world),
+            tuple(sorted((u.id,u.pos) for u in world.ours.values() if u.alive and u.kind in WEAPONS|{'wall','station'})),
+            tuple(sorted((u.id,tuple(sorted((k,n) for k,n in u.inventory.items()
+                if k in {'Medicine','WallFixer','DizzyWeapon','Bomb'})))
+                for u in world.movers if u.backpack is not None)))
+        if self.checkout_context and context!=self.checkout_context:
+            for identity in list(self.checkout_intents):
+                actor=world.ours.get(identity)
+                # A paid upgrade chain finishes its existing checkout and
+                # delivery before enlarging the basket. Ore collection and
+                # its own purchase receipts are not new unfunded demand.
+                if actor and any(n and 'UpgradeVoucher' in k for k,n in actor.inventory.items()):continue
+                if context[1:]!=self.checkout_context[1:] or (world.gold or 0)>(self.checkout_context[0] or 0):
+                    self.checkout_intents.pop(identity,None)
+        self.checkout_context=context
+        from .wall_policy import purchase_units
+        stage=tuple(sorted((u.kind,u.pos) for u in purchase_units(world)))
+        if self.checkout_stage and stage!=self.checkout_stage:
+            # A confirmed weapon receipt can unlock the wall stage while the
+            # carrier is still at the counter. Requote there with the same
+            # route/deadline checks; never turn an underway paid delivery back.
+            for actor in world.movers:
+                if world.near_zone(actor.pos,'weaponShop'):
+                    self.checkout_intents.pop(actor.id,None)
+                    self.checkout_deliveries.discard(actor.id)
+        self.checkout_stage=stage
         if getattr(world,'critical_base_ids',()):
             self.checkout_intents.clear()  # New survival priority overrides routine purchases.
             self.checkout_targets.clear()
-        world.checkout_order_limits=self.checkout_intents
+        world.checkout_order_limits=dict(self.checkout_intents)
+        self.checkout_deliveries={i for i in self.checkout_deliveries if i in world.ours
+            and any(n and 'UpgradeVoucher' in k for k,n in world.ours[i].inventory.items())}
+        for actor in world.movers:
+            if actor.id not in self.checkout_intents and actor.id in self.checkout_deliveries:
+                world.checkout_order_limits[actor.id]={}
         self.checkout_targets={i:[(uid,level) for uid,level in targets
             if uid in world.ours and world.ours[uid].alive
             and world.ours[uid].level is not None and world.ours[uid].level<=level]
@@ -95,13 +137,24 @@ class SunsetMarket:
                 at_shop = [i for i in reachable if world.near_zone(world.ours[i].pos,'weaponShop')]
                 if (owner is not None and owner not in at_shop and at_shop
                         and owner not in self.pending
-                        and not any(n and 'UpgradeVoucher' in name for name,n in world.ours[owner].inventory.items())):
+                        and (owner in self.checkout_deliveries or not any(n and 'UpgradeVoucher' in name
+                            for name,n in world.ours[owner].inventory.items()))):
                     # An unpaid traveller cannot reserve the counter while a
-                    # free teammate is already there. Actual paid deliveries
-                    # and unresolved purchase receipts retain their owner.
+                    # free teammate is already there. A completed checkout's
+                    # vouchers keep their personal targets while new unpaid
+                    # investment passes to the counter. Pending receipts wait.
                     owner=min(at_shop)
                 if owner is None:
                     owner = min(at_shop) if at_shop else roster.p if roster.p in reachable else roster.w
+                if owner != self.checkout_primary and owner in world.ours:
+                    buyer = world.ours[owner]
+                    if (owner not in self.pending and not any(n and 'UpgradeVoucher' in name
+                            for name,n in buyer.inventory.items())):
+                        # A personal-stock quote made as the secondary buyer
+                        # must not cap the newly assigned investment checkout.
+                        self.checkout_intents.pop(owner,None)
+                        world.checkout_order_limits.pop(owner,None)
+                self.checkout_primary = owner
                 world.upgrade_checkout_actor = owner
                 emergency = [u for u in world.stations if u.id in getattr(world,'critical_base_ids',()) and u.level in (1,2)]
                 worker = world.ours.get(roster.w)
@@ -422,6 +475,19 @@ class SunsetMarket:
         return None
 
     def finalize(self, world, response):
+        courier=self.diagnostic.get('buyer')
+        issued=response['roleCommandMap'].get(courier,{})
+        actor=world.ours.get(courier)
+        if (self.diagnostic.get('stage') in ('upgrade_deliver','upgrade_return')
+                and not self.diagnostic.get('basket') and courier not in self.pending
+                and issued.get('action') in ('move','use')
+                and issued in getattr(world,'sunset_actions',{}).get(courier,())
+                and actor and any(n and 'UpgradeVoucher' in name for name,n in actor.inventory.items())):
+            # A fitted basket may shrink after its first purchase. Dispatching
+            # paid delivery completes checkout even if the old ceiling still
+            # contains unbought entries; personal target bindings remain.
+            self.checkout_intents.pop(courier,None)
+            self.checkout_deliveries.add(courier)
         for actor,command in response['roleCommandMap'].items():
             if (command.get('action')=='buy' and 'UpgradeVoucher' in command.get('name','')
                     and actor in getattr(world,'quoted_checkout_targets',{})):

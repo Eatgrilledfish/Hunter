@@ -19,6 +19,9 @@ def prepare(market, world, clock, rules, policy, guidance, jobs, excluded, deadl
     eligible = [world.ours[i] for i in (roster.w,roster.p) if i in world.ours
                 and i not in excluded and world.ours[i].alive and world.ours[i].backpack is not None
                 and i not in guidance.recovery_actions and i not in getattr(world,'return_recovery_actions',{})]
+    market.diagnostic['quotes'] = {}
+    market.diagnostic['excluded'] = sorted(set(excluded)&{roster.w,roster.p})
+    if not eligible:market.diagnostic['blocked']='no_eligible_guard'
     proposals = []
     for actor in eligible:
         if time.monotonic() >= deadline:break
@@ -47,6 +50,9 @@ def prepare(market, world, clock, rules, policy, guidance, jobs, excluded, deadl
             trip=dict(held=[r for r in supply_basket.requirements(world,rules,policy)
                             if not r.get('pending') and r['level']==r['unit'].level
                             and actor.inventory[r['name']]],orders={},required=None,fits=False)
+        market.diagnostic['quotes'][actor.id]=dict(cash=world.gold,orders=dict(trip['orders']),
+            required=trip['required'],left=clock.until_night,fits=trip['fits'],
+            reserve=trip.get('reserve'),reason='quoted' if trip['fits'] else 'route_or_deadline')
         choices,stage,item,num = [],'upgrade_return',None,0
         if stock and trip['fits'] and not trip.get('delivery_only'):
             item=max(stock,key=lambda k:stock[k]*world.vendor[k]);num=stock[item]
@@ -89,8 +95,13 @@ def prepare(market, world, clock, rules, policy, guidance, jobs, excluded, deadl
                 choices=DaySchedule.moves(actor,home,'complete shopping return before night')
         preview=copy(guidance)
         preview.return_routes={i:r for i,r in guidance.return_routes.items() if i!=actor.id}
+        proposed=bool(choices)
         choices=[c for c in choices if preview.permit(c)]
-        if not choices:continue
+        if not choices:
+            reason='guidance_denied' if proposed else 'no_executable_order_or_delivery'
+            market.diagnostic['quotes'][actor.id]['reason']=reason
+            market.diagnostic['blocked']=reason
+            continue
         for c in choices:c.utility=240
         priority=(actor.id!=market.upgrade_owner if market.upgrade_owner else False,
                   not world.near_zone(actor.pos,'weaponShop'), bool(jobs.get(actor.id)),
@@ -105,6 +116,12 @@ def prepare(market, world, clock, rules, policy, guidance, jobs, excluded, deadl
     # the other guard's independent building, repairing or return movement.
     if world.sunset_buyer is None or choices[0].command['action']=='buy':
         world.sunset_buyer=actor.id
+    if stage == 'upgrade_procure':
+        # Only the selected, executable, return-feasible basket reserves cash.
+        # Ore-sale forecasts and stale/unconfirmed orders are not commitments.
+        cost = sum(world.shop[name]*count for name,count in trip['orders'].items())
+        if cost + trip['reserve'] <= (world.gold or 0):
+            world.checkout_cash_reserve = cost + trip['reserve']
     market.diagnostic.update(stage=stage,buyer=actor.id,item=item,num=num,
         basket=dict(trip['orders']),required=trip['required'],blocked=None,
         worker_busy=bool(jobs.get(roster.w)))

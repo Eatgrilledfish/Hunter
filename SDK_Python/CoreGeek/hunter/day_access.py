@@ -22,6 +22,11 @@ def prepare(world, clock, deadline, state=None):
     walls={u.pos:u for u in world.ours.values() if u.alive and u.kind=='wall'}
     gaps=yellow-walls.keys()
     fixed=plan['gate']
+    # Retain today's passage identity when a bounded comparison is unfinished.
+    # This grants no build/remove permission: each consumer still proves its route.
+    incumbent=state.get('point') if state else None
+    if incumbent in yellow and (incumbent in gaps or walls.get(incumbent) and walls[incumbent].level==1):
+        world.active_access_gap=incumbent
     from .wall_policy import monster_face
     backup_doors={p for p,u in walls.items() if p in yellow and u.level==1
                   and p not in monster_face(world,plan['anchor'])}

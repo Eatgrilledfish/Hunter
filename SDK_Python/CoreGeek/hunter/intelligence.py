@@ -9,6 +9,7 @@ from .arbitration import Candidate
 from .economy import movement
 from .navigation import route, distance_field, interaction_cells, neighbours
 from .protocol import obj, integer, position, pos_json, fingerprint, strict_json
+from .tasks import llm_service_failure
 
 
 # Taskbook 4.6.3 descriptions. The live shop controls availability and price.
@@ -49,6 +50,8 @@ class Intelligence:
     execution: dict = field(default_factory=dict)
     offered_plan: dict = field(default_factory=dict)
     execution_blockers: dict = field(default_factory=dict)
+    invalid_candidates: list = field(default_factory=list)
+    validation_reviews: dict = field(default_factory=dict)
 
     @staticmethod
     def news_id(entry):
@@ -120,14 +123,21 @@ class Intelligence:
                     self.reviewed_sources.update(self.pending.get('review_sources',()))
                     if self.pending.get('synthesis_corpus'):
                         self.synthesized_sources.add(self.pending['synthesis_corpus'])
+                    reviewed=set(self.pending.get('validation_ids',()))
+                    self.invalid_candidates=[v for v in self.invalid_candidates if v['id'] not in reviewed]
                     self.pending = None
-                    self.llm_status = "accepted"
+                    self.llm_status = ('accepted_without_plan' if self.llm_diagnostic.get('rejected')
+                                       and not self.llm_diagnostic.get('progress',{}).get('new_hypotheses') else 'accepted')
                 except (ValueError, TypeError, KeyError) as exc:
                     self.llm_status = "invalid_response"
                     self.llm_diagnostic['reason']=str(exc)[:100]
                     self.pending['rejection']=self.llm_diagnostic.copy()
                     if world.round > self.pending["round"]+2:
                         self.pending = None
+            elif not raw and llm_service_failure(world,self.pending):
+                self.llm_status='service_failure'
+                self.llm_diagnostic['reason']='platform LLM request failed; reservation remains consumed'
+                self.pending=None
             elif world.round > self.pending["round"]+2:
                 self.llm_status = 'oversized_response' if isinstance(raw,str) and len(raw)>32768 else 'missing_response'
                 if self.pending.get('rejection'):
@@ -148,6 +158,21 @@ class Intelligence:
         prior_clues={c['id'] for c in self.clues}
         prior_hypotheses={h['id'] for h in self.treasures}
         rejected=Counter()
+        expected={
+            'unsupported_source':'support[].source must be a supplied source ID; quote must be an exact substring of that source',
+            'position_or_items':'position is an in-bounds integer {x,y}; items is a nonempty exact quantity list, at most 40',
+            'unknown_shop_item':'items must use exact IDs from the current shop and offering descriptions',
+            'opening_window':'opening_round is an absolute integer round; optional closing_round >= opening_round, horizon <=1300',
+            'unresolved_conditions':'confidence must be high and all_conditions_resolved true, only when supported by original clues'}
+        def reject(candidate,reason):
+            rejected[reason]+=1
+            if not isinstance(candidate,dict):return
+            encoded=json.dumps(candidate,ensure_ascii=False)
+            if len(encoded)>6000:return
+            record=dict(id=fingerprint(candidate),candidate=candidate,reason=reason,expected=expected[reason],round=world.round)
+            self.invalid_candidates=[v for v in self.invalid_candidates if v['id']!=record['id']]
+            self.invalid_candidates=(self.invalid_candidates+[record])[-4:]
+
         unresolved=data.get('unresolved',[])
         if isinstance(unresolved,list):
             self.unresolved=[s[:200] for s in unresolved[:6] if isinstance(s,str)]
@@ -207,7 +232,7 @@ class Intelligence:
                 self.events.append(record)
         for candidate in data.get("treasures", [])[:8]:
             if not isinstance(candidate, dict) or support(candidate) is None:
-                rejected['unsupported_source']+=1
+                reject(candidate,'unsupported_source')
                 continue
             pos, items = position(candidate.get("position")), candidate.get("items")
             opening = candidate.get("opening_round")
@@ -219,16 +244,16 @@ class Intelligence:
             if not expiry_known:
                 closing = 1300
             if pos is None or not world.inside(pos) or not isinstance(items, list) or not items or len(items) > 40:
-                rejected['position_or_items']+=1
+                reject(candidate,'position_or_items')
                 continue
             if any(not isinstance(x, str) or x not in world.shop for x in items):
-                rejected['unknown_shop_item']+=1
+                reject(candidate,'unknown_shop_item')
                 continue
             if not integer(opening, 0) or not integer(closing, opening) or closing-opening > 1300:
-                rejected['opening_window']+=1
+                reject(candidate,'opening_window')
                 continue
             if candidate.get("confidence") != "high" or candidate.get("all_conditions_resolved") is not True:
-                rejected['unresolved_conditions']+=1
+                reject(candidate,'unresolved_conditions')
                 continue
             record = {"position": pos, "items": sorted(items), "opening_round": opening, "closing_round": closing,
                       "support": support(candidate), "basis": "model_hypothesis_not_official", "confidence": "high"}
@@ -238,6 +263,7 @@ class Intelligence:
             if (not any(t["id"] == record["id"] for t in self.treasures) and
                     not any(r['hypothesis_id'] == record['id'] for r in self.rejections)):
                 self.treasures.append(record)
+                self.invalid_candidates=[]
         self.events, self.treasures = self.events[-64:], self.treasures[-16:]
         self.llm_diagnostic.update(hypotheses=len(self.treasures),proposed=len(data.get('treasures',[])),
                                    rejected=dict(rejected),unresolved=self.unresolved,
@@ -496,7 +522,10 @@ class Intelligence:
                     and self.review_attempts.get(k,0)<2 and not folk[k]['truncated_locally']}
         review=bool(reviewable and not fresh and not feedback and not synthesize
                     and self.treasure_complete and not executable and not awaiting_result)
-        if (not fresh and not feedback and not synthesize and not review) or not session.tasks.budget.reserve():
+        repair_validation=bool(self.invalid_candidates and not fresh and not executable
+            and not awaiting_result and self.validation_reviews.get(corpus,0)<1)
+        if repair_validation:synthesize=review=False
+        if (not fresh and not feedback and not synthesize and not review and not repair_validation) or not session.tasks.budget.reserve():
             return
         constraints,constraint_terms=self.constraint_state(retained)
         missing=[k for k,v in constraints.items() if v['status'] in {'unread','unresolved'}]
@@ -532,7 +561,7 @@ class Intelligence:
             if used+len(entry["text"]) <= 16000 and not entry["truncated_locally"]:
                 sources[key] = entry
                 used += len(entry["text"])
-        if not sources or (not set(sources).intersection(fresh) and not feedback and not synthesize and not review):
+        if not sources or (not set(sources).intersection(fresh) and not feedback and not synthesize and not review and not repair_validation):
             # Reserve was only tentative; no response was issued.
             session.tasks.budget.cancel_unissued()
             return
@@ -550,6 +579,7 @@ class Intelligence:
             "仍缺信息时返回 unresolved:[具体缺失项]，不要把未知当作失败或把旧日相对日期自动平移。"
             "review_unresolved是原文复核：上次已读不等于已解。逐项重新核对地点计算、祭品映射及数量、时间、额外条件，"
             "constraint_state按字段给出已验证引文位置及待解项；evidence_collected只表示有线索，不代表结论正确。逐项说明推导并保留否定约束。"
+            "repair_validation是本地字段校验失败后的补正：按validation_feedback逐项修正被拒字段，保留其他有依据的条件；来源ID、逐字引文、商品ID和绝对回合必须来自提供的数据，不得放松校验。"
             "优先回答unresolved；对原文其实已给出的条件给出推导和逐字引文，不要原样重复‘缺失’。"
             "确实无法唯一推出时明确指出缺哪条依据并保留矛盾，不得为了完成任务猜测。"
             "昼70回合、夜60回合；已知 clock_origin 时，第d天白天起点为 clock_origin+(d-1)*130。按原文条件转换时间窗口。"
@@ -577,10 +607,11 @@ class Intelligence:
                                                           ((world.side,world.ours),("enemy",world.enemies))
                                                           for u in units.values() if u.kind=='station' and u.alive]},
                                                   "offering_descriptions": {k:v for k,v in OFFERING_DESCRIPTIONS.items() if k in world.shop},
-                                                  "analysis_stage": "reassess" if feedback else "synthesize" if synthesize else "review_unresolved" if review else "read_clues",
+                                                  "analysis_stage": "repair_validation" if repair_validation else "reassess" if feedback else "synthesize" if synthesize else "review_unresolved" if review else "read_clues",
                                                   "review_source_ids":sorted(set(sources)&reviewable) if review else [],
                                                   "known_clues": known_clues,
                                                   "execution_blockers": self.execution_blockers,
+                                                  "validation_feedback":self.invalid_candidates if repair_validation else [],
                                                   "constraint_state": constraints,
                                                   "unresolved":self.unresolved,
                                                   "treasure_attempt_feedback": feedback,
@@ -595,8 +626,11 @@ class Intelligence:
                 if ref['source'] in retained:citation_sources[ref['source']]=retained[ref['source']]
         self.pending = {"round": world.round, "context": context, "sources": sources,"citation_sources":citation_sources,
                         'synthesis_corpus':corpus if synthesize else None,
-                        'analysis_stage': 'reassess' if feedback else 'synthesize' if synthesize else 'review_unresolved' if review else 'read_clues',
+                        'analysis_stage': 'repair_validation' if repair_validation else 'reassess' if feedback else 'synthesize' if synthesize else 'review_unresolved' if review else 'read_clues',
                         'review_sources':sorted(set(sources)&reviewable) if review else []}
+        self.pending['validation_ids']=[v['id'] for v in self.invalid_candidates] if repair_validation else []
+        if repair_validation:self.validation_reviews[corpus]=self.validation_reviews.get(corpus,0)+1
+        self.validation_reviews=dict(list(self.validation_reviews.items())[-10:])
         for key in self.pending['review_sources']:
             self.review_attempts[key]=self.review_attempts.get(key,0)+1
         self.llm_status = "pending"

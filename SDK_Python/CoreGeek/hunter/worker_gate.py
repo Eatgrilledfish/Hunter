@@ -109,14 +109,23 @@ def prepare(state, world, clock, rules, policy, deadline, *, task_busy=False):
                             and reach[q]+passage[traveller.pos]+home[q]+policy.return_buffer >= clock.until_night):
                         continue
                 if prefer_exterior and q not in interior:
-                    # A material supplier can continue work outside after
-                    # yielding, but must retain an observed return route once
-                    # P occupies the common stand. Fall back inside if late.
-                    final = copy(preview)
-                    final.occupied = (preview.occupied-{traveller.pos,q})|set(goals)
-                    home = distance_field(final,stands(world,blocker.id),q,deadline)
-                    if (q not in home or reach[q]+passage[traveller.pos]+home[q]
-                            +policy.return_buffer >= clock.until_night):
+                    # A guard occupies one reachable duty cell, not every
+                    # alternative stand at once. Prove a concrete arrival and
+                    # the yielding actor's return with that arrival occupied.
+                    safe_return = False
+                    for destination in sorted(goals):
+                        arrival = distance_field(preview,{destination},traveller.pos,deadline)
+                        length = arrival.get(traveller.pos,float('inf'))
+                        if length > shortest+1:
+                            continue
+                        final = copy(preview)
+                        final.occupied = (preview.occupied-{traveller.pos,q})|{destination}
+                        home = distance_field(final,stands(world,blocker.id),q,deadline)
+                        if (q in home and reach[q]+length+home[q]
+                                +policy.return_buffer < clock.until_night):
+                            safe_return = True
+                            break
+                    if not safe_return:
                         continue
                 return step(blocker,{q})
             if time.monotonic() >= deadline:
@@ -165,9 +174,12 @@ def prepare(state, world, clock, rules, policy, deadline, *, task_busy=False):
 
     if pioneer.pos == plan['w'] and worker.pos in stands(world,worker.id):
         state.interior_clearance_day = None
-    if (pioneer.pos == plan['w'] or worker.pos not in blue or clock.phases != {'day'}
+    if (pioneer.pos == plan['w'] or clock.phases != {'day'}
+            or state.pioneer_return_clearance_position is not None
+                and worker.pos != state.pioneer_return_clearance_position
             or state.pioneer_return_clearance_day != clock.day):
         state.pioneer_return_clearance_day = None
+        state.pioneer_return_clearance_position = None
     if (pioneer.pos in blue and worker.pos in blue
             and (pioneer.pos != plan['w'] or state.interior_clearance_day == clock.day)):
         actual = distance_field(world,{plan['w']},pioneer.pos,deadline).get(pioneer.pos)
@@ -420,8 +432,11 @@ def prepare(state, world, clock, rules, policy, deadline, *, task_busy=False):
                     and 0 < world.shop.get(r['name'],0) <= (world.gold or 0)
                     for r in delivery_targets.values()))
         if (task_busy or world.phase_task or state.worker_return_clearance_day != clock.day
+                or (state.worker_return_clearance_position is not None
+                    and pioneer.pos != state.worker_return_clearance_position)
                 or not worker_investment or worker.pos in blue and not paid_worker):
             state.worker_return_clearance_day = None
+            state.worker_return_clearance_position = None
         if (worker_investment and not task_busy and not world.phase_task and worker.backpack is not None
                 and (worker.pos not in blue or state.worker_return_clearance_day == clock.day)):
             # Checkout needs a real return path even before the final recall.
@@ -434,10 +449,20 @@ def prepare(state, world, clock, rules, policy, deadline, *, task_busy=False):
             unblocked = distance_field(preview,goals,worker.pos,deadline).get(worker.pos)
             if unblocked is not None and unblocked+policy.return_buffer+2 < clock.until_night:
                 if actual is None or actual > unblocked+2:
-                    command = clear_worker_for(worker,goals,inside=True,blocker=pioneer)
+                    departure=any(t.get('isValid') is True for t in world.tasks)
+                    command = clear_worker_for(worker,goals,inside=True,blocker=pioneer,
+                                               prefer_exterior=departure)
                     if command:
                         offer(pioneer,command,'clear observed worker checkout and paid-delivery return')
-                        state.worker_return_clearance_day = clock.day
+                        # A proved exterior yield lets P continue toward an
+                        # available task. Do not turn it back to its duty stand
+                        # while W is still travelling to or from the counter.
+                        if departure:
+                            state.worker_return_clearance_day = None
+                            state.worker_return_clearance_position = None
+                        else:
+                            state.worker_return_clearance_day = clock.day
+                            state.worker_return_clearance_position = position(command['targetPos'][0])
                 elif state.worker_return_clearance_day == clock.day:
                     # Do not immediately walk back into the same passage or
                     # start opposing traffic while W delivers its paid stock.
@@ -446,6 +471,7 @@ def prepare(state, world, clock, rules, policy, deadline, *, task_busy=False):
                     command = step(pioneer,{plan['w']})
                     if command:
                         offer(pioneer,command,'finish worker clearance at pioneer duty stand')
+                        state.worker_return_clearance_position = position(command['targetPos'][0])
                     else:
                         hold(pioneer)
                 if pioneer.id in state.commands:
@@ -507,6 +533,7 @@ def prepare(state, world, clock, rules, policy, deadline, *, task_busy=False):
                     offer(worker,command,'open return corridor for pioneer checkout before dusk')
                     if interior_clearance:
                         state.pioneer_return_clearance_day = clock.day
+                        state.pioneer_return_clearance_position = position(command['targetPos'][0])
                     # Do not let P step into W's only exit before this observed
                     # clearance completes, including when other walls lack stone.
                     offer(pioneer,None,'wait for observed worker passage clearance')

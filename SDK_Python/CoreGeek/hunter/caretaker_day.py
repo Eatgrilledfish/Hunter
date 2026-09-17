@@ -185,10 +185,11 @@ class CaretakerDay:
                 if immediate:
                     return self.finish(world,guidance,jobs,actor,immediate,'use')
             # Repair yesterday's breach with already held stone before starting
-            # a new economic trip. Keep a separate final-seal stone when needed.
+            # a new economic trip. A front breach takes the last stone too;
+            # saving it for the door cannot close a still-broken perimeter.
             front_missing = (missing & set(getattr(world,'monster_front_walls',()))) - {plan['gate']}
-            reserve = int(plan['gate'] in missing)
-            if not front_missing:self.front_rebuild_pending = False
+            reserve = 0
+            self.front_rebuild_pending = bool(front_missing and clock.day > 1)
             if self.front_rebuild_pending and front_missing and actor.inventory['stone'] > reserve and job:
                 from .economy import ready_construction
                 emergency_job = dict(job, target=min(front_missing,key=lambda p:(

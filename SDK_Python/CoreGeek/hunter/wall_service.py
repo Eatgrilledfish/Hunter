@@ -76,17 +76,24 @@ class WallService:
                 set(world.wall_targets or ())-{u.pos for u in world.ours.values() if u.alive and u.kind=='wall'}-helpers)
             steps = job.get('construction_steps')
             funded = actor.inventory['stone']>=len(targets)
-            fits = steps is not None and steps+1<clock.until_night
+            # A concrete front job can be funded even when the same worker
+            # still owes stone for side walls and the final access closure.
+            funded_targets = targets if funded else (
+                {job.get('target')} if actor.inventory['stone']
+                and job.get('target') in set(getattr(world,'monster_front_walls',()))
+                and job.get('target') != gate else set())
             for p in targets & self.sites.keys():
                 if self.sites[p]['id'] is not None:continue
                 from .day_access import gate as access_gate
                 # The active access gap is held for guard ingress. Do not
                 # promise its construction at the worker's first arrival.
-                closure_steps=(max(steps or 0,clock.until_night-18)
-                    if p==gate and not getattr(world,'worker_close_requested',False) else steps)
+                target_steps=job.get('target_steps',{}).get(p,steps)
+                fits = target_steps is not None and target_steps+1<clock.until_night
+                closure_steps=(max(target_steps or 0,clock.until_night-18)
+                    if p==gate and not getattr(world,'worker_close_requested',False) else target_steps)
                 self.sites[p].update(builder=identity,
-                    build_after=world.round+closure_steps+1 if funded and fits else None,
-                    state='await_build' if funded and fits else 'await_material')
+                    build_after=world.round+closure_steps+1 if p in funded_targets and fits else None,
+                    state='await_build' if p in funded_targets and fits else 'await_material')
         available={u.id:u.inventory['WallUpgradeVoucher1'] for u in world.movers if u.backpack is not None}
         roster=world.night_roster
         for p,record in sorted(self.sites.items()):
@@ -129,9 +136,14 @@ def use_permitted(world, candidate):
     points=command.get('targetPos',[])
     if not actor or actor.backpack is None or len(points)!=1:return True
     point=(points[0].get('x'),points[0].get('y'))
+    paid={world.ours[uid].pos for uid,level in getattr(world,'checkout_targets',{}).get(actor.id,())
+          if level==1 and uid in world.ours and world.ours[uid].alive
+          and world.ours[uid].kind=='wall' and world.ours[uid].level==1}
+    if point in paid:return True
     reservations=[p for p,r in getattr(world,'wall_service',{}).items()
                   if r.get('reserved_owner')==actor.id and r.get('level') not in (2,3)]
-    if point in reservations or actor.inventory['WallUpgradeVoucher1']>len(reservations):return True
+    committed_elsewhere=actor.inventory['WallUpgradeVoucher1']<=len(paid)
+    if not committed_elsewhere and (point in reservations or actor.inventory['WallUpgradeVoucher1']>len(reservations)):return True
     wall=next((u for u in world.ours.values() if u.alive and u.kind=='wall' and u.pos==point),None)
     loss=getattr(world,'observed_wall_losses',{}).get(wall.id,0) if wall else 0
     return bool(wall and loss>0 and wall.health is not None and wall.health<=loss*2)

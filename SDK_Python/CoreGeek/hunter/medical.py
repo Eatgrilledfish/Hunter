@@ -16,7 +16,7 @@ def needs_treatment(world,actor,clock):
     # Exterior workers need a new-day treatment opportunity for substantial
     # unrecovered damage. A fresh scratch does not consume the last reserve.
     # Damage comes from consecutive observations, not an assumed enemy DPS.
-    return bool(roster and actor.id==roster.m and injury and clock.day is not None
+    return bool(roster and actor.id in (roster.m,roster.w,roster.p) and injury and clock.day is not None
                 and injury['day']<clock.day and actor.health<=2*injury['damage'])
 
 
@@ -61,6 +61,7 @@ class MedicalSupply:
         reserve = min(costs, default=0)*max(0, rules.weapon_limit-len(world.weapons))
         budget = min(max(0, (world.gold or 0)-reserve), max(0, policy.medical_gold_limit-self.spent.get(clock.day, 0)))
         self.diagnostic.update(reserve_gold=reserve, available_budget=budget)
+        optional_spent = 0
         for actor in actors:
             if time.monotonic() >= deadline:
                 break
@@ -108,6 +109,14 @@ class MedicalSupply:
                 from .wall_policy import investment_fund
                 reserve=max(reserve,investment_fund(world)[0])
                 budget=min(budget,max(0,(world.gold or 0)-reserve))
+                # A healthy spare dose must not shrink an affordable checkout.
+                # Compare before purchase: arbitration already charges any buy
+                # in this frame, so do not add its full cost as a second floor.
+                stock_budget = max(0, (world.gold or 0) -
+                    max(reserve, getattr(world,'checkout_cash_reserve',0)) - optional_spent)
+                if world.shop.get('Medicine',float('inf')) > stock_budget:
+                    self.diagnostic['plans'][actor.id] = dict(stage='stock_deferred',reason='funded_checkout')
+                    continue
             if actor.id in self.pending or actor.capacity is None or len(actor.backpack) >= actor.capacity:
                 continue
             price = world.shop.get('Medicine')
@@ -154,6 +163,7 @@ class MedicalSupply:
             offers = [c for c in offers if permission.permit(c)]
             if offers:
                 result.extend(offers)
+                optional_spent += price
                 budget -= price  # Personal plans may not jointly overspend the daily allocation.
                 self.diagnostic['plans'][actor.id] = {'stage': 'buy' if length == 0 else 'travel',
                     'shop_cell': shop_cell, 'travel': length, 'planned_actions': total, 'quote': price,

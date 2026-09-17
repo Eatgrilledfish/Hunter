@@ -48,8 +48,6 @@ def check_action(world, clock, rules, identity, command, *, task_actor=None, sum
     if not actor.alive:
         return invalid("actor dead")
     action = command["action"]
-    if action == 'buy' and command.get('name') == 'WallFixer' and actor.kind != 'worker':
-        return invalid('team purchase policy: wall repair packs belong to workers')
     if action in {'buy','use'}:
         from .opponent import SUMMONS, summon_target_status
         if command.get('name') in SUMMONS:

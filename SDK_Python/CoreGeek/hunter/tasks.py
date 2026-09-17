@@ -19,6 +19,16 @@ from .task_lifecycle import TaskLifecycle, family as task_family
 from .rules import Clock, Policy
 
 
+def llm_service_failure(world, pending):
+    """Attribute a next-turn platform error to the emitted model request only."""
+    if world.round != pending['round']+1:return None
+    for error in array(world.raw.get('errors')):
+        if obj(error).get('errorCode') != 3:continue
+        description=str(obj(error).get('description',''))
+        if re.search(r'LLM|模型',description,re.I):return description[:200]
+    return None
+
+
 def execution_failure(data):
     """Recognize explicit execution errors; zero records alone are not a failure."""
     for event in data.get('runtime_events', []):
@@ -557,6 +567,13 @@ def evidence_answer(task, spec):
                 value = decoded
                 spec = dict(spec, format='json')
     validate_answer(task, spec, value, refs)
+    if basis == 'model_inference_not_verified':
+        paged=[task.evidence[k].get('data',{}) for k in refs if any(
+            e.get('kind')=='json_shape' and (e.get('pagination_datasets') or e.get('pagination_coverage'))
+            for e in task.evidence[k].get('data',{}).get('runtime_events',[]))]
+        if paged and not answer_contract(task)['coverage_scope']['local']:
+            if not any(r.get('data') == value for r in paged):
+                raise ValueError('paginated answer must match computed execution JSON; compute corrected fields in the sandbox')
     diagnostic = value
     if isinstance(value, str):
         try:
@@ -752,6 +769,11 @@ class TaskEngine:
         task, pending = self.active, self.active.llm_pending
         raw = world.raw.get("llmResp")
         if not isinstance(raw, str) or not raw:
+            failure=llm_service_failure(world,pending)
+            if failure:
+                task.events.append({'kind':'llm_service_failure','round':world.round,'reason':failure})
+                task.llm_pending=None
+                return
             if world.round > pending["round"] + 2:
                 task.events.append({"kind": "missing_llm", "round": world.round})
                 task.llm_pending = None
@@ -967,6 +989,9 @@ class TaskEngine:
                         'evidence_refs':[evidence_id], 'partial':output.get('partial') is True,
                         'extract':{'evidence':evidence_id,'selector':output.get('selector')}})
                     if any(s['hash'] == task.answer['hash'] for s in task.submitted):task.answer = None
+                    elif pending['plan'].get('effect')=='read_only':
+                        from .task_checkpoints import remember_complete
+                        remember_complete(task,task.answer['spec'])
                 except (ValueError, KeyError, TypeError) as exc:
                     task.events.append({'kind':'answer_output_rejected','round':world.round})
                     task.diagnostic_events.append({'kind':'answer_output_rejected','round':world.round,
@@ -1234,6 +1259,7 @@ class TaskEngine:
                                'runtime':e['data'].get('runtime_events',[]),
                                'entries':e['data'].get('cwd_entries'),'root_entries':e['data'].get('root_entries'),'tail':result_excerpt(e['data'].get('text',''))} if e.get('failure') else None)
                                for e in reversed(list(task.evidence.values())) if e.get('data',{}).get('operation') in ('run_python','run_tool')),None),
+                           "answer_validation_feedback":task.diagnostic_events[-3:],
                            "latest_api_observation":next(([v for v in e['data'].get('runtime_events',[])
                                if v.get('kind') in ('json_shape','exception','http')]
                                for e in reversed(list(task.evidence.values())) if e.get('data',{}).get('operation') in ('run_python','run_tool')),[]),

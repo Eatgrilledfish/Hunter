@@ -15,6 +15,18 @@ from .day_schedule import weighted_field
 OPTIONAL_STOCK = {'DizzyWeapon', 'Bomb', 'SmallRobotSummonOrder'}
 
 
+def stock_quantity(world, actor, name, target, available, reserve, space, planned, minimum_reserve):
+    """Bounded personal maintenance precedes optional reconstruction spending."""
+    from .wall_policy import minimum_stock
+    price=world.shop[name]
+    held=actor.inventory[name]+sum(e['name']==name for e in planned)
+    paid=sum(world.shop[e['name']] for e in planned if e['unit'] is not None)
+    ordinary=max(0,available-reserve)//price
+    essential=min(max(0,minimum_stock(world,actor,name)-held),
+                  max(0,available-max(0,minimum_reserve-paid))//price)
+    return min(space,max(0,target-held),max(ordinary,essential))
+
+
 def requirements(world, rules, policy):
     from .wall_policy import upgrade_rank
     emergency = {u.id for u in world.stations if u.id in getattr(world, 'critical_base_ids', ()) and u.level in (1, 2)}
@@ -69,8 +81,9 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
     # batch by unit ID can add an excluded exterior corner and invalidate the
     # remaining checkout/use circuit immediately after the first purchase.
     from .wall_pressure import priority
-    requests=sorted(enumerate(requests),key=lambda pair:(pair[1]['rank'],pair[1]['level'],
-        priority(world,pair[1]['unit']),not any(committed(pair[1],i) for i in carriers),pair[0]))
+    requests=sorted(enumerate(requests),key=lambda pair:(
+        not any(committed(pair[1],i) for i in carriers),pair[1]['rank'],pair[1]['level'],
+        priority(world,pair[1]['unit']),pair[0]))
     for _,req in requests:
         if time.monotonic() >= deadline:
             return None
@@ -107,17 +120,20 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
     # The maintenance worker needs real personal repair stock, not just money
     # reserved in P's basket. Fund a small working stock alongside the wall
     # stage, before its remaining cash is exhausted by upgrade chains.
-    if (not emergency and actor.id==roster.w and len(world.weapons)==rules.weapon_limit
+    if (not emergency and not getattr(world,'critical_base_ids',())
+            and actor.id in (roster.w,roster.p)
+            and not (actor.id==roster.p and getattr(world,'base_restore_ids',()))
+            and len(world.weapons)==rules.weapon_limit
             and not any(g.id in stage_ids for g in world.weapons)):
         price=world.shop.get('WallFixer',0)
         if price>0:
             from .wall_policy import investment_fund
-            investment_reserve,_=investment_fund(world)
+            investment_reserve,_=investment_fund(world,preserve_reconstruction=False)
             # The minimum working stock is still subject to the same next
             # investment reserve as the final purchase permit. An impossible
             # top-up must not keep prepaid delivery waiting at the shop.
             stock_cash=max(0,available-max(0,investment_reserve-reserve))
-            count=min(space,stock_cash//price,max(0,2-actor.inventory['WallFixer']))
+            count=min(space,stock_cash//price,max(0,(2 if actor.id==roster.w else 1)-actor.inventory['WallFixer']))
             if limits is not None:count=min(count,limits['WallFixer'])
             if count:
                 planned.extend(dict(name='WallFixer',rank=1.9,level=0,unit=None) for _ in range(count))
@@ -145,14 +161,20 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
     stock = []
     if not emergency and (primary or actor.id==roster.w):
         stock.append(('Medicine', 1 if policy.medical_stock_enabled else 2))
-    if not emergency and actor.id == roster.w and walls:
+    if (not emergency and actor.id in (roster.w,roster.p) and walls
+            and not (actor.id==roster.p and getattr(world,'base_restore_ids',()))):
         from .repair_decision import eligible
         damaged = sum(eligible(world,u,rules,policy) for u in walls)
-        stock.append(('WallFixer', max(2, damaged+(len(walls)+3)//4)))
+        stock.append(('WallFixer', max(2, damaged+(len(walls)+3)//4) if actor.id==roster.w else 1))
     # Night actions and bag space bound useful explosive reserves. The budget
     # may buy several in one action rather than stopping at the old one-item cap.
     defence_reserve = sum(world.shop.get(r['name'], available) for r in unfilled
                           if r['unit'].id in stage_ids and (r['unit'].id,r['level']) not in covered)
+    from .wall_policy import reconstruction_pending
+    if (getattr(world,'critical_base_ids',()) or reconstruction_pending(world)) and not emergency:
+        from .wall_policy import investment_fund
+        paid_now=sum(world.shop[e['name']] for e in planned if e['unit'] is not None)
+        defence_reserve=max(defence_reserve,max(0,investment_fund(world)[0]-paid_now))
     # Upgrade ownership serializes shared building investment, not personal
     # guard ammunition. W must budget its sale/checkout before sealing even
     # when the free pioneer owns the team's upgrade purchases.
@@ -173,17 +195,19 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
         and primary_cost <= max(0,(world.gold or 0)-reserve))
     if cash_funded_investment:
         available = min(available,max(0,(world.gold or 0)-reserve-primary_cost))
+    from .wall_policy import investment_fund
+    minimum_reserve,_=investment_fund(world,preserve_reconstruction=False)
     for name, target in stock:
         price = world.shop.get(name,0)
         if price <= 0: continue
-        spendable = max(0,available-defence_reserve)
-        count = min(space, spendable//price, max(0,target-actor.inventory[name]-sum(r['name']==name for r in planned)))
+        count=stock_quantity(world,actor,name,target,available,defence_reserve,space,planned,minimum_reserve)
         if limits is not None:count=min(count,limits[name])
         if count:
             planned.extend(dict(name=name,rank=4,level=0,unit=None) for _ in range(count))
             available -= count*price;space -= count
     return dict(held=held, planned=planned, reserve=reserve, unspent=available,
                 prepaid=prepaid, stock_targets=stock, unfunded_defence_reserve=defence_reserve,
+                minimum_stock_reserve=minimum_reserve,
                 cash_funded_investment=cash_funded_investment)
 
 
@@ -208,11 +232,7 @@ def use_tour(world, actor, entries, start, home, deadline, fields=None, *, arriv
         # The delivery planner prioritizes last night's damaged wall within
         # a tier. Quote that same order rather than a shorter unrelated tour.
         from .wall_pressure import priority
-        if any(priority(world,remaining[c[-1]]['unit'])[0] == 0 for c in choices):
-            choices.sort(key=lambda c:(c[1],priority(world,remaining[c[-1]]['unit']),c[0],c[2],c[3]))
-            chosen=choices[0]
-        else:
-            chosen=min(choices)
+        chosen=min(choices,key=lambda c:(c[1],priority(world,remaining[c[-1]]['unit']),c[0],c[2],c[3]))
         length,_,_,_,point,index = chosen
         entry = remaining[index]
         if entry.get('pending'):
@@ -328,9 +348,8 @@ def quote(world, actor, clock, rules, policy, deadline, *, home, tail=None, end=
         if time.monotonic() >= deadline:break
         price=world.shop.get(name,0)
         if price<=0:continue
-        spendable=max(0,available-defence_reserve)
-        count=min(actor.capacity-len(actor.backpack)-len(selected),spendable//price,
-                  max(0,target-actor.inventory[name]-counts[name]))
+        count=stock_quantity(world,actor,name,target,available,defence_reserve,
+            actor.capacity-len(actor.backpack)-len(selected),selected,data['minimum_stock_reserve'])
         if order_limits is not None:count=min(count,max(0,order_limits.get(name,0)-counts[name]))
         if count<=0:continue
         entries=[dict(name=name,rank=4,level=0,unit=None) for _ in range(count)]

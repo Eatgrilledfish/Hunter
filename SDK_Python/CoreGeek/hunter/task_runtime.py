@@ -6,7 +6,7 @@ def prelude(root):
 
 
 SOURCE = r'''
-import atexit as _ha, json as _hj, os as _ho, shlex as _hs, shutil as _hh
+import atexit as _ha, json as _hj, os as _ho, shlex as _hs, shutil as _hh, hashlib as _hhash
 import subprocess as _hsub, sys as _hsys, re as _hre
 _hunter_events = []
 _hunter_json_pending = False
@@ -43,6 +43,34 @@ def _hunter_report():
     if _hunter_events:
         print('\nHUNTER_RUNTIME:' + _hj.dumps(_hunter_events, ensure_ascii=True), file=_hsys.stderr, flush=True)
 _ha.register(_hunter_report)
+def hunter_collect_offset_pages(fetch, *, rows_path=('data','records'),
+        pagination_path=('data','pagination'), total_key='total_count', offset_key='offset',
+        identity_fields=(), max_pages=64):
+    """Explicit observed offset protocol; no URL/auth/schema guesses."""
+    def select(value,path):
+        for part in path:value=value[part]
+        return value
+    offset=0;expected=None;records={};identities={}
+    for _ in range(max_pages):
+        value=fetch(offset)
+        rows=select(value,rows_path);paging=select(value,pagination_path)
+        total=paging[total_key];actual=paging[offset_key]
+        if type(total) is not int or total<0 or type(actual) is not int or actual!=offset:
+            raise ValueError('pagination offset/total invalid or request repeated')
+        if expected is not None and total!=expected:raise ValueError('dataset total changed during pagination')
+        expected=total
+        if not isinstance(rows,list) or len(rows)+offset>total:raise ValueError('invalid page records')
+        if not rows and offset<total:raise ValueError('empty page before complete dataset')
+        for index,row in enumerate(rows,offset):
+            if identity_fields:
+                identity=tuple(_hj.dumps(row[k],sort_keys=True) for k in identity_fields)
+                if identity in identities and identities[identity]!=index:
+                    raise ValueError('duplicate declared record identity')
+                identities[identity]=index
+            records[index]=row
+        offset+=len(rows)
+        if offset==total:return [records[i] for i in range(total)]
+    raise ValueError('pagination budget exceeded before completeness')
 _hunter_json_loads = _hj.loads
 def _hunter_shape(value,depth=0):
     if depth>=2:return type(value).__name__
@@ -100,7 +128,8 @@ def _hunter_loads(*args,**kwargs):
                     covered=sum(max(0,min(end,total)-min(start,total)) for start,end in merged)
                     record['pagination_coverage']={'total_count':total,'covered_records':covered,
                         'complete': covered==total,'ranges':merged[:8],'ranges_partial':len(merged)>8}
-                    _hunter_coverages[key]=dict(record['pagination_coverage'],path=_hunter_json_dataset[2])
+                    _hunter_coverages[key]=dict(record['pagination_coverage'],path=_hunter_json_dataset[2],
+                        dataset_id=_hhash.sha256(repr(_hunter_json_dataset).encode()).hexdigest()[:16])
         if _hunter_coverages:
             # Preserve each separately keyed population when a later request
             # changes endpoint or query. Query values are never emitted.

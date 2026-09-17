@@ -136,16 +136,39 @@ def validate(task, spec, value, refs):
     results = [task.evidence[key].get("data", {}) for key in refs]
     # Concrete observed pagination can disprove a complete API aggregation.
     # This does not infer missing pages, field meanings or unseen API contracts.
-    aggregate_fields = set(fields) | set((required.get('schema') or {}).get('properties', {}))
     scope=required['coverage_scope']
-    aggregate = scope['complete'] or bool(aggregate_fields & {'world_heritage_count','oldest_era'}) and not scope['local']
-    if required['execution_required'] and aggregate and (scope['complete'] or not partial):
-        for result in results:
+    # A known missing page is a concrete counterexample, even when prose or
+    # a model's partial flag failed to declare the aggregation scope. Only an
+    # explicit source-backed first-page task can authorize local coverage.
+    if required['execution_required'] and not scope['local']:
+        paging_results=results
+        keys=list(task.evidence)
+        through=max((keys.index(k) for k in refs),default=-1)
+        datasets_by_id={}
+        for key in keys[:through+1]:
+            for event in task.evidence[key].get('data',{}).get('runtime_events',[]):
+                if event.get('kind')!='json_shape':continue
+                for dataset in event.get('pagination_datasets',[]):
+                    identity=dataset.get('dataset_id')
+                    if identity:datasets_by_id[identity]=dataset
+        relevant=list(datasets_by_id.values())
+        relevant=[d for d in relevant if d.get('path') in scope['paths']] or relevant
+        if any(d.get('complete') is False for d in relevant):
+            raise ValueError('API pagination incomplete: current task dataset remains uncovered')
+        if not any(any(e.get('kind')=='json_shape' for e in result.get('runtime_events',[])) for result in results):
+            # Only the selected evidence's prefix; a later failed exploration
+            # cannot invalidate an earlier explicitly validated checkpoint.
+            prior=[task.evidence[k].get('data',{}) for k in keys[:through+1]]
+            last=next((result for result in reversed(prior)
+                       if any(e.get('kind')=='json_shape' for e in result.get('runtime_events',[]))),None)
+            if last:paging_results=results+[last]
+        for result in paging_results:
             for event in result.get('runtime_events', []):
                 if event.get('kind') != 'json_shape':
                     continue
                 datasets=event.get('pagination_datasets',[])
-                relevant=[d for d in datasets if not scope['paths'] or d.get('path') in scope['paths']]
+                matched=[d for d in datasets if d.get('path') in scope['paths']]
+                relevant=matched or datasets
                 if any(d.get('complete') is False for d in relevant):
                     raise ValueError('API pagination incomplete: requested dataset has uncovered record ranges')
                 if datasets:

@@ -182,7 +182,9 @@ class RepairPlan:
                         break
                     result.extend(self._return(actor, home, current, world, service_context))
                 continue
+            from .guard_risk import evidence as guard_evidence
             self.diagnostic[identity]=dict(phase='WAIT',wall=None,remaining_actions=None,
+                risk=guard_evidence(world,actor,actor.pos),
                 observed_cooldown=window,reason='no damaged wall with a safe service route',stock=actor.inventory['WallFixer'])
             if identity == defence_duties.rotator(world) and actor.pos != plan['w'] and not current:
                 continue
@@ -242,7 +244,7 @@ class RepairPlan:
                     # No repair detour enters an observed lethal exposure.
                     if any(u.attack_range is None or u.attack_power is None for u in threats):
                         continue
-                    if 2*sum(u.attack_power for u in threats if distance(u.pos,stand)<=u.attack_range) >= actor.health:
+                    if exposure[stand]>=actor.health:
                         continue
                     options.append((delayed, wall.pos not in getattr(world,'monster_front_walls',()),
                                     actions, wall.health, wall.id, stand, wall, item))

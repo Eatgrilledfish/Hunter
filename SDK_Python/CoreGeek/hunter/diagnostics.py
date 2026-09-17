@@ -85,6 +85,12 @@ class Diagnostics(logging.Handler):
                 break
             obj(obj(record.get('duty')).get(section)).pop(key,None)
             record['context_cut'] = True
+        for repair in obj(obj(record.get('duty')).get('repair')).values():
+            for key in ('risk','reason','delayed','cd'):
+                if len(json.dumps(record,ensure_ascii=False,separators=(",", ":")).encode()) <= 1400:
+                    break
+                repair.pop(key,None)
+                record['context_cut'] = True
         print("HUNTER " + json.dumps(record,ensure_ascii=False,separators=(",", ":")),flush=True)
 
     def _compact_event(self, event, data):
@@ -232,8 +238,14 @@ class Diagnostics(logging.Handler):
             wall = obj(units.get(str(repair.get('wall'))))
             actor = obj(units.get(str(identity)))
             bag = actor.get('backpack')
+            limits=obj(decision.get('wall_health_levels'))
+            observed=obj(limits.get(wall.get('level'),limits.get(str(wall.get('level')))))
+            configured=self.max_health.get('wall',{}).get(wall.get('level'))
+            effective=observed.get('hp') if observed and not observed.get('conflict') else configured
             repairs[str(identity)[:32]] = dict(phase=self._brief(repair.get('phase'),24),wall=str(repair.get('wall'))[:32],
-                hp=[wall.get('health'),self.max_health.get('wall',{}).get(wall.get('level'))],
+                hp=[wall.get('health'),effective],configured_max_hp=configured,
+                hp_source=observed.get('source') if observed and not observed.get('conflict') else 'configured',
+                risk=repair.get('risk'),
                 stock=bag.count('WallFixer') if isinstance(bag,list) else None,
                 remaining=repair.get('remaining_actions'),cd=repair.get('observed_cooldown'),
                 selected=bool(repair.get('selected')),delayed=repair.get('delayed_fire'),

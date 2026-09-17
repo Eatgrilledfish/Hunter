@@ -51,6 +51,22 @@ def remember(task, spec):
     task.checkpoints = sorted(rows, key=lambda r: -len(r['fields']))[:4]
 
 
+def remember_complete(task, spec):
+    """An explicit computed result, not an arbitrary older successful execution."""
+    from .tasks import evidence_answer
+    try:
+        candidate=evidence_answer(task,{**spec,'partial':False})
+    except (ValueError,TypeError,KeyError):return
+    if candidate['basis']!='deterministic_extraction':return
+    if candidate['hash'] in {s['hash'] for s in task.submitted}:return
+    proof={key:deepcopy(task.evidence[key]) for key in candidate['evidence_refs']}
+    if len(json.dumps(proof,ensure_ascii=False).encode())>32768:return
+    row=dict(key=task.key,candidate=candidate,proof=proof,complete=True,
+        contract=fingerprint(answer_contract(task)),
+        documents={p:d['hash'] for p,d in task.documents.files.items()},fields=[])
+    task.checkpoints=([row]+[r for r in task.checkpoints if r['candidate']['hash']!=candidate['hash']])[:4]
+
+
 def checkpoint(task):
     from .tasks import evidence_answer
     for row in getattr(task, 'checkpoints', []):

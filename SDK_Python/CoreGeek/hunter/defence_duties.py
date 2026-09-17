@@ -31,13 +31,18 @@ def stand_rank(world, actor, position, walk):
     from .robot_threats import active
     if not enabled(world) or actor.id != caretaker(world):
         return (walk, position)
-    threats = [r for r in active(world) if r.target_team in (None, world.side)]
-    damage = sum(2*r.attack_power for r in threats
-                 if r.attack_power is not None and r.attack_range is not None
-                 and distance(position, r.pos) <= r.attack_range)
+    from .guard_risk import evidence
+    risk=evidence(world,actor,position)
+    damage=risk['two_opportunity_upper']
     front = getattr(world, 'monster_front_walls', set())
     coverage = sum(distance(position, p) <= 1 for p in front)
-    return (damage >= actor.health, -coverage, damage, walk, position)
+    # Prefer covering a wall whose observed loss is closing its service window.
+    # This only ranks safe legal gun stands; it never authorizes a lethal move.
+    losses=getattr(world,'observed_wall_losses',{})
+    urgent=[u for u in world.ours.values() if u.alive and u.kind=='wall' and u.pos in front
+            and losses.get(u.id,0)>0 and u.health<=losses[u.id]*3]
+    missed=sum(distance(position,u.pos)>1 for u in urgent)
+    return (risk['lethal'],missed,-coverage,damage if damage is not None else float('inf'),walk,position)
 
 
 def seal_service_steps(world):
@@ -126,8 +131,8 @@ def service_diagnostic(world, selected):
     if not actor:return None
     options=[]
     for point in sorted(stands(world,actor.id)):
-        lethal,coverage,damage,_,_=stand_rank(world,actor,point,0)
+        lethal,missed,coverage,damage,_,_=stand_rank(world,actor,point,0)
         options.append(dict(pos=point,occupied=point in world.occupied and point!=actor.pos,
-            known_lethal=lethal,known_two_step_damage=damage,front_coverage=-coverage))
+            known_lethal=lethal,urgent_walls_uncovered=missed,known_two_step_damage=damage,front_coverage=-coverage))
     return dict(actor=actor.id,current=actor.pos,selected=selected.get(actor.id),options=options,
         basis='known lethal exposure, wall coverage, known damage, reachable walking cost')

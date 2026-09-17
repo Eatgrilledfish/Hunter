@@ -63,6 +63,7 @@ class DayDivision:
     def assign(self, world, clock, rules, policy, jobs, deadline):
         world.economy_first = False
         world.helper_wall_targets = frozenset()
+        world.front_worker_targets = frozenset()
         world.wall_assistance = {'active': False}
         world.helper_clearance_commands = {}
         if (not policy.economy_first_enabled or not policy.day_schedule_enabled
@@ -160,6 +161,11 @@ class DayDivision:
         # makes a redundant mining trip. Only the primary supplier mines a deficit.
         other = next(u for u in workers if u.id != self.supplier)
         if defence_duties.enabled(world):
+            world.front_worker_targets = self.front_worker_targets(
+                world,clock,policy,actor,other,missing,ring,guard,deadline)
+            if world.front_worker_targets:
+                job['target']=min(world.front_worker_targets,key=lambda p:(distance(actor.pos,p),p))
+                job['defer_build']=False
             deficit = max(0, len(missing)-actor.inventory['stone'])
             rescue = bool(getattr(world, 'critical_base_ids', ()))
             material_steps = 0
@@ -228,6 +234,19 @@ class DayDivision:
                     defer_build=bool(other_tour and job['defer_build']
                                      and clock.until_night > other_tour['steps'] + 3))
                 job['stock_target'] -= share
+        current=result.get(actor.id,{})
+        target=current.get('target')
+        if (defence_duties.enabled(world) and target in set(getattr(world,'monster_front_walls',()))
+                and target!=self.gate
+                and actor.inventory['stone'] and not current.get('defer_build')):
+            # The first funded wall is usable before the whole construction
+            # tour and final return finish. Quote that actual arrival for P.
+            view=copy(world)
+            view.occupied=world.occupied|{world.task_side_plan['w']}
+            route=distance_field(view,interaction_cells(view,[target],actor.pos),actor.pos,deadline)
+            walk=route.get(actor.pos)
+            if walk is not None and time.monotonic()<deadline:
+                current.setdefault('target_steps',{})[target]=walk+1
         return result
 
     def clear_helper_corridor(self, world, clock, policy, worker, helper, missing, ring, job, deadline):
@@ -268,6 +287,39 @@ class DayDivision:
             world.wall_assistance = dict(active=False,reason='await observed worker corridor clearance',
                 worker=helper.id,supplier=worker.id,clearance=list(point),steps=planned['construction_steps'])
             return
+
+    def front_worker_targets(self, world, clock, policy, worker, helper, missing, ring, guard, deadline):
+        """Reserve only personally funded front work W can finish sooner.
+
+        Recomputed from observed positions every turn, so a failed route or
+        exhausted stock releases ownership instead of pinning a remote batch.
+        """
+        if not worker.inventory['stone'] or clock.day<=1:return frozenset()
+        targets=(missing & set(getattr(world,'monster_front_walls',())))-{self.gate}
+        if not targets:return frozenset()
+        view=copy(world)
+        view.occupied=world.occupied | (missing-{self.gate})
+        view.occupied.discard(worker.pos)
+        start=distance_field(view,{worker.pos},worker.pos,deadline)
+        home=distance_field(view,defence_duties.stands(world,worker.id),worker.pos,deadline)
+        outside=ring|world.build_interior|world.stations[0].cells
+        helper_start=distance_field(world,{helper.pos},helper.pos,deadline,extra_blocked=outside)
+        choices=[]
+        for target in targets:
+            command=Candidate(worker.id,dict(action='build',name='wall',targetPos=[pos_json(target)]),0,'front ownership')
+            if not guard.check([command])[0]:continue
+            stands=interaction_cells(view,[target],worker.pos)-ring
+            options=[(start[p]+1,home[p]) for p in stands if p in start and p in home]
+            helper_steps=min((helper_start[p]+1 for p in interaction_cells(world,[target],helper.pos)-outside
+                              if p in helper_start),default=float('inf'))
+            if not helper.inventory['stone']:helper_steps=float('inf')
+            feasible=[(steps,back) for steps,back in options
+                      if steps+back+policy.return_buffer+2<clock.until_night]
+            if feasible:
+                steps,back=min(feasible)
+                if steps<helper_steps:choices.append((steps,target))
+        if time.monotonic()>=deadline:return frozenset()
+        return frozenset(p for _,p in sorted(choices)[:worker.inventory['stone']])
 
     def assistance(self, world, clock, policy, actor, missing, ring, job, guard, deadline):
         """Finish the observed ore batch, then spend personal stone in one tour.
@@ -317,6 +369,7 @@ class DayDivision:
         gate_stone = int(self.gate in missing)
         exclusive = {job['target']} if supplier and supplier.inventory['stone'] > gate_stone else set()
         if batch:exclusive-=set(batch.get('targets',()))
+        exclusive.update(getattr(world,'front_worker_targets',()))
         for target in sorted(missing-{self.gate}-exclusive):
             if time.monotonic() >= deadline:
                 break
@@ -391,6 +444,7 @@ class DayDivision:
         batch['reason'] = stop or ('current mine still present' if collect else 'mine batch complete')
         return dict(job,target=target,stock_target=len(targets),gate=False,economy_first=False,
                     helper=True,helper_mine=mine,helper_collect=collect,helper_targets=targets,
+                    target_steps={q:n for q,n in timed_targets if q in targets},
                     helper_batch_reason=batch['reason'],helper_goals=sorted(goals),
                     construction_steps=required,construction_endpoint='exterior',
                     defer_build=collect)
