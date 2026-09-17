@@ -40,6 +40,7 @@ class RepairPlan:
         self.service = {}
         self.diagnostic = {}
         world.repair_commands = {}
+        world.repair_holds = {}
         world.day_repair_steps = {}
         world.day_repair_demand = 0
         world.day_repair_urgent = False
@@ -419,7 +420,8 @@ class RepairPlan:
         self.active.pop(actor.id, None)
         home = defence_duties.stands(world, actor.id)
         view = copy(world)
-        lethal = {q for q in home if evidence(world, actor, q)['lethal']}
+        risks={q:evidence(world,actor,q) for q in home}
+        lethal = {q for q in home if risks[q]['lethal']}
         view.navigation_avoided = {p:set(c) for p,c in world.navigation_avoided.items()}
         view.navigation_avoided.setdefault(actor.pos,set()).update(lethal | {world.task_side_plan['w']})
         reach = distance_field(view, {actor.pos}, actor.pos, deadline)
@@ -432,14 +434,16 @@ class RepairPlan:
             if maximum and wall.health is not None and wall.health>=maximum:continue
             hit = pressure(world, wall)
             service_cells=interaction_cells(world,[wall.pos],actor.pos)&home
-            safe_cells={p for p in service_cells if not evidence(world,actor,p)['lethal']}
+            safe_cells={p for p in service_cells if not risks[p]['lethal']}
             if not safe_cells:rejected['NO_SAFE_SERVICE']+=1
+            elif not safe_cells & reach.keys():
+                rejected['NO_SERVICE_ROUTE' if reach.complete else 'ROUTE_BUDGET_EXHAUSTED']+=1
             for stand in safe_cells & reach.keys():
                 steps = reach[stand]+1
                 ready=repair_decision.eligible(world,wall,rules,policy,service_steps=steps,pressure=hit or 0)
                 soon=repair_decision.eligible(world,wall,rules,policy,
                     service_steps=steps+policy.return_buffer,pressure=hit or 0)
-                if not ready and (not soon or steps==1):
+                if not ready and not soon:
                     continue
                 item = 'WallFixer' if actor.inventory['WallFixer'] else None
                 if wall.level in (1,2) and actor.inventory[f'WallUpgradeVoucher{wall.level}']:
@@ -449,19 +453,25 @@ class RepairPlan:
                     use=Candidate(actor.id,dict(action='use',name=coupon,targetPos=[pos_json(wall.pos)]),0,'repair coupon')
                     if upgrade_allowed(world,wall,policy,rules) and use_permitted(world,use):item=coupon
                     else:rejected['COUPON_RESERVED']+=1
-                if item and not evidence(world, actor, stand)['lethal']:
+                if item:
                     loss=self.loss_samples.get(wall.id,{}).get('loss',0) if hit else 0
                     window=(wall.health+loss-1)//loss if loss else None
                     if window is not None and steps>1 and steps>=window:
                         rejected['ARRIVAL_TOO_LATE']+=1
                         continue
                     slack=window-steps if window is not None else float('inf')
+                    prior_command=(previous or {}).get('command') or {}
                     continuing=bool(previous and previous.get('wall')==wall.id
                         and previous.get('target_position')==wall.pos and previous.get('target_level',wall.level)==wall.level
                         and previous.get('round')==world.round-1
-                        and previous.get('command',{}).get('action')=='move'
-                        and previous['command']['targetPos']==[pos_json(actor.pos)])
-                    candidates.append((not ready,slack,not continuing,wall.pos not in world.monster_front_walls,
+                        and (prior_command.get('action')=='move'
+                             and prior_command.get('targetPos')==[pos_json(actor.pos)]
+                             or previous.get('phase')=='HOLD_REPAIR' and previous.get('stand')==actor.pos))
+                    # Finish an available use instead of leaving a repairable
+                    # adjacent wall. Otherwise retain an observed successful
+                    # approach unless another wall has its last service turn.
+                    last_window=window is not None and window<=steps+1
+                    candidates.append((not ready,steps!=1,not last_window,not continuing,slack,wall.pos not in world.monster_front_walls,
                                        steps,wall.health,wall.id,stand,item,wall))
                 elif not item:
                     rejected['NO_STOCK']+=1
@@ -470,12 +480,28 @@ class RepairPlan:
                         self.unserved_stock.setdefault(clock.day,set()).add(wall.id)
         self.diagnostic[actor.id] = dict(phase='HOLD_FRONT', stock=actor.inventory['WallFixer'],
             minimum=2, target=getattr(world,'caretaker_repair_target',max(2,policy.caretaker_repair_target)), receipt=receipt,
-            reason='NO_SERVICE_REQUIRED',blocked=dict(rejected))
+            reason='NO_SERVICE_REQUIRED',blocked=dict(rejected),risk=dict(worker_hp=actor.health,
+                min_two_hit_upper=min((r['two_opportunity_upper'] for r in risks.values()
+                                      if r['two_opportunity_upper'] is not None),default=None),
+                unknown_cells=sum(r['unknown_attack'] for r in risks.values()),
+                basis='range upper bound, not actual target'))
         if not candidates or time.monotonic() >= deadline:
             self.diagnostic[actor.id]['reason']=('BUDGET_EXHAUSTED' if time.monotonic()>=deadline else
                 rejected.most_common(1)[0][0] if rejected else 'NO_SERVICE_REQUIRED')
             return []
-        preposition,slack,_,_,steps,_,_,stand,item,wall=min(candidates,key=lambda row:row[:8])
+        preposition,_,_,_,slack,_,steps,_,_,stand,item,wall=min(candidates,key=lambda row:row[:10])
+        if preposition and stand==actor.pos:
+            # No invented wait command. Keep this safe service position while
+            # the freshly observed damage/pressure still justifies staging;
+            # medicine and control consumables remain legal via guidance.
+            state=dict(wall=wall.id,phase='HOLD_REPAIR',round=world.round,command=None,
+                inventory_before=actor.inventory[item],target_position=wall.pos,target_level=wall.level,
+                stand=stand,day=clock.day)
+            self.offered.setdefault(actor.id,[]).append(state)
+            world.repair_holds[actor.id]=dict(wall=wall.id,stand=stand)
+            self.diagnostic[actor.id].update(phase='HOLD_REPAIR',wall=wall.id,remaining_actions=1,
+                preposition=True,reason='safe service position reached; wait for fresh repair threshold')
+            return []
         route=distance_field(view,{stand},actor.pos,deadline)
         commands=([dict(action='use',name=item,targetPos=[pos_json(wall.pos)])] if actor.pos==stand else
                   [dict(action='move',targetPos=[pos_json(q)]) for q in sorted(neighbours(actor.pos))
@@ -498,7 +524,10 @@ class RepairPlan:
     def finalize(self, world, response):
         for identity, offers in self.offered.items():
             for state in offers:
-                if response['roleCommandMap'].get(identity) == state['command']:
+                command=response['roleCommandMap'].get(identity)
+                stationary_control=(state.get('phase')=='HOLD_REPAIR' and command
+                    and command.get('action')=='use' and command.get('name') in {'Medicine','Bomb','DizzyWeapon'})
+                if command == state['command'] or stationary_control:
                     self.active[identity] = dict(state)
                     self.diagnostic[identity]["selected"] = True
                     break

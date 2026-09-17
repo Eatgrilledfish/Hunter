@@ -212,6 +212,8 @@ class Agent:
             if self.policy.pioneer_rotation_enabled and clock.phases=={'night'}:
                 for c in repairs:
                     guidance.repair_actions.setdefault(c.actor,[]).append(c.command)
+                for identity in getattr(world,'repair_holds',{}):
+                    guidance.repair_actions.setdefault(identity,[])
             pioneer = draft.night_roster.p
             if (world.task_return_required and pioneer in guidance.roster_transit_actions
                     and not draft.night_roster.traffic
