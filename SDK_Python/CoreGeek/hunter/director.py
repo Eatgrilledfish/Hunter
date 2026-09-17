@@ -543,9 +543,13 @@ def triage(world, clock, task_actor, task, policy=None, risk_memory=None):
             risk.update(maintenance_hold=not personal['withdraw'],
                         observed_hp_loss=personal['actual_recent_loss'],withdraw=personal['withdraw'],
                         withdrawal_basis=personal['basis'])
-            if actor.inventory['Medicine'] and actor.health<=110:
-                result.candidates.append(Candidate(actor.id,dict(action='use',name='Medicine'),
-                    2000,'treat actual maintenance injury in place'))
+            if actor.inventory['Medicine'] and actor.health<220:
+                command=dict(action='use',name='Medicine')
+                result.candidates.append(Candidate(actor.id,command,
+                    2000,'maintenance worker heals first with personally held medicine'))
+                result.survival_actions[actor.id]=[command]
+                risk['maintenance_action']='heal_first'
+                continue
             if not personal['withdraw']:
                 continue
             # Only a recent actual hit can release W from night maintenance.
