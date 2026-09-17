@@ -404,6 +404,12 @@ class RepairPlan:
         actor = world.ours.get(world.night_roster.w)
         if not actor or not actor.alive or actor.backpack is None or actor.abnormal == 'dizzy':
             return []
+        personal=evidence(world,actor,actor.pos)
+        if personal['withdraw']:
+            self.active.pop(actor.id,None)
+            self.diagnostic[actor.id]=dict(phase='PERSONAL_RESCUE',stock=actor.inventory['WallFixer'],
+                reason='recent personal hit may be lethal again',risk=personal)
+            return []
         previous = self.active.get(actor.id)
         receipt = None
         if previous and previous['phase'] == 'USE_PENDING' and world.round > previous['round']:
@@ -484,7 +490,8 @@ class RepairPlan:
                 min_two_hit_upper=min((r['two_opportunity_upper'] for r in risks.values()
                                       if r['two_opportunity_upper'] is not None),default=None),
                 unknown_cells=sum(r['unknown_attack'] for r in risks.values()),
-                basis='range upper bound, not actual target'))
+                actual_recent_loss=personal['actual_recent_loss'],withdraw=personal['withdraw'],
+                basis=personal['basis']))
         if not candidates or time.monotonic() >= deadline:
             self.diagnostic[actor.id]['reason']=('BUDGET_EXHAUSTED' if time.monotonic()>=deadline else
                 rejected.most_common(1)[0][0] if rejected else 'NO_SERVICE_REQUIRED')

@@ -33,7 +33,7 @@ def stand_rank(world, actor, position, walk):
         return (walk, position)
     from .guard_risk import evidence
     risk=evidence(world,actor,position)
-    damage=risk['two_opportunity_upper']
+    damage=(risk['two_opportunity_upper'] if not risk['measured_maintenance'] or risk['withdraw'] else 0)
     front = getattr(world, 'monster_front_walls', set())
     coverage = sum(distance(position, p) <= 1 for p in front)
     # Prefer covering a wall whose observed loss is closing its service window.
@@ -134,7 +134,10 @@ def service_diagnostic(world, selected):
     options=[]
     for point in sorted(stands(world,actor.id)):
         lethal,missed,coverage,damage,_,_=stand_rank(world,actor,point,0)
+        from .guard_risk import evidence
+        risk=evidence(world,actor,point)
         options.append(dict(pos=point,occupied=point in world.occupied and point!=actor.pos,
-            known_lethal=lethal,urgent_walls_uncovered=missed,known_two_step_damage=damage,front_coverage=-coverage))
+            known_lethal=lethal,urgent_walls_uncovered=missed,known_two_step_damage=risk['two_opportunity_upper'],
+            actual_recent_loss=risk['actual_recent_loss'],withdraw=risk['withdraw'],front_coverage=-coverage))
     return dict(actor=actor.id,current=actor.pos,selected=selected.get(actor.id),options=options,
-        basis='known lethal exposure, wall coverage, known damage, reachable walking cost')
+        basis=risk['basis'] if options else 'no service position')

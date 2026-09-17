@@ -537,6 +537,30 @@ def triage(world, clock, task_actor, task, policy=None, risk_memory=None):
         risk = exposure(world, clock, actor.pos)
         result.observations[actor.id] = risk
         upper = risk["upper_per_attack_opportunity"]
+        from .guard_risk import maintenance_worker, evidence as personal_risk
+        if maintenance_worker(world,actor):
+            personal=personal_risk(world,actor,actor.pos)
+            risk.update(maintenance_hold=not personal['withdraw'],
+                        observed_hp_loss=personal['actual_recent_loss'],withdraw=personal['withdraw'],
+                        withdrawal_basis=personal['basis'])
+            if actor.inventory['Medicine'] and actor.health<=110:
+                result.candidates.append(Candidate(actor.id,dict(action='use',name='Medicine'),
+                    2000,'treat actual maintenance injury in place'))
+            if not personal['withdraw']:
+                continue
+            # Only a recent actual hit can release W from night maintenance.
+            # Range exposure ranks escape directions; it never triggers exit.
+            for pos in neighbours(actor.pos):
+                if not world.inside(pos) or pos in world.occupied:continue
+                future=exposure(world,clock,pos)
+                if (future['upper_per_attack_opportunity'],-future['nearest']) >= (upper,-risk['nearest']):continue
+                reduction=upper-future['upper_per_attack_opportunity']
+                result.candidates.append(Candidate(actor.id,dict(action='move',targetPos=[pos_json(pos)]),
+                    1000+min(500,reduction)+future['nearest'],
+                    'withdraw maintenance worker after observed near-lethal personal damage'))
+            rescue=[c.command for c in result.candidates if c.actor==actor.id]
+            if rescue:result.survival_actions[actor.id]=rescue
+            continue
         observed_loss = max((loss for r, loss in (risk_memory.recent_hp_losses.get(actor.id, []) if risk_memory else [])
                              if world.round-2 <= r <= world.round), default=0)
         if (policy.lethal_entry_guard_enabled or actor.kind == "pioneer" or ((observed_loss > 0 or (risk_memory and actor.id in risk_memory.damaged_actors)) and actor.health <= 110)) and clock.phases == {"night"} and upper < actor.health:

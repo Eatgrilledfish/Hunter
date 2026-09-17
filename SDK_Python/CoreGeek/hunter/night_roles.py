@@ -248,7 +248,12 @@ def _fixed_stands(world, deadline, include_pioneer=True, task_actor=None, allow_
         field = distance_field(world, [actor.pos], actor.pos, deadline)
         reachable = goals & field.keys()
         if reachable:
-            result[actor.id] = min(reachable, key=lambda p: defence_duties.stand_rank(world, actor, p, field[p]))
+            from .guard_risk import maintenance_worker, evidence
+            if (maintenance_worker(world,actor) and actor.pos in reachable
+                    and not evidence(world,actor,actor.pos)['withdraw']):
+                result[actor.id]=actor.pos
+            else:
+                result[actor.id] = min(reachable, key=lambda p: defence_duties.stand_rank(world, actor, p, field[p]))
     return result if time.monotonic() < deadline else {}
 
 
@@ -463,8 +468,10 @@ def _fixed_w_transit(world, clock, deadline):
                 for q in area:
                     if time.monotonic() >= deadline:
                         raise BudgetExpired
-                    if 2*sum(r.attack_power for r in threats
-                             if distance(q,r.pos) <= r.attack_range) >= actor.health:
+                    from .guard_risk import maintenance_worker, evidence
+                    unsafe_here=(evidence(world,actor,q)['lethal'] if maintenance_worker(world,actor) else
+                        2*sum(r.attack_power for r in threats if distance(q,r.pos)<=r.attack_range)>=actor.health)
+                    if unsafe_here:
                         unsafe.add(q)
                 hazards[actor.id] = unsafe
             obstacles |= hazards[actor.id]

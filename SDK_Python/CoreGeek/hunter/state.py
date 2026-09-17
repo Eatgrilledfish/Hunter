@@ -146,7 +146,12 @@ class Session:
                 previous = self.recent_mover_injuries.get(u.id)
                 if loss:
                     injuries[u.id] = dict(round=world.round,loss=loss)
+                    # Reconcile precedes this frame's layout/roster publish.
+                    if (u.id==self.night_roster.w
+                            and getattr(getattr(world,'strategy_policy',None),'rear_open_enabled',False)):
+                        injuries[u.id]['position']=u.pos
                 elif (previous and u.health == old[1]
+                        and previous.get('position',u.pos)==u.pos
                         and 0 <= world.round-previous['round'] <= 2):
                     injuries[u.id] = previous
         # This is short-lived injury evidence, not fresh damage. Gaps,
