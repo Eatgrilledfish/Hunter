@@ -9,33 +9,48 @@ from .navigation import route
 from .protocol import distance, pos_json
 
 ITEMS = ('Bomb', 'DizzyWeapon')
+PURPOSE = 'night_attack_stock'
 
 
 @dataclass
 class DefenceProcurement:
     spent: dict = field(default_factory=dict)
-    pending: dict = field(default_factory=dict)
+    pending: dict = field(default_factory=dict)  # legacy, unused: receipts live in the market ledger
     offered: dict = field(default_factory=dict)
     diagnostic: dict = field(default_factory=dict)
 
     def reconcile(self, world, clock):
-        feedback = world.raw.get('lastRoundRoleActionResults', {})
-        feedback = feedback if isinstance(feedback, dict) else {}
-        for identity, order in list(self.pending.items()):
-            actor = world.ours.get(identity)
-            failed = world.round == order['round']+1 and feedback.get(identity) is False
-            covered = actor is not None and actor.backpack is not None and actor.inventory[order['name']] > order['prior_count']
-            if failed:
-                self.spent[order['day']] = max(0, self.spent.get(order['day'], 0)-order['price'])
-            if failed or covered:
-                self.pending.pop(identity)
+        receipts = getattr(world, 'purchase_receipts', None)
+        if receipts is None:
+            # Standalone use without the market ledger keeps its own receipts.
+            feedback = world.raw.get('lastRoundRoleActionResults', {})
+            feedback = feedback if isinstance(feedback, dict) else {}
+            for identity, order in list(self.pending.items()):
+                actor = world.ours.get(identity)
+                failed = world.round == order['round']+1 and feedback.get(identity) is False
+                covered = actor is not None and actor.backpack is not None and actor.inventory[order['name']] > order['prior_count']
+                if failed:
+                    self.spent[order['day']] = max(0, self.spent.get(order['day'], 0)-order['price'])
+                if failed or covered:
+                    self.pending.pop(identity)
+            self.spent = dict(sorted(self.spent.items())[-10:])
+            return
+        for order in receipts.values():
+            # Refund only this module's own failed day-budget charges.
+            if order.get('purpose') == PURPOSE and order.get('outcome') == 'failed' \
+                    and order.get('round') == world.round:
+                day = order.get('day')
+                self.spent[day] = max(0, self.spent.get(day, 0)-order.get('price', 0))
         # At most ten match days; retained unknown purchases do not disappear
         # merely because a new day or a skipped observation arrives.
         self.spent = dict(sorted(self.spent.items())[-10:])
 
     def candidates(self, world, clock, policy, deadline, task_actor=None, selected=(), guidance=None):
         self.offered = {}
-        self.diagnostic = {'status':'disabled', 'pending_purchases':len(self.pending),
+        market = getattr(world, 'procurement_market', None)
+        pending_count = len(self.pending) if market is None else sum(
+            market.purchase_pending(world, a.id) for a in world.movers)
+        self.diagnostic = {'status':'disabled', 'pending_purchases':pending_count,
                            'spent_this_day':self.spent.get(clock.day, 0)}
         if not policy.defence_procurement_enabled:
             return []
@@ -51,7 +66,12 @@ class DefenceProcurement:
         roster=getattr(world,'night_roster',None)
         actors = [a for a in world.movers if a.id != task_actor and (roster is None or a.id==roster.w)]
         self.diagnostic['status'] = 'inventory_or_purchase_unresolved'
-        if self.pending or any(a.backpack is None for a in actors):
+        if any(a.backpack is None for a in actors):
+            return []
+        if market is None:
+            if self.pending:
+                return []
+        elif any(market.purchase_pending(world, a.id) for a in actors):
             return []
         if any(a.inventory[name] for a in actors for name in ITEMS):
             self.diagnostic['status'] = 'use_existing_personal_stock_first'
@@ -102,6 +122,14 @@ class DefenceProcurement:
                                         'observed-wave resupply; current residual threat, personal buyer and bounded cost',
                                         gold_reserve=policy.reserve_gold if length == 0 else 0)
                               for i, command in enumerate(commands)]
+                if market is not None:
+                    tracked = []
+                    for c in candidates:
+                        if c.command.get('action') == 'buy':
+                            c = market.track(world, c, PURPOSE, step='checkout')
+                        if c is not None:
+                            tracked.append(c)
+                    candidates = tracked
                 candidates = [c for c in candidates if guidance is None or guidance.permit(c)]
                 if candidates:
                     options.append((-utility, price, length, actor.id, name, candidates))
@@ -120,6 +148,9 @@ class DefenceProcurement:
         for identity, order in self.offered.items():
             command = response['roleCommandMap'].get(identity, {})
             if command == {'action':'buy', 'name':order['name'], 'num':1}:
-                self.pending[identity] = dict(order)
+                # The day-budget charge stays here; the purchase receipt and its
+                # pending state belong to the market ledger when one is live.
                 self.spent[order['day']] = self.spent.get(order['day'], 0)+order['price']
+                if getattr(world, 'procurement_market', None) is None:
+                    self.pending[identity] = dict(order)
         self.offered = {}

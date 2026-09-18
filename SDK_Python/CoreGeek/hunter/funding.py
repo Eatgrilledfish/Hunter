@@ -135,6 +135,30 @@ def publish(world, clock, rules, policy, intelligence, deadline):
                 deadline=world.round+clock.until_night,expires=world.round,
                 last_progress_round=plan.get('last_progress_round'),deadline_source='reprice_each_frame'))
     allocate(world)
+    link_works(world)
+
+
+def link_works(world):
+    """Tag each grant with the active procurement work consuming it (design §4.4).
+
+    Matching is by owner plus item-name overlap with the work's quote, issued
+    command or confirmed receipts. Unmatched rows remain provisional quotes.
+    """
+    works = getattr(world, 'procurement_works', ())
+    if not works:
+        return
+    active = [w for w in works if w.status in ('ACTIVE', 'WAIT_RECEIPT', 'SUSPENDED')]
+    if not active:
+        return
+    for row in getattr(world, 'funding_plan', ()):
+        if row.get('work_id') or not row.get('demand_id'):
+            continue
+        for work in active:
+            if work.actor == row['owner'] and set(row['items']) & work.item_names():
+                row['work_id'] = work.work_id
+                work.grants.update({name: min(row.get('granted', 0), row['cost']) for name in row['items']})
+                work.demands = tuple(dict.fromkeys(work.demands + (row['demand_id'],)))
+                break
 
 
 def allocate(world):
@@ -184,6 +208,7 @@ def release_busy(world, excluded):
     world.funding_plan=[r for r in world.funding_plan
         if not (r['purpose'].endswith('_upgrade') and r['owner'] in excluded)]
     allocate(world)
+    link_works(world)
 
 
 def reserve_for(world, purpose):
@@ -196,7 +221,7 @@ def fulfilled(row, candidate, world):
             and command.get('name') in row['items'])
 
 
-def permits_bundle(world, candidates, spent):
+def permits_bundle(world, candidates, spent, released=()):
     rows=getattr(world,'funding_plan',())
     if not rows:
         return True
@@ -213,6 +238,8 @@ def permits_bundle(world, candidates, spent):
     for row in rows:
         if emergency:
             continue
+        if released and row.get('demand_id') in released:
+            continue  # Lapsed provisional grant (one-shot top-up pass only).
         credit=0
         for name,count in row['items'].items():
             used=min(count,credits[row['owner'],name])
@@ -220,6 +247,31 @@ def permits_bundle(world, candidates, spent):
             credits[row['owner'],name]-=used
         reserve+=max(0,row['granted']-credit)
     return world.gold is not None and spent+reserve<=world.gold
+
+
+def lapsable(world, selected):
+    """Provisional grants the chosen bundle neither consumes nor a committed work holds.
+
+    A grant linked to an ACTIVE/WAIT_RECEIPT/SUSPENDED procurement work is a
+    continuing reservation and never lapses merely because this frame's legal
+    step was a wait. Strategy floors (treasure) are protected separately via
+    candidate reserves and stay out of this release set.
+    """
+    bought=Counter()
+    for c in selected:
+        if c.command.get('action')=='buy':
+            bought[c.actor,c.command['name']]+=c.command.get('num',1)
+    committed=getattr(world,'committed_work_ids',set())
+    released=set()
+    for row in getattr(world,'funding_plan',()):
+        if row.get('granted',0)<=0 or row.get('purpose')=='treasure':
+            continue
+        if row.get('work_id') and row['work_id'] in committed:
+            continue
+        unpaid=sum(max(0,count-bought[row['owner'],name]) for name,count in row['items'].items())
+        if unpaid and row.get('demand_id'):
+            released.add(row['demand_id'])
+    return released
 
 
 def item_granted(world, actor, name, quantity=1):

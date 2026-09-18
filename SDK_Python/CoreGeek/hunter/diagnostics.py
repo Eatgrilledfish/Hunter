@@ -466,6 +466,31 @@ class Diagnostics(logging.Handler):
 
     def _work_item_events(self, state, raw, response, decision, units, number):
         """Never sample away item identity or confuse an offer with a receipt."""
+        # Procurement work events (2026-09-19 design §7): creation, transitions,
+        # first-blocker changes, receipts and selection. Unchanged waiting
+        # collapses into a per-work count.
+        markers=state.setdefault('work_markers',{})
+        collapsed_counts=state.setdefault('work_collapsed',{})
+        for event in array(decision.get('work_events')):
+            if not isinstance(event,dict):continue
+            work_id=event.get('work_id')
+            kind=event.get('event')
+            marker=(event.get('status'),event.get('step'),event.get('blocked_by'),event.get('reason'))
+            if kind=='blocked' and markers.get(work_id)==marker:
+                collapsed_counts[work_id]=collapsed_counts.get(work_id,0)+1
+                continue
+            collapsed=collapsed_counts.pop(work_id,0)
+            markers[work_id]=marker
+            self._write_compact('work',**{k:v for k,v in dict(
+                kind=kind,actor=event.get('actor'),work_id=work_id,revision=event.get('revision'),
+                status=event.get('status'),step=event.get('step'),deadline=event.get('deadline'),
+                grant=event.get('grant'),blocked_by=event.get('blocked_by'),reason=event.get('reason'),
+                last_confirmed_progress=event.get('last_confirmed_progress'),
+                previous=event.get('previous'),layer=event.get('layer'),
+                block_reason=event.get('block_reason'),next_action=event.get('next_action'),
+                item=event.get('item'),num=event.get('num'),received=event.get('received'),
+                target=event.get('target'),receipt=event.get('receipt'),purpose=event.get('purpose'),
+                collapsed=collapsed or None).items() if v is not None})
         orders=obj(decision.get('wall_upgrade_orders'))
         market=obj(decision.get('sunset_market'))
         upgrade=dict(orders=orders,wall_rebuild=decision.get('wall_rebuild'),market={k:market[k] for k in ('stage','buyer','quotes','excluded','blocked','worker_busy') if k in market},

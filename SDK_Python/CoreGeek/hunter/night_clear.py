@@ -20,7 +20,6 @@ class NightClear:
     returning: bool = False
     offered: dict = field(default_factory=dict)
     diagnostic: dict = field(default_factory=dict)
-    pending: dict = field(default_factory=dict)
 
     @staticmethod
     def material_reserve(world,clock,rules):
@@ -47,13 +46,9 @@ class NightClear:
 
     def prepare(self,world,clock,rules,policy,guidance,deadline):
         self.offered={};self.diagnostic={'stage':'inactive'}
-        if self.pending:
-            buyer=world.ours.get(self.pending['actor'])
-            feedback=world.raw.get('lastRoundRoleActionResults',{})
-            result=feedback.get(self.pending['actor']) if isinstance(feedback,dict) and world.round==self.pending['round']+1 else None
-            if (buyer and buyer.backpack is not None and buyer.inventory[self.pending['name']]>self.pending['before']
-                    or result is False or isinstance(result,dict) and result.get('success') is False):
-                self.pending={}
+        # Purchase receipts are consumed by the market ledger (design §6.3);
+        # this module only asks whether its worker has a buy in flight.
+        market=getattr(world,'procurement_market',None)
         if clock.phases!={'night'} or not defence_duties.enabled(world) or not policy.night_foraging_enabled:
             self.actor=None;self.returning=False
             return []
@@ -112,7 +107,8 @@ class NightClear:
                 if steps:command=dict(action='move',targetPos=[pos_json(steps[0])])
         elif back is not None and time.monotonic()<deadline:
             reach=distance_field(world,{worker.pos},worker.pos,deadline,blocked)
-            if not self.pending:
+            buy_in_flight=market is not None and market.purchase_pending(world,worker.id)
+            if not buy_in_flight:
                 command=self._investment(world,clock,rules,policy,worker,reach,home,blocked,horizon,deadline)
                 if command:stage='invest'
             sale={name:worker.inventory[name] for name in MINERALS
@@ -122,7 +118,7 @@ class NightClear:
                 sale['stone']=max(0,sale['stone']-keep)
                 if not sale['stone']:sale.pop('stone')
             vendors=interaction_cells(world,world.zones.get('vendor',()),worker.pos,blocked)
-            if not command and sale and not self.pending:
+            if not command and sale and not buy_in_flight:
                 command=self._funding_sale(world,rules,policy,worker,sale,reach,home,blocked,horizon,deadline)
                 if command:stage='fund_investment'
             if not command and sale and (sum(sale.values())>=policy.sell_batch or len(worker.backpack)>=worker.capacity
@@ -179,6 +175,13 @@ class NightClear:
         if not command:return []
         self.offered=dict(actor=worker.id,command=command)
         candidate=Candidate(worker.id,command,1100,'cleared own wave: '+stage+' using current passage and safe return')
+        if command.get('action')=='buy' and market is not None:
+            tracked=market.track(world,candidate,'night_clear_resupply',step='checkout')
+            if tracked is None:
+                self.offered={}
+                self.diagnostic=dict(stage='procurement_work_busy',actor=worker.id)
+                return []
+            candidate=tracked
         previous=guidance.duty_permit
         def permit(c):
             identity=c.command.get('controllerId') if c.command.get('action')=='attack' else c.actor
@@ -346,7 +349,6 @@ class NightClear:
 
     def finalize(self,world,response):
         if self.offered and response['roleCommandMap'].get(self.offered['actor'])==self.offered['command']:
+            # The market ledger records any purchase receipt; clearing keeps
+            # only its actor continuity here.
             self.actor=self.offered['actor']
-            command=self.offered['command']
-            if command['action']=='buy':
-                self.pending=dict(actor=self.actor,name=command['name'],before=world.ours[self.actor].inventory[command['name']],round=world.round)

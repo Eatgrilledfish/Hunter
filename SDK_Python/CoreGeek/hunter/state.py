@@ -108,6 +108,7 @@ class Session:
             self.origin = 0
         clock = Clock(world.round, self.origin)
         world.strategy_clock = clock
+        world.wall_rebuild_plan = self.wall_rebuild.plan
         self.wall_health.observe(world, clock, self)
         self.wall_pressure.observe(world, clock)
         self.opening_wave.observe(world,clock)
@@ -300,6 +301,10 @@ class Session:
         self.intelligence.reconcile(world, clock, self)
         self.llm_channel.sync(self,world)
         self.opponent.reconcile(world, clock)
+        # The procurement ledger consumes purchase receipts before dependent
+        # budget keepers read their read-only outcome view (design §6.1).
+        self.sunset_market.reconcile_work(world, clock)
+        world.purchase_receipts = self.sunset_market.recent_receipts
         self.defence.reconcile(world, clock)
         self.medical.reconcile(world, clock)
         self.repair_supply.reconcile(world, clock)

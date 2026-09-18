@@ -32,6 +32,8 @@ class MedicalSupply:
     def reconcile(self, world, clock):
         feedback = world.raw.get('lastRoundRoleActionResults', {})
         feedback = feedback if isinstance(feedback, dict) else {}
+        w = getattr(getattr(world, 'night_roster', None), 'w', None)
+        receipts = getattr(world, 'purchase_receipts', {})
         for identity, order in list(self.pending.items()):
             actor = world.ours.get(identity)
             failed = world.round == order['round']+1 and feedback.get(identity) is False
@@ -40,6 +42,13 @@ class MedicalSupply:
                 self.spent[order['day']] = max(0, self.spent.get(order['day'], 0)-order['price'])
             if failed or observed:
                 self.pending.pop(identity)
+        # W's purchases migrated to the market ledger; refund its failed
+        # emergency-treatment charge from the ledger's read-only outcome view.
+        for order in receipts.values():
+            if order.get('purpose') == 'emergency_medical' and order.get('outcome') == 'failed' \
+                    and order.get('round') == world.round:
+                day = order.get('day')
+                self.spent[day] = max(0, self.spent.get(day, 0)-order.get('price', 0))
         self.spent = dict(sorted(self.spent.items())[-10:])
 
     def candidates(self, world, clock, rules, policy, deadline, guidance, excluded=(), *, construction_jobs=None):
@@ -119,6 +128,11 @@ class MedicalSupply:
                     continue
             if actor.id in self.pending or actor.capacity is None or len(actor.backpack) >= actor.capacity:
                 continue
+            w_identity = getattr(getattr(world, 'night_roster', None), 'w', None)
+            market = getattr(world, 'procurement_market', None)
+            migrated_w = market is not None and actor.id == w_identity
+            if migrated_w and market.purchase_pending(world, actor.id):
+                continue
             price = world.shop.get('Medicine')
             from .day_schedule import day_endpoints
             goals = ({guidance.operator_stands[actor.id]} if actor.id in guidance.operator_stands else
@@ -157,6 +171,17 @@ class MedicalSupply:
                                 ('complete low-HP treatment trip before optional daytime work' if treatment else
                                  'idle role obtains one personal emergency Medicine before returning'), gold_reserve=reserve)
                       for i, command in enumerate(commands)]
+            if migrated_w:
+                # W's medicine buys join the single procurement ledger; genuine
+                # treatment preempts an unpaid in-progress trip (§5.5).
+                tracked = []
+                for c in offers:
+                    if c.command.get('action') == 'buy':
+                        c = market.track(world, c, 'emergency_medical', step='checkout',
+                                         preempt=treatment, preempt_reason='emergency_medical')
+                    if c is not None:
+                        tracked.append(c)
+                offers = tracked
             if detour:
                 guidance.medical_detour_actors.add(actor.id)
                 permission=guidance.treatment_view(actor.id)
@@ -183,8 +208,14 @@ class MedicalSupply:
             if response['roleCommandMap'].get(identity) in order['commands']:
                 self.detours[identity]=dict(order['plan'])
         self.offered_detours={}
+        w_identity = getattr(getattr(world, 'night_roster', None), 'w', None)
         for identity, order in self.offered.items():
             if response['roleCommandMap'].get(identity) == {'action': 'buy', 'name': 'Medicine', 'num': 1}:
+                if identity == w_identity and getattr(world, 'procurement_market', None) is not None:
+                    # The market ledger owns W's purchase pending; keep only the
+                    # day-budget charge here.
+                    self.spent[order['day']] = self.spent.get(order['day'], 0)+order['price']
+                    continue
                 self.pending[identity] = dict(order)
                 self.spent[order['day']] = self.spent.get(order['day'], 0)+order['price']
         self.offered = {}

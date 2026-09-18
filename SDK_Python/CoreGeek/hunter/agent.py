@@ -144,10 +144,14 @@ class Agent:
             from . import day_access
             day_access.prepare(world,clock,min(start+self.policy.planning_seconds,time.monotonic()+.025),draft.day_access_choice)
             economy.prepare_wall_cycle(world, clock, self.rules, self.policy)
+            draft.sunset_market.begin_frame(world)
             draft.sunset_market.publish_checkout_targets(world)
             draft.wall_service.prepare(world, self.rules)
             draft.repair.publish_demand(world,clock,self.rules,self.policy,
                 min(start+self.policy.planning_seconds,time.monotonic()+.04))
+            # Quote-independent invalidation precedes grant publication (E5);
+            # WallRebuild action planning still runs at its original point.
+            draft.wall_rebuild.reconcile(world, clock, self.rules, self.policy, draft)
             funding.publish(world,clock,self.rules,self.policy,draft.intelligence,
                             min(start+self.policy.planning_seconds,time.monotonic()+.04))
             daily = draft.sunset_market.caretaker_day
@@ -708,7 +712,8 @@ class Agent:
             decision = select(world, clock, self.rules, self.policy, candidates, deadline,
                               task_actor=task_actor, weights=weights,
                               task_moves=guidance.task_moves, allow_task_control=guidance.allow_task_control,
-                              incumbent=incumbent_candidates, summon_remaining=draft.opponent.remaining)
+                              incumbent=incumbent_candidates, summon_remaining=draft.opponent.remaining,
+                              funding_topup=True)
             joint_report = {"status": "inactive"}
             if self.policy.joint_lookahead_enabled:
                 try:
@@ -766,6 +771,7 @@ class Agent:
                       "elapsed_ms": (time.monotonic()-start)*1000, "actions": len(response["roleCommandMap"]),
                       "selected": [{"actor": c.actor, "reason": c.reason} for c in decision.selected],
                       "rejected": decision.rejected, "module_errors": module_errors,
+                      "selection_report": decision.report,
                       "warnings": world.warnings, "origin": draft.origin,
                       "rule_observation_differences": self.rules.observation_differences(world),
                       "wall_health_levels": draft.wall_health.levels,
@@ -820,6 +826,12 @@ class Agent:
                       "wall_rebuild":draft.wall_rebuild.diagnostic,
                       "funding_plan":world.funding_plan,
                       "work_rejections":getattr(world,'work_rejections',[]),
+                      "work_events":getattr(world,'work_events',[]),
+                      "procurement_works":[dict(work_id=w.work_id,actor=w.actor,purpose=w.purpose,
+                          status=w.status,step=w.step,revision=w.revision,deadline=w.deadline,
+                          blocked_by=w.blocked_by,reason=w.reason,
+                          last_confirmed_progress=w.last_confirmed_progress)
+                          for w in getattr(world,'procurement_works',[])],
                       "treasure_inventory":draft.intelligence.inventory_report(world),
                       "guard_stock":getattr(world,'guard_stock_report',{}),
                       "guard_funding":getattr(world,'guard_funding_report',{}),

@@ -9,6 +9,7 @@ from math import ceil
 import time
 
 from . import defence_duties, procurement
+from . import procurement_work as pw
 from .arbitration import Candidate
 from .day_schedule import DaySchedule, weighted_field
 from .day_division import DayDivision
@@ -708,6 +709,22 @@ class CaretakerDay:
             if actor.id in jobs:
                 jobs[actor.id]['defer_build'] = False
                 jobs[actor.id]['stock_target'] = min(jobs[actor.id].get('stock_target',0),actor.inventory['stone'])
+        if phase in {'sell', 'buy', 'use'} and choices:
+            # The day's sell/checkout/deliver circuit is one procurement work
+            # owned by the market ledger; candidates carry its reference (§4.3).
+            market = getattr(world, 'procurement_market', None)
+            if market is not None:
+                work = market.work_for(world, actor.id, 'day_checkout')
+                if work is not None:
+                    orders = {c.command['name']: c.command.get('num', 1)
+                              for c in choices if c.command.get('action') == 'buy'}
+                    clock = getattr(world, 'strategy_clock', None)
+                    market.attach_quote(world, work, pw.Quote(
+                        status=pw.FEASIBLE, round=world.round, actor=actor.id, orders=orders,
+                        cost=sum(world.shop.get(n, 0)*num for n, num in orders.items()),
+                        deadline=(world.round+clock.until_night) if clock is not None else None,
+                        source='caretaker_day:'+phase))
+                    choices = market.propose_step(world, work, choices, phase)
         preview = copy(guidance)
         preview.return_routes = {i:r for i,r in guidance.return_routes.items() if i != actor.id}
         world.sunset_actions[actor.id] = [c.command for c in choices]

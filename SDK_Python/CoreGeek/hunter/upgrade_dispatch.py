@@ -3,6 +3,7 @@ from copy import copy
 import time
 
 from . import defence_duties, supply_basket
+from . import procurement_work as pw
 from .arbitration import Candidate
 from .day_schedule import weighted_field, DaySchedule
 from .navigation import distance_field, interaction_cells
@@ -119,6 +120,17 @@ def prepare(market, world, clock, rules, policy, guidance, jobs, excluded, deadl
         proposals.append((priority,actor,choices,trip,stage,item,num))
     if not proposals:return []
     _,actor,choices,trip,stage,item,num=min(proposals,key=lambda p:p[0])
+    if actor.id == roster.w:
+        # W's basket/delivery circuit is one procurement work in the ledger.
+        work = market.work_for(world, actor.id, 'day_checkout')
+        if work is not None:
+            market.attach_quote(world, work, pw.Quote(
+                status=pw.FEASIBLE if trip.get('fits', True) else pw.quote_status_for('no_route'),
+                round=world.round, actor=actor.id, orders=dict(trip.get('orders', {})),
+                required=trip.get('required'), reserve=trip.get('reserve') or 0,
+                cost=sum(world.shop.get(n, 0)*c for n, c in trip.get('orders', {}).items()),
+                source='upgrade_dispatch'))
+            choices = market.propose_step(world, work, choices, stage)
     if stage=='day_repair':
         world.maintenance_targets=dict(getattr(world,'maintenance_targets',{}))
         world.maintenance_targets[trip['maintenance']['target']]=actor.id

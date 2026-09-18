@@ -5,10 +5,11 @@ import time
 
 from .arbitration import Candidate
 from .navigation import distance_field, interaction_cells, neighbours
-from .protocol import MINERALS, WEAPONS, distance, pos_json
+from .protocol import MINERALS, WEAPONS, distance, fingerprint, pos_json
 from .day_schedule import day_endpoints
 from .night_roles import defender_ids
 from . import procurement
+from . import procurement_work as pw
 from .caretaker_day import CaretakerDay
 
 
@@ -39,6 +40,169 @@ class SunsetMarket:
     checkout_primary: str | None = None
     maintenance_assignment: dict = field(default_factory=dict)
     caretaker_day: CaretakerDay = field(default_factory=CaretakerDay)
+    # Authoritative W procurement work records (2026-09-19 design §4.3).
+    works: dict = field(default_factory=dict)          # work_id -> ProcurementWork
+    work_seq: dict = field(default_factory=dict)       # (actor, purpose) -> int
+    work_offers: dict = field(default_factory=dict)    # this frame: (actor, command fingerprint) -> work_id
+    recent_receipts: dict = field(default_factory=dict)  # actor -> last purchase receipt outcome
+    reconciled_round: int = -1
+
+    def begin_frame(self, world):
+        """Per-frame init before any consumer; publishes the work views."""
+        if getattr(world, 'work_events', None) is None:
+            world.work_events = []
+        self.work_offers = {}
+        for work in self.works.values():
+            if work.status not in pw.TERMINAL:
+                work.grants = {}
+        world.procurement_market = self
+        world.procurement_works = list(self.works.values())
+        world.committed_work_ids = {w.work_id for w in self.works.values()
+                                    if w.status in (pw.ACTIVE, pw.WAIT_RECEIPT, pw.SUSPENDED)}
+
+    def active_work(self, actor):
+        """At most one active procurement trip per actual actor (design §4.3)."""
+        for work in self.works.values():
+            if work.actor == actor and work.status not in pw.TERMINAL:
+                return work
+        return None
+
+    def work_for(self, world, actor, purpose, *, deadline=None, preempt=False, preempt_reason=None):
+        existing = self.active_work(actor)
+        if existing is not None:
+            if existing.purpose == purpose:
+                return existing
+            if not preempt or existing.status == pw.WAIT_RECEIPT:
+                return None  # A receipt in flight is never preempted (§5.3).
+            if existing.status in (pw.PROPOSED, pw.ACTIVE):
+                existing.preemption = dict(reason=preempt_reason or purpose, round=world.round,
+                                           resume='requote after '+purpose)
+                existing.transition(world, pw.SUSPENDED, reason='preempted_by_'+purpose)
+            else:
+                return None
+        seq = self.work_seq.get((actor, purpose), 0) + 1
+        self.work_seq[(actor, purpose)] = seq
+        work = pw.ProcurementWork(work_id=f'{actor}:{purpose}:{seq}', epoch=getattr(world, 'session_epoch', 0),
+                                  actor=actor, purpose=purpose, created=world.round,
+                                  last_confirmed_progress=world.round, deadline=deadline)
+        self.works[work.work_id] = work
+        pw.emit(world, work, 'created', purpose=purpose)
+        return work
+
+    def attach_quote(self, world, work, quote):
+        """Quote evidence attaches to the work; never marks success (§6.2)."""
+        work.quote = quote
+        work.revision += 1
+        work.deadline = quote.deadline or work.deadline
+        if quote.status != pw.FEASIBLE:
+            layer = 'funding' if quote.status == pw.CASH_DEFICIT else \
+                    'target' if quote.status == pw.TARGET_INVALID else 'quote'
+            work.block(world, layer, quote.reason or quote.status)
+        return quote
+
+    def propose_step(self, world, work, candidates, step):
+        """Candidates carry the work reference; no execution fact advances here."""
+        if work.status in (pw.PROPOSED, pw.SUSPENDED):
+            work.transition(world, pw.ACTIVE, step=step)
+            if work.preemption:
+                work.preemption = None
+        else:
+            work.step = step
+        work.unblock()
+        for candidate in candidates:
+            candidate.work_id = work.work_id
+            self.work_offers[(candidate.actor, fingerprint(candidate.command))] = work.work_id
+            if candidate.command.get('action') == 'buy':
+                self._commit_purchase_reserve(world, candidate)
+        if candidates:
+            pw.emit(world, work, 'proposed', next_action=candidates[0].command.get('action'),
+                    item=candidates[0].command.get('name'))
+        return candidates
+
+    @staticmethod
+    def _commit_purchase_reserve(world, candidate):
+        """Apply at creation what the purchase gate used to mutate mid-permit (E4).
+
+        Mirrors purchase_permitted's branch order exactly: branches that used
+        to return True without mutating still leave the reserve untouched.
+        """
+        from .wall_policy import investment_fund, minimum_stock
+        command = candidate.command
+        name = command.get('name', '')
+        actor = world.ours.get(candidate.actor)
+        if actor is None:
+            return
+        if (not getattr(world, 'staged_walls', False)
+                or not getattr(getattr(world, 'strategy_policy', None), 'upgrade_commitment_enabled', True)):
+            return
+        from .funding import item_granted
+        if item_granted(world, actor.id, name, command.get('num', 1)):
+            return
+        if 'UpgradeVoucher' in name:
+            return
+        if name == 'Medicine':
+            from .medical import needs_treatment
+            clock = getattr(world, 'strategy_clock', None)
+            if (actor.health <= (200 if actor.kind == 'pioneer' else 220)*.5
+                    or clock and needs_treatment(world, actor, clock)):
+                return
+        if name == 'WallFixer' and getattr(world, 'critical_base_ids', ()):
+            return
+        guard = getattr(world, 'essential_guard_stock', {}).get((actor.id, name), {})
+        repair = getattr(world, 'essential_repair_stock', {}).get(actor.id, {})
+        if (actor.id == getattr(getattr(world, 'night_roster', None), 'w', None)
+                and name in {'DizzyWeapon', 'Bomb'} and actor.inventory[name] < 1
+                and guard.get('round') == world.round and guard.get('price') == world.shop.get(name)
+                and command.get('num', 1) == 1 == guard.get('count')):
+            candidate.gold_reserve = max(candidate.gold_reserve, getattr(world, 'treasure_reserved_gold', 0))
+            return
+        if name == 'WallFixer' and repair.get('round') == world.round \
+                and 0 < command.get('num', 1) <= repair.get('count', 0):
+            candidate.gold_reserve = max(candidate.gold_reserve, getattr(world, 'treasure_reserved_gold', 0))
+            return
+        if name.endswith('SummonOrder'):
+            return
+        minimum = max(0, minimum_stock(world, actor, name) - actor.inventory[name])
+        reserve, item = investment_fund(world, preserve_reconstruction=command.get('num', 1) > minimum)
+        candidate.gold_reserve = max(candidate.gold_reserve, reserve)
+        candidate.gold_reserve_item = item
+
+    def track(self, world, candidate, purpose, *, step='checkout', deadline=None, preempt=False,
+              preempt_reason=None):
+        """Single entry for any migrated W buy candidate; no separate pending."""
+        work = self.work_for(world, candidate.actor, purpose, deadline=deadline, preempt=preempt,
+                             preempt_reason=preempt_reason)
+        if work is None:
+            return None
+        self.attach_quote(world, work, pw.Quote(
+            status=pw.FEASIBLE, round=world.round, actor=candidate.actor,
+            orders={candidate.command['name']: candidate.command.get('num', 1)},
+            cost=world.shop.get(candidate.command.get('name'), 0) * candidate.command.get('num', 1),
+            deadline=deadline, source=purpose))
+        return self.propose_step(world, work, [candidate], step)[0]
+
+    def purchase_pending(self, world, actor):
+        return actor in self.pending
+
+    def receipt_outcome(self, world, actor):
+        """Read-only last purchase receipt evidence for migrated budget keepers."""
+        row = self.recent_receipts.get(actor)
+        return row if row and world.round <= row['round'] + 1 else None
+
+    def rebind_delivery(self, world, old_id, new_wall, extra_bindings=None):
+        """WallRebuild supplies the new wall instance; bindings rebind here (§3)."""
+        for owner, targets in list(self.checkout_targets.items()):
+            self.checkout_targets[owner] = [(new_wall.id if uid == old_id else uid, level)
+                                            for uid, level in targets]
+        for owner, targets in (extra_bindings or {}).items():
+            saved = self.checkout_targets.setdefault(owner, [])
+            for _, level in targets:
+                if (new_wall.id, level) not in saved:
+                    saved.append((new_wall.id, level))
+        for work in self.works.values():
+            if work.bindings:
+                work.bindings = [(new_wall.id if uid == old_id else uid, level)
+                                 for uid, level in work.bindings]
 
     def publish_checkout_targets(self,world):
         """Expose live paid ownership before repair and night candidates run."""
@@ -69,17 +233,15 @@ class SunsetMarket:
             world.maintenance_targets=dict(getattr(world,'maintenance_targets',{}))
             world.maintenance_targets[target.id]=job['owner']
 
-    def prepare(self, world, clock, rules, policy, guidance, jobs, excluded, deadline):
-        guidance.market_permit = lambda candidate: permits(world, candidate)
-        world.pioneer_trade_stands = guidance.operator_stands
-        world.sunset_actions = {}
-        world.sunset_buyer = None
-        world.checkout_cash_reserve = 0
-        # NightClear runs before this planner. Preserve its current-round,
-        # route-validated authorization even when daylight work is inactive.
-        world.essential_repair_stock = {i:r for i,r in getattr(world,'essential_repair_stock',{}).items()
-                                        if r.get('round')==world.round}
-        self.diagnostic = {'stage':'inactive'}
+    def reconcile_work(self, world, clock):
+        """Receipt-driven work progression (design §5/§6.2 reconcile_work).
+
+        Consumes last round's purchase/delivery feedback exactly once per frame,
+        advances the linked work records, and applies terminal/release rules.
+        """
+        if self.reconciled_round == world.round:
+            return
+        self.reconciled_round = world.round
         for identity, order in list(self.pending.items()):
             actor = world.ours.get(identity)
             feedback = world.raw.get('lastRoundRoleActionResults', {})
@@ -104,6 +266,28 @@ class SunsetMarket:
             absent=(world.round>order['round']+1 and known and delta==0
                     and actor.inventory[order['name']]<=order['prior'])
             if failed or arrived or absent:
+                outcome='failed' if failed else 'confirmed' if arrived else 'unknown'
+                self.recent_receipts[identity]=dict(round=world.round,outcome=outcome,
+                    name=order['name'],price=order.get('price',0),day=order.get('day',clock.day),
+                    purpose=order.get('purpose'),received=delta)
+                work=self.works.get(order.get('work') or '')
+                if work is not None and work.status not in pw.TERMINAL:
+                    work.issued=None
+                    if arrived:
+                        work.confirmed[order['name']]=work.confirmed.get(order['name'],0)+delta
+                        work.last_confirmed_progress=world.round
+                        work.transition(world,pw.ACTIVE,reason=None)
+                    elif failed:
+                        # A confirmed failure requotes from the current snapshot;
+                        # draft.failed backoff prevents an unconditional resend.
+                        work.transition(world,pw.ACTIVE,reason='buy_failed')
+                        work.block(world,'receipt','buy_failed')
+                    else:
+                        # An unknown receipt is not success and never locks W
+                        # permanently; the fresh snapshot re-proves any deficit.
+                        work.transition(world,pw.ACTIVE,reason='receipt_unknown')
+                        work.block(world,'receipt','receipt_unknown')
+                    pw.emit(world,work,'receipt',receipt=outcome,item=order['name'],received=delta)
                 self.pending.pop(identity)
         for identity,order in list(self.delivery_pending.items()):
             if world.round<=order['round']:continue
@@ -117,13 +301,106 @@ class SunsetMarket:
                 and actor.backpack is not None and actor.inventory[order['name']]==order['prior']
                 and target and target.alive and target.pos==order['position'] and target.level==order['level'])
             if failed or changed or consumed or not_applied:
+                confirmed=bool(not failed and consumed and target and target.alive and target.pos==order['position']
+                               and target.level==order['level']+1)
                 self.delivery_receipts.append(dict(actor=identity,item=order['name'],target=order['target'],
                     issued=order['round'],observed=world.round,consumed=consumed,
-                    confirmed=bool(not failed and consumed and target and target.alive and target.pos==order['position']
-                                   and target.level==order['level']+1),failed=failed,not_applied=not_applied))
+                    confirmed=confirmed,failed=failed,not_applied=not_applied))
                 self.delivery_receipts=self.delivery_receipts[-40:]
+                work=self.works.get(order.get('work') or '')
+                if work is not None and work.status not in pw.TERMINAL:
+                    work.issued=None
+                    if confirmed:
+                        work.last_confirmed_progress=world.round
+                        work.bindings=[b for b in work.bindings
+                                       if not (b[0]==order['target'])]
+                        work.transition(world,pw.ACTIVE,step=work.step,reason=None)
+                    else:
+                        work.block(world,'receipt','delivery_failed' if failed else
+                                   'target_changed' if changed else 'delivery_not_applied')
+                    pw.emit(world,work,'receipt',receipt='confirmed' if confirmed else
+                            'failed' if failed else 'changed' if changed else 'not_applied',
+                            item=order['name'],target=order['target'])
                 self.delivery_pending.pop(identity)
         world.checkout_use_pending=set(self.delivery_pending)
+        world.checkout_pending_actors=set(self.pending)
+        self._sweep_works(world, clock)
+
+    def _sweep_works(self, world, clock):
+        """Terminal rules: observed completion, invalidation, bounded history."""
+        day_changed=self.day is not None and clock.day is not None and self.day!=clock.day
+        rebuild_plan=getattr(world,'wall_rebuild_plan',None)
+        for work in list(self.works.values()):
+            if work.status in pw.TERMINAL:
+                continue
+            actor=world.ours.get(work.actor)
+            if actor is None or not actor.alive or actor.backpack is None:
+                # Death/replacement: the old role's inventory stays with it;
+                # the successor takes new work with its own resources (§5.7).
+                work.transition(world,pw.CANCELLED,reason='actor_unavailable')
+                continue
+            if work.issued or work.actor in self.pending or work.actor in self.delivery_pending:
+                continue  # Receipts in flight; never judge from a missing observation.
+            if work.bindings:
+                continue  # Paid delivery obligations survive pause and target change.
+            orders=dict(work.quote.orders) if work.quote else {}
+            if orders and all(work.confirmed.get(name,0)>=num for name,num in orders.items()):
+                work.transition(world,pw.DONE,reason='confirmed')
+                continue
+            if work.purpose=='emergency_medical' and (actor.inventory['Medicine'] or actor.health>=220):
+                work.transition(world,pw.DONE,reason='observed_stock_or_health')
+                continue
+            if work.purpose=='wall_rebuild_supply' and not rebuild_plan:
+                work.transition(world,pw.CANCELLED,reason='rebuild_plan_released')
+                continue
+            if day_changed and work.purpose in ('day_checkout','night_stock','upgrade_chain'):
+                work.transition(world,pw.CANCELLED,reason='day_expired')
+                continue
+            if clock.phases=={'day'} and work.purpose in ('night_clear_resupply','night_attack_stock'):
+                work.transition(world,pw.CANCELLED,reason='night_ended')
+                continue
+            last=max(work.created,work.last_confirmed_progress,
+                     work.quote.round if work.quote else 0,work.blocked_since or 0)
+            if world.round-last>130:
+                work.transition(world,pw.CANCELLED,reason='stale_unprogressed')
+        terminal=[w for w in self.works.values() if w.status in pw.TERMINAL]
+        if len(terminal)>24:
+            for work in sorted(terminal,key=lambda w:w.history[-1]['round'] if w.history else 0)[:-24]:
+                self.works.pop(work.work_id,None)
+        world.procurement_works=list(self.works.values())
+        world.committed_work_ids={w.work_id for w in self.works.values()
+                                  if w.status in (pw.ACTIVE,pw.WAIT_RECEIPT,pw.SUSPENDED)}
+
+    def cancel_for_critical_base(self, world):
+        """A new survival priority overrides unpaid routine purchases (§5.5).
+
+        Mirrors the legacy checkout clearing: unpaid work cancels; a work whose
+        paid bindings were just cleared stays active on inventory facts and
+        re-matches its targets after the emergency.
+        """
+        for work in self.works.values():
+            if work.status in pw.TERMINAL or work.purpose == 'emergency_medical':
+                continue
+            if work.issued or work.actor in self.pending or work.actor in self.delivery_pending:
+                continue  # Paid responsibility and in-flight receipts are kept.
+            if work.bindings:
+                work.bindings = []
+                work.transition(world, pw.ACTIVE, reason='critical_base_bindings_released')
+                continue
+            work.transition(world, pw.CANCELLED, reason='critical_base_survival_priority')
+
+    def prepare(self, world, clock, rules, policy, guidance, jobs, excluded, deadline):
+        guidance.market_permit = lambda candidate: permits(world, candidate)
+        world.pioneer_trade_stands = guidance.operator_stands
+        world.sunset_actions = {}
+        world.sunset_buyer = None
+        world.checkout_cash_reserve = 0
+        # NightClear runs before this planner. Preserve its current-round,
+        # route-validated authorization even when daylight work is inactive.
+        world.essential_repair_stock = {i:r for i,r in getattr(world,'essential_repair_stock',{}).items()
+                                        if r.get('round')==world.round}
+        self.diagnostic = {'stage':'inactive'}
+        self.reconcile_work(world, clock)
         if self.day != clock.day:
             self.day = clock.day; self.started = False; self.settled.clear()
             self.upgrade_travellers.clear()
@@ -161,6 +438,7 @@ class SunsetMarket:
         if getattr(world,'critical_base_ids',()):
             self.checkout_intents.clear()  # New survival priority overrides routine purchases.
             self.checkout_targets.clear()
+            self.cancel_for_critical_base(world)
         world.checkout_order_limits=dict(self.checkout_intents)
         self.checkout_deliveries={i for i in self.checkout_deliveries if i in world.ours
             and any(n and 'UpgradeVoucher' in k for k,n in world.ours[i].inventory.items())}
@@ -415,8 +693,21 @@ class SunsetMarket:
                         choices=([Candidate(buyer.id,{'action':'buy','name':name,'num':num},180,
                                             'final checkout with observed team gold',gold_reserve=reserve)]
                                  if length==0 else moves(buyer,route,'designated buyer night-stock checkout'))
-                        install(buyer,choices,'checkout')
-                        self.diagnostic.update(stage='checkout',item=name,num=num,gold=world.gold)
+                        if buyer.id==world.night_roster.w:
+                            work=self.work_for(world,buyer.id,'night_stock',deadline=world.round+clock.until_night)
+                            if work is None:
+                                choices=[]
+                                self.diagnostic.update(stage='checkout',blocked='procurement_work_busy')
+                            else:
+                                self.attach_quote(world,work,pw.Quote(status=pw.FEASIBLE,round=world.round,
+                                    actor=buyer.id,orders={name:num},cost=world.shop.get(name,0)*num,
+                                    reserve=reserve,deadline=world.round+clock.until_night,source='checkout'))
+                                choices=self.propose_step(world,work,choices,'checkout')
+                        if choices:
+                            install(buyer,choices,'checkout')
+                            self.diagnostic.update(stage='checkout',item=name,num=num,gold=world.gold)
+                        elif buyer.id==world.night_roster.w:
+                            self.diagnostic['blocked']='procurement_work_busy'
                     else:
                         choices=moves(buyer,home(buyer),'night stock ready or unaffordable: return before dusk')
                         if not choices and buyer.pos in home(buyer):world.sunset_actions[buyer.id]=[]
@@ -489,6 +780,13 @@ class SunsetMarket:
                                'maintenance worker buys personal night supplies',gold_reserve=reserve)]
                     if not length else moves(buyer,distance_field(world,[stand],buyer.pos,deadline),
                                               'maintenance worker stocks supplies before dusk'))
+        work=self.work_for(world,identity,'night_stock',deadline=world.round+clock.until_night)
+        if work is None:
+            self.diagnostic['blocked']='procurement_work_busy';return []
+        self.attach_quote(world,work,pw.Quote(status=pw.FEASIBLE,round=world.round,actor=identity,
+            orders={name:num},cost=world.shop.get(name,0)*num,reserve=reserve,
+            deadline=world.round+clock.until_night,required=total,source='worker_stock'))
+        candidates=self.propose_step(world,work,candidates,'checkout')
         preview=copy(guidance)
         preview.return_routes={i:r for i,r in guidance.return_routes.items() if i!=identity}
         candidates=[c for c in candidates if preview.permit(c)]
@@ -540,7 +838,29 @@ class SunsetMarket:
                 return name,min(num,buyer.capacity-len(buyer.backpack),cash//price),reserve
         return None
 
+    def record_selected(self, world, response):
+        """Only actually issued commands create pending evidence (§6.2).
+
+        Work-linked commands advance their record to WAIT_RECEIPT; offered but
+        unselected candidates create nothing and leave the work Active.
+        """
+        for actor, command in response['roleCommandMap'].items():
+            work = self.works.get(self.work_offers.get((actor, fingerprint(command)), ''))
+            if work is None or work.status in pw.TERMINAL:
+                continue
+            action = command.get('action')
+            if action == 'buy':
+                work.issued = dict(command=dict(command), round=world.round)
+                work.transition(world, pw.WAIT_RECEIPT, step='checkout', reason=None)
+                pw.emit(world, work, 'selected', next_action='buy', item=command.get('name'),
+                        num=command.get('num', 1))
+            elif action == 'use' and 'UpgradeVoucher' in command.get('name', ''):
+                work.issued = dict(command=dict(command), round=world.round)
+                work.transition(world, pw.WAIT_RECEIPT, step='deliver', reason=None)
+                pw.emit(world, work, 'selected', next_action='use', item=command.get('name'))
+
     def finalize(self, world, response):
+        self.record_selected(world, response)
         courier=self.diagnostic.get('buyer')
         issued=response['roleCommandMap'].get(courier,{})
         actor=world.ours.get(courier)
@@ -564,20 +884,27 @@ class SunsetMarket:
             from .rear_open import enabled as rear_enabled
             maintenance_order=(rear_enabled(world) and actor in (world.night_roster.w,world.night_roster.p)
                                and command.get('name') in {'WallFixer','Medicine','Bomb','DizzyWeapon'})
-            if command.get('action')=='buy' and ('UpgradeVoucher' in command.get('name','') or maintenance_order):
+            work_id=self.work_offers.get((actor,fingerprint(command)))
+            work_purpose=self.works[work_id].purpose if work_id in self.works else None
+            if command.get('action')=='buy' and ('UpgradeVoucher' in command.get('name','') or maintenance_order
+                                                 or work_id):
                 self.pending.setdefault(actor,dict(name=command['name'],num=command.get('num',1),
-                    prior=world.ours[actor].inventory[command['name']],round=world.round))
+                    prior=world.ours[actor].inventory[command['name']],round=world.round,
+                    work=work_id,purpose=work_purpose,price=world.shop.get(command['name'],0),
+                    day=getattr(getattr(world,'strategy_clock',None),'day',None)))
             if command.get('action')=='use' and 'UpgradeVoucher' in command.get('name',''):
                 target=next((u for u in world.ours.values() if u.pos==tuple(
                     command['targetPos'][0][k] for k in ('x','y'))),None)
                 if target and actor not in self.delivery_pending:
                     self.delivery_pending[actor]=dict(name=command['name'],prior=world.ours[actor].inventory[command['name']],
-                        target=target.id,position=target.pos,level=target.level,round=world.round)
+                        target=target.id,position=target.pos,level=target.level,round=world.round,work=work_id)
             if (command.get('action')=='buy' and 'UpgradeVoucher' in command.get('name','')
                     and actor in getattr(world,'quoted_checkout_targets',{})):
                 # Preserve the feasible delivery subset, not hypothetical
                 # inventory. Matching still consumes only observed vouchers.
                 self.checkout_targets[actor]=world.quoted_checkout_targets[actor]
+                if work_id and work_id in self.works:
+                    self.works[work_id].bindings=list(world.quoted_checkout_targets[actor])
             if (command.get('action')=='use' and 'UpgradeVoucher' in command.get('name','')
                     and command in getattr(world,'sunset_actions',{}).get(actor,())):
                 self.upgrade_travellers.add(actor)
@@ -594,8 +921,13 @@ class SunsetMarket:
                 and getattr(world,'upgrade_checkout_actor',None)==worker):
             self.upgrade_owner=worker
         if cmd.get('action')=='buy':
+            buyer_work=self.work_offers.get((identity,fingerprint(cmd)))
             self.pending[identity]={'name':cmd['name'],'prior':world.ours[identity].inventory[cmd['name']],
-                                    'round':world.round,'num':cmd.get('num',1)}
+                                    'round':world.round,'num':cmd.get('num',1),
+                                    'work':buyer_work,
+                                    'purpose':self.works[buyer_work].purpose if buyer_work in self.works else None,
+                                    'price':world.shop.get(cmd['name'],0),
+                                    'day':getattr(getattr(world,'strategy_clock',None),'day',None)}
 
 
 def permits(world, candidate):
@@ -607,6 +939,12 @@ def permits(world, candidate):
     if command.get('action')=='buy' and identity in getattr(world,'checkout_pending_actors',()):return False
     if (command.get('action')=='use' and 'UpgradeVoucher' in command.get('name','')
             and identity in getattr(world,'checkout_use_pending',())):return False
+    work = None
+    if candidate.work_id:
+        market = getattr(world, 'procurement_market', None)
+        work = market.works.get(candidate.work_id) if market else None
+        if work is not None and (work.status in pw.TERMINAL or work.actor != identity):
+            return False  # A terminal or foreign work no longer authorizes.
     personal_dose = (command.get('action')=='buy' and command.get('name')=='Medicine'
         and command.get('num',1)==1 and actor and actor.backpack is not None
         and not actor.inventory['Medicine']
@@ -632,6 +970,10 @@ def permits(world, candidate):
             and command.get('name') not in world.upgrade_priority_items):
         return False
     if command.get('action')=='buy' and buyer and identity!=buyer:
+        if work is not None and work.status not in pw.TERMINAL:
+            # The work record authorizes its own actor's purchase; the retired
+            # global-buyer veto no longer re-judges migrated entries (E2).
+            return True
         actor=world.ours.get(identity)
         return bool(personal_dose or command.get('name')=='Medicine' and actor and actor.health<=110)
     if identity not in allowed:

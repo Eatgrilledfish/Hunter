@@ -21,6 +21,9 @@ class Candidate:
     gold_reserve: int = 0
     route_goal: dict | None = None
     gold_reserve_item: str | None = None
+    # Internal procurement-work reference (2026-09-19 design); never serialized
+    # into the competition response.
+    work_id: str | None = None
 
 
 @dataclass
@@ -30,6 +33,7 @@ class Selection:
     rejected: list[dict]
     value: float
     alternatives: list = field(default_factory=list)
+    report: dict = field(default_factory=dict)
 
 
 def movement_yielders(checked):
@@ -55,7 +59,7 @@ def movement_yielders(checked):
 
 def select(world, clock, rules, policy, candidates, deadline, *, task_actor=None, summon_remaining=0,
            weights=None, incumbent=None, task_moves=(), allow_task_control=False, alternatives_limit=0,
-           diversity_key=None):
+           diversity_key=None, funding_topup=False):
     from .forage_admission import bundle_allowed, attack_key, prepare_fire
     weights = weights or {}
     pressure = BasePressure(world, clock) if policy.base_fire_enabled and policy.joint_fire_enabled else None
@@ -76,7 +80,8 @@ def select(world, clock, rules, policy, candidates, deadline, *, task_actor=None
             fire_examined.add(attack_key(candidate.actor, candidate.command))
         if not permits(world, clock, candidate):
             rejected.append({"actor": candidate.actor, "action": candidate.command.get('action'),
-                             "verdict": "duty_rejected", "reason": "action has no current night duty admission"})
+                             "verdict": "duty_rejected", "reason": "action has no current night duty admission",
+                             **({"work_id": candidate.work_id} if candidate.work_id else {})})
             continue
         key = (candidate.actor, repr(candidate.command))
         if key in unique:
@@ -88,7 +93,8 @@ def select(world, clock, rules, policy, candidates, deadline, *, task_actor=None
         if (check.verdict != Verdict.VALID or not math.isfinite(candidate.utility)
                 or type(candidate.gold_reserve) is not int or candidate.gold_reserve < 0):
             rejected.append({"actor": candidate.actor, "action": candidate.command.get("action"),
-                             "verdict": check.verdict.value, "reason": check.reason})
+                             "verdict": check.verdict.value, "reason": check.reason,
+                             **({"work_id": candidate.work_id} if candidate.work_id else {})})
         else:
             checked.append((candidate, check.resources))
 
@@ -150,11 +156,9 @@ def select(world, clock, rules, policy, candidates, deadline, *, task_actor=None
 
     # (value, selected, resources, predicted damage). Empty remains a structural
     # incumbent, with official waiting semantics explicitly unverified.
-    beam = [(0.0, [], Resources(), {})]
-    best_complete=beam[0]
-    def preserves_reserve(bundle, resources):
+    def preserves_reserve(bundle, resources, released=()):
         from .funding import permits_bundle
-        if not permits_bundle(world,bundle,resources.gold):return False
+        if not permits_bundle(world,bundle,resources.gold,released=released):return False
         floors = []
         for candidate in bundle:
             # A reserve earmarked for a specific purchase is fulfilled by
@@ -166,84 +170,125 @@ def select(world, clock, rules, policy, candidates, deadline, *, task_actor=None
             floors.append(max(0, candidate.gold_reserve-credit))
         floor = max(floors, default=0)
         return not floor or (world.gold is not None and resources.gold+floor <= world.gold)
-    if incumbent:
-        resource, good, damage = Resources(), [], {}
-        for candidate in incumbent:
-            if not admitted(candidate) or not permits(world, clock, candidate):
-                continue
-            check = check_action(world, clock, rules, candidate.actor, candidate.command,
-                                 task_actor=task_actor, summon_remaining=summon_remaining,
-                                 task_moves=task_moves, allow_task_control=allow_task_control)
-            merged = merge_resources(world, rules, resource, check.resources, summon_remaining)
-            if (check.verdict == Verdict.VALID and merged is not None and preserves_reserve(good+[candidate], merged)
-                    and layout_allowed(good+[candidate])):
-                resource = merged
-                good.append(candidate)
-                for identity, amount in candidate.damage.items():
-                    damage[identity] = damage.get(identity, 0) + amount
-        if bundle_allowed(world,good,complete=True):
-            row=(value(good, damage), good, resource, damage)
-            beam.append(row)
-            if row[0]>best_complete[0]:best_complete=row
-    beam.sort(key=lambda row: -row[0])
+    # A candidate whose single-action bundle fails the shared-cash ledger is
+    # funding-blocked: larger bundles only spend more, so no bundle can admit
+    # it under this ledger. Distinguish lapsed provisional grants (curable by
+    # the one-shot top-up) from the candidate's own attached reserve floor.
+    grant_blocked, floor_blocked = set(), set()
     for candidate, resource in checked:
-        if time.monotonic() >= deadline:
-            break
-        expanded = list(beam)
-        for _, chosen, used, damage in beam:
-            merged = merge_resources(world, rules, used, resource, summon_remaining)
-            if merged is None:
-                continue
-            combined = damage.copy()
-            for identity, amount in candidate.damage.items():
-                combined[identity] = combined.get(identity, 0) + amount
-            bundle = chosen + [candidate]
-            if (not preserves_reserve(bundle, merged) or not layout_allowed(bundle)
-                    or not bundle_allowed(world,bundle,complete=False)):
-                continue
-            row=(value(bundle, combined), bundle, merged, combined)
-            expanded.append(row)
-            if row[0]>best_complete[0] and bundle_allowed(world,bundle,complete=True):
-                best_complete=row
-        # Keep only one instance of each action set (incumbent paths can duplicate).
-        seen, ranked = set(), []
-        for row in sorted(expanded, key=lambda row: (-row[0], tuple((c.actor, repr(c.command)) for c in row[1]))):
-            signature = tuple(sorted((c.actor, repr(c.command)) for c in row[1]))
-            if signature not in seen:
-                seen.add(signature)
-                ranked.append(row)
-            if diversity_key is None and len(ranked) >= policy.beam_width:
+        if candidate.command.get('action') != 'buy':
+            continue
+        merged = merge_resources(world, rules, Resources(), resource, summon_remaining)
+        if merged is None:
+            continue
+        from .funding import permits_bundle
+        if not permits_bundle(world, [candidate], merged.gold):
+            grant_blocked.add(id(candidate))
+        elif not preserves_reserve([candidate], merged):
+            floor_blocked.add(id(candidate))
+
+    def search(released=()):
+        beam = [(0.0, [], Resources(), {})]
+        best_complete = beam[0]
+        if incumbent:
+            resource, good, damage = Resources(), [], {}
+            for candidate in incumbent:
+                if not admitted(candidate) or not permits(world, clock, candidate):
+                    continue
+                check = check_action(world, clock, rules, candidate.actor, candidate.command,
+                                     task_actor=task_actor, summon_remaining=summon_remaining,
+                                     task_moves=task_moves, allow_task_control=allow_task_control)
+                merged = merge_resources(world, rules, resource, check.resources, summon_remaining)
+                if (check.verdict == Verdict.VALID and merged is not None and preserves_reserve(good+[candidate], merged, released)
+                        and layout_allowed(good+[candidate])):
+                    resource = merged
+                    good.append(candidate)
+                    for identity, amount in candidate.damage.items():
+                        damage[identity] = damage.get(identity, 0) + amount
+            if bundle_allowed(world,good,complete=True):
+                row=(value(good, damage), good, resource, damage)
+                beam.append(row)
+                if row[0]>best_complete[0]:best_complete=row
+        beam.sort(key=lambda row: -row[0])
+        for candidate, resource in checked:
+            if time.monotonic() >= deadline:
                 break
-        if diversity_key is None:
-            beam = ranked[:policy.beam_width]
-        else:
-            # Reserve at most half the slots for distinct tactical effects.
-            # Every row has already passed the same bundle/resource checks.
-            # The best row is retained; remaining slots preserve value order.
-            chosen_indices, effects = [], set()
-            for index, row in enumerate(ranked):
-                key = diversity_key(row[1])
-                if key not in effects:
-                    effects.add(key)
-                    chosen_indices.append(index)
-                if len(chosen_indices) >= max(1, policy.beam_width // 2):
+            expanded = list(beam)
+            for _, chosen, used, damage in beam:
+                merged = merge_resources(world, rules, used, resource, summon_remaining)
+                if merged is None:
+                    continue
+                combined = damage.copy()
+                for identity, amount in candidate.damage.items():
+                    combined[identity] = combined.get(identity, 0) + amount
+                bundle = chosen + [candidate]
+                if (not preserves_reserve(bundle, merged, released) or not layout_allowed(bundle)
+                        or not bundle_allowed(world,bundle,complete=False)):
+                    continue
+                row=(value(bundle, combined), bundle, merged, combined)
+                expanded.append(row)
+                if row[0]>best_complete[0] and bundle_allowed(world,bundle,complete=True):
+                    best_complete=row
+            # Keep only one instance of each action set (incumbent paths can duplicate).
+            seen, ranked = set(), []
+            for row in sorted(expanded, key=lambda row: (-row[0], tuple((c.actor, repr(c.command)) for c in row[1]))):
+                signature = tuple(sorted((c.actor, repr(c.command)) for c in row[1]))
+                if signature not in seen:
+                    seen.add(signature)
+                    ranked.append(row)
+                if diversity_key is None and len(ranked) >= policy.beam_width:
                     break
-            selected_indices = set(chosen_indices)
-            for index in range(len(ranked)):
-                if len(selected_indices) >= policy.beam_width:
-                    break
-                selected_indices.add(index)
-            beam = [ranked[i] for i in sorted(selected_indices)]
-    # An expired beam may contain only unfinished repair dependencies. Retain
-    # the best complete incumbent independently of speculative beam slots.
-    beam=[row for row in beam if bundle_allowed(world,row[1],complete=True)]
-    if not beam or best_complete[0]>beam[0][0]:beam.insert(0,best_complete)
+            if diversity_key is None:
+                beam = ranked[:policy.beam_width]
+            else:
+                # Reserve at most half the slots for distinct tactical effects.
+                # Every row has already passed the same bundle/resource checks.
+                # The best row is retained; remaining slots preserve value order.
+                chosen_indices, effects = [], set()
+                for index, row in enumerate(ranked):
+                    key = diversity_key(row[1])
+                    if key not in effects:
+                        effects.add(key)
+                        chosen_indices.append(index)
+                    if len(chosen_indices) >= max(1, policy.beam_width // 2):
+                        break
+                selected_indices = set(chosen_indices)
+                for index in range(len(ranked)):
+                    if len(selected_indices) >= policy.beam_width:
+                        break
+                    selected_indices.add(index)
+                beam = [ranked[i] for i in sorted(selected_indices)]
+        # An expired beam may contain only unfinished repair dependencies. Retain
+        # the best complete incumbent independently of speculative beam slots.
+        beam=[row for row in beam if bundle_allowed(world,row[1],complete=True)]
+        if not beam or best_complete[0]>beam[0][0]:beam.insert(0,best_complete)
+        return beam
+    beam = search()
+    topup_report = None
+    if funding_topup and grant_blocked and time.monotonic() < deadline:
+        from .funding import lapsable
+        # Bounded one-shot completion (design §4.4): provisional grants the
+        # first selection neither consumed nor holds via a committed work
+        # lapse; committed trips and strategy floors stay protected. The
+        # second result never recursively triggers a third planning pass.
+        released = lapsable(world, beam[0][1])
+        if released:
+            second = search(released)
+            topup_report = {'released': sorted(r for r in released if r),
+                            'adopted': second[0][0] > beam[0][0],
+                            'budget_exhausted': time.monotonic() >= deadline}
+            if second[0][0] > beam[0][0]:
+                beam = second
     best = beam[0]
     chosen_ids = {id(c) for c in best[1]}
     for candidate, _ in checked:
         if id(candidate) not in chosen_ids:
+            funding = id(candidate) in grant_blocked or id(candidate) in floor_blocked
             rejected.append({"actor": candidate.actor, "action": candidate.command["action"],
-                             "verdict": "not_selected", "reason": "resource conflict or lower joint value"})
+                             "verdict": "funding_reserve" if funding else "not_selected",
+                             "reason": ("shared cash grant or attached reserve covers no feasible bundle"
+                                        if funding else "resource conflict or lower joint value"),
+                             **({"work_id": candidate.work_id} if candidate.work_id else {})})
     response = empty_response()
     response["roleCommandMap"] = {c.actor: c.command for c in best[1]}
     validate_response(response)
@@ -253,4 +298,5 @@ def select(world, clock, rules, policy, candidates, deadline, *, task_actor=None
         option["roleCommandMap"] = {c.actor: c.command for c in selected_}
         validate_response(option)
         alternatives.append(Selection(option, selected_, [], value_))
-    return Selection(response, best[1], rejected[:128], best[0], alternatives)
+    return Selection(response, best[1], rejected[:128], best[0], alternatives,
+                     report={'funding_topup': topup_report} if topup_report else {})

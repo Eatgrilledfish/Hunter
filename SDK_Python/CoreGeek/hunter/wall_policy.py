@@ -315,7 +315,11 @@ def purchase_units(world):
 
 
 def purchase_permitted(world, rules, candidate):
-    """One investment gate for all day/night and personal supply producers."""
+    """One investment gate for all day/night and personal supply producers.
+
+    Work-linked candidates (migrated W chain) carry their reserve from the
+    same-source quote at creation; this gate stays read-only for them (E4).
+    """
     command=candidate.command
     if (command.get('action') != 'buy' or not getattr(world, 'staged_walls', False)
             or not getattr(getattr(world, 'strategy_policy', None), 'upgrade_commitment_enabled', True)):
@@ -325,6 +329,7 @@ def purchase_permitted(world, rules, candidate):
     from .funding import item_granted
     if item_granted(world,actor.id,name,command.get('num',1)):
         return True  # All grants are charged together by final arbitration.
+    committed = candidate.work_id is not None
     if 'UpgradeVoucher' in name:
         prefix=name.split('UpgradeVoucher')[0]
         allowed={'Weapon' if u.kind in {'rocket','gatling','railgun'} else 'Wall' if u.kind=='wall' else 'Station'
@@ -342,17 +347,20 @@ def purchase_permitted(world, rules, candidate):
             and name in {'DizzyWeapon','Bomb'} and actor.inventory[name]<1
             and guard.get('round')==world.round and guard.get('price')==world.shop.get(name)
             and command.get('num',1)==1==guard.get('count')):
-        candidate.gold_reserve=max(candidate.gold_reserve,getattr(world,'treasure_reserved_gold',0))
+        if not committed:
+            candidate.gold_reserve=max(candidate.gold_reserve,getattr(world,'treasure_reserved_gold',0))
         return True
     repair=getattr(world,'essential_repair_stock',{}).get(actor.id,{})
     if (name=='WallFixer' and repair.get('round')==world.round
             and 0<command.get('num',1)<=repair.get('count',0)):
-        candidate.gold_reserve=max(candidate.gold_reserve,getattr(world,'treasure_reserved_gold',0))
+        if not committed:
+            candidate.gold_reserve=max(candidate.gold_reserve,getattr(world,'treasure_reserved_gold',0))
         return True
     if name.endswith('SummonOrder') and not pressure_ready(world):return False
     minimum = max(0,minimum_stock(world,actor,name)-actor.inventory[name])
     reserve,item=investment_fund(world,preserve_reconstruction=command.get('num',1)>minimum)
-    candidate.gold_reserve=max(candidate.gold_reserve,reserve)
-    candidate.gold_reserve_item=item
+    if not committed:
+        candidate.gold_reserve=max(candidate.gold_reserve,reserve)
+        candidate.gold_reserve_item=item
     price=world.shop.get(name)
     return price is not None and (world.gold or 0)-price*command.get('num',1)>=reserve

@@ -73,6 +73,13 @@ class RepairSupply:
                 budget['count']-=1;budget['spent']-=order['price']
             if failed or observed:
                 self.pending.pop(identity)
+        # W's repair-stock purchase migrated to the market ledger; refund its
+        # failed charge from the ledger's read-only outcome view.
+        for order in getattr(world, 'purchase_receipts', {}).values():
+            if order.get('purpose') == 'repair_stock' and order.get('outcome') == 'failed' \
+                    and order.get('round') == world.round and order.get('day') in self.daily:
+                budget = self.daily[order['day']]
+                budget['count'] -= 1; budget['spent'] -= order.get('price', 0)
         # Unresolved spends remain charged and block that buyer across days.
         self.daily=dict(sorted(self.daily.items())[-10:])
 
@@ -104,7 +111,14 @@ class RepairSupply:
             if time.monotonic()>=deadline or slots<=0 or price>budget:
                 break
             actor=world.ours.get(identity)
-            if not actor or not actor.alive or actor.kind != 'worker' or identity in excluded or identity in self.pending:
+            market=getattr(world,'procurement_market',None)
+            migrated_w = market is not None and identity==roster.w
+            if not actor or not actor.alive or actor.kind != 'worker' or identity in excluded:
+                continue
+            if migrated_w:
+                if market.purchase_pending(world, identity):
+                    continue
+            elif identity in self.pending:
                 continue
             if (actor.backpack is None or actor.capacity is None or len(actor.backpack)>=actor.capacity
                     or actor.inventory['WallFixer']>=1 or actor.health<(220 if actor.kind=='worker' else 200)*.75):
@@ -157,6 +171,11 @@ class RepairSupply:
             offers=[Candidate(identity,command,120-i*.01,'personal repair stock within daily quota',gold_reserve=reserve,
                               gold_reserve_item=world.repair_weapon_reserve_name)
                     for i,command in enumerate(commands)]
+            if migrated_w and offers and offers[0].command.get('action')=='buy':
+                tracked=market.track(world,offers[0],'repair_stock',step='checkout')
+                if tracked is None:
+                    continue
+                offers[0]=tracked
             # Return deadlines and triage apply before this optional stock trip
             # gets priority over ordinary wall/base procurement.
             if guidance.return_routes.get(identity,{}).get('due') or not offers:
@@ -175,9 +194,15 @@ class RepairSupply:
         return result
 
     def finalize(self, world, response):
+        w_identity = getattr(getattr(world, 'night_roster', None), 'w', None)
         for identity,order in self.offered.items():
             if response['roleCommandMap'].get(identity)==dict(action='buy',name='WallFixer',num=1):
-                self.pending[identity]=dict(order)
                 budget=self.daily.setdefault(order['day'],dict(count=0,spent=0))
+                if identity == w_identity and getattr(world, 'procurement_market', None) is not None:
+                    # The market ledger owns W's purchase pending; only the
+                    # daily quota charge stays here.
+                    budget['count']+=1;budget['spent']+=order['price']
+                    continue
+                self.pending[identity]=dict(order)
                 budget['count']+=1;budget['spent']+=order['price']
         self.offered={}
