@@ -35,6 +35,45 @@ class RepairPlan:
     loss_samples: dict = field(default_factory=dict)
     unserved_stock: dict = field(default_factory=dict)
 
+    def publish_demand(self, world, clock, rules, policy, deadline):
+        """Price the same personal stock before any supplier claims the worker."""
+        from .rear_open import enabled
+        world.day_repair_demand=0
+        if not enabled(world):return
+        actor=world.ours.get(world.night_roster.w)
+        pending=self.active.get(actor.id) if actor else None
+        if (pending and pending.get('phase')=='USE_PENDING'
+                and pending['command'].get('name')=='WallFixer' and actor.backpack is not None
+                and world.round==pending['round']+1 and self.usage_observed_round!=world.round
+                and actor.inventory['WallFixer']<pending['inventory_before']):
+            day=pending.get('day',clock.day)
+            self.night_usage[day]=self.night_usage.get(day,0)+1
+            self.usage_observed_round=world.round
+        previous_day=(clock.day or 0)-1
+        world.caretaker_repair_target=max(2,policy.caretaker_repair_target,
+            min(6,self.night_usage.get(previous_day,0)+len(self.unserved_stock.get(previous_day,set()))+1))
+        if clock.phases!={'day'} or not actor or not actor.alive or actor.backpack is None:return
+        reachable=distance_field(world,{actor.pos},actor.pos,deadline)
+        home=distance_field(world,defence_duties.stands(world,actor.id),actor.pos,deadline)
+        options=[(w.health,reachable[p],w.id,p,w) for w in damaged_walls(world,rules)
+                 for p in interaction_cells(world,[w.pos],actor.pos) if p in reachable and p in home
+                 and reachable[p]+1+home[p]+policy.return_buffer<=clock.until_night]
+        if time.monotonic()>=deadline:return
+        from .procurement import upgrade_allowed
+        from .wall_service import use_permitted
+        supplies=actor.inventory.copy();items={}
+        for _,_,identity,_,wall in sorted(options,key=lambda x:x[:4]):
+            if identity in items:continue
+            coupon=f'WallUpgradeVoucher{wall.level}'
+            candidate=Candidate(actor.id,dict(action='use',name=coupon,targetPos=[pos_json(wall.pos)]),260,'paid restoration')
+            item='WallFixer'
+            if (wall.level in (1,2) and supplies[coupon]>0 and upgrade_allowed(world,wall,policy,rules)
+                    and use_permitted(world,candidate)):
+                item=coupon;supplies[coupon]-=1
+            items[identity]=item
+        world.day_repair_demand=sum(name=='WallFixer' for name in items.values())
+        world.day_repair_quote=(options,items)
+
     def prepare(self, world, clock, rules, policy, deadline, task=None):
         self.offered = {}
         self.service = {}
@@ -42,7 +81,7 @@ class RepairPlan:
         world.repair_commands = {}
         world.repair_holds = {}
         world.day_repair_steps = {}
-        world.day_repair_demand = 0
+        world.day_repair_demand = getattr(world,'day_repair_demand',0)
         world.day_repair_urgent = False
         world.repair_service = self.service
         self.loss_samples={i:r for i,r in self.loss_samples.items()
@@ -72,28 +111,14 @@ class RepairPlan:
             self.active={}
             actor=world.ours.get(defence_duties.caretaker(world))
             if actor and actor.alive and actor.backpack is not None:
-                reachable=distance_field(world,{actor.pos},actor.pos,deadline)
-                home=distance_field(world,defence_duties.stands(world,actor.id),actor.pos,deadline)
-                options=[(w.health,reachable[p],w.id,p,w) for w in damaged_walls(world,rules)
-                         for p in interaction_cells(world,[w.pos],actor.pos) if p in reachable and p in home
-                         and reachable[p]+1+home[p]+policy.return_buffer<=clock.until_night]
+                if not hasattr(world,'day_repair_quote'):
+                    self.publish_demand(world,clock,rules,policy,deadline)
+                options,items=getattr(world,'day_repair_quote',([],{}))
                 # An upgrade restores full health under the official rules.
                 # Allocate each personally held voucher once, with the same
                 # paid-target restrictions as the final use validator.
                 from .procurement import upgrade_allowed
                 from .wall_service import use_permitted
-                supplies=actor.inventory.copy()
-                items={}
-                for _,_,identity,_,wall in sorted(options,key=lambda x:x[:4]):
-                    if identity in items:continue
-                    item='WallFixer'
-                    coupon=f'WallUpgradeVoucher{wall.level}'
-                    candidate=Candidate(actor.id,dict(action='use',name=coupon,targetPos=[pos_json(wall.pos)]),260,
-                                        'restore damaged wall with paid upgrade')
-                    if (wall.level in (1,2) and supplies[coupon]>0
-                            and upgrade_allowed(world,wall,policy,rules) and use_permitted(world,candidate)):
-                        item=coupon;supplies[coupon]-=1
-                    items[identity]=item
                 world.day_repair_demand=sum(item=='WallFixer' for item in items.values())
                 funded=[row for row in options if actor.inventory[items[row[2]]]>0]
                 if funded and time.monotonic()<deadline:

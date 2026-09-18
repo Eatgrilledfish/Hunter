@@ -807,6 +807,10 @@ class TaskEngine:
 
     def _consume_llm(self, world):
         task, pending = self.active, self.active.llm_pending
+        from .llm_channel import owns
+        if not owns(world,pending):
+            self._quarantine(world,'llm',{'reason':'channel owned by another request'})
+            return
         raw = world.raw.get("llmResp")
         if not isinstance(raw, str) or not raw:
             failure=llm_service_failure(world,pending)
@@ -1311,7 +1315,8 @@ class TaskEngine:
                     count=block['count'],reason=block['reason']))
                 block['reported']=True
             return  # Three identical coverage failures: no blind fourth model round.
-        if task.llm_pending is None and not response["executeCmd"] and task.sandbox_pending is None:
+        from .llm_channel import available, claim
+        if task.llm_pending is None and not response["executeCmd"] and task.sandbox_pending is None and not response['prompt'] and available(world):
             if self.budget.reserve(active_task=True):
                 context = self._context(task, "choose_next_task_step")
                 evidence, document_coverage = pack_evidence(task)
@@ -1350,5 +1355,6 @@ class TaskEngine:
                     **({'submit':'<actual answer>'} if final_answer_only else {'cmd':'<Python source>'})}
                 payload['required_response'] = 'ONLY JSON; copy the current request_id and choose one allowed action.'
                 response["prompt"] = instructions + json.dumps(payload, ensure_ascii=False)
+                claim(world,context,'task_exempt')
                 task.llm_pending = {"round": world.round, "context": context,'answer_only':final_answer_only}
                 mark_timing(task,'llm_sent',world.round)

@@ -20,6 +20,7 @@ def upgrade_rank(world, unit):
             and unit.kind == 'wall' and unit.pos in upgrade_targets(world)):
         return .5
     if unit.kind=='wall':
+        if unit.id in {u.id for u in daily_upgrade_targets(world)}:return .75
         loss = getattr(world,'observed_wall_losses',{}).get(unit.id,0)
         if loss>0 and unit.health is not None and unit.health<=loss*2:return 1.5
         return 2+(unit.level-1)*.1
@@ -34,6 +35,21 @@ def planned_gate(world):
 def upgrade_targets(world):
     """One permanent target set for purchases, held deliveries and completion."""
     return frozenset(getattr(world, 'monster_front_walls', ())) - {planned_gate(world)}
+
+
+def daily_upgrade_targets(world):
+    """A bounded front-wall investment floor alongside unfinished weapons."""
+    from .rear_open import enabled
+    clock=getattr(world,'strategy_clock',None)
+    if (not enabled(world) or not clock or clock.day is None or clock.day<2
+            or len(world.weapons)<3 or getattr(world,'critical_base_ids',())):return []
+    sites=getattr(world,'wall_service',{})
+    completed=sum(r.get('upgrade_steps',0) for r in sites.values() if r.get('upgrade_day')==clock.day)
+    count=max(0,2-completed)
+    from .wall_pressure import priority
+    targets=[u for u in world.ours.values() if u.alive and u.kind=='wall'
+             and u.pos in upgrade_targets(world) and u.level in (1,2)]
+    return sorted(targets,key=lambda u:(u.level,u.health,priority(world,u),u.id))[:count]
 
 
 def monster_direction(world, anchor):
@@ -105,6 +121,7 @@ def priority_units(world):
     emergency = [u for u in world.stations if u.id in getattr(world, 'critical_base_ids', ()) and u.level in (1, 2)]
     if emergency:
         return emergency
+    daily=daily_upgrade_targets(world)
     walls = [u for u in world.ours.values() if u.alive and u.kind == 'wall'
              and u.pos in upgrade_targets(world) and u.level != 3]
     if any(u.level == 3 and u.id in getattr(world, 'critical_base_ids', ()) for u in world.stations):
@@ -123,13 +140,13 @@ def priority_units(world):
             cost = sum(world.shop.get(f'StationUpgradeVoucher{u.level}',float('inf'))
                        for u in restoration if not held[f'StationUpgradeVoucher{u.level}'])
             if reserve+cost<=world.gold:
-                return weapons+restoration  # Jointly funded, still weapon-first in the use tour.
-        return weapons
+                return daily+weapons+restoration  # Keep the bounded wall floor in the jointly funded tier.
+        return daily+weapons
     if getattr(world, 'task_side_plan', None) and len(world.weapons) < 3:
         return []  # Rebuild a missing planned rocket before funding later tiers.
     restoration = [u for u in world.stations if u.id in getattr(world, 'base_restore_ids', ())]
     if restoration:
-        return restoration  # Actual injury must not wait for every wall to max out.
+        return daily+restoration  # Critical rescue still precedes this bounded floor.
     permanent = upgrade_targets(world)
     front = walls
     if front:
@@ -250,6 +267,10 @@ def pressure_ready(world):
 def purchase_units(world):
     """Allow next-stage checkout once weapon purchases are fully funded."""
     current = priority_units(world)
+    daily=daily_upgrade_targets(world)
+    if daily:
+        ids={u.id for u in current}
+        return current+[u for u in daily if u.id not in ids]
     if any(u.kind == 'station' for u in current):
         return current
     if getattr(world,'critical_base_ids',()):

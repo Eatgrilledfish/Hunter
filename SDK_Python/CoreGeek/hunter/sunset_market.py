@@ -197,6 +197,10 @@ class SunsetMarket:
                     owner=min(at_shop)
                 if owner is None:
                     owner = min(at_shop) if at_shop else roster.p if roster.p in reachable else roster.w
+                funded=[r['owner'] for r in getattr(world,'funding_plan',()) if r['purpose']=='wall_upgrade'
+                        and r['granted']==r['cost'] and r['owner'] in reachable]
+                if funded and owner not in self.checkout_deliveries and owner not in self.pending:
+                    owner=min(funded,key=lambda i:(i not in at_shop,i!=roster.w,i))
                 if owner != self.checkout_primary and owner in world.ours:
                     buyer = world.ours[owner]
                     if (owner not in self.pending and not any(n and 'UpgradeVoucher' in name

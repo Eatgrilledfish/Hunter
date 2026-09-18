@@ -7,7 +7,7 @@ from pathlib import Path
 import threading
 import time
 
-from . import combat, economy, director, joint_lookahead, task_schedule, site_clearance, exterior_evasion, forage_admission
+from . import wall_policy, combat, economy, director, joint_lookahead, task_schedule, site_clearance, exterior_evasion, forage_admission
 from .arbitration import select
 from .protocol import parse_request, fingerprint, empty_response, validate_response, distance, position
 from .rules import Rules, Policy, Clock
@@ -137,14 +137,18 @@ class Agent:
                 draft.repair.active.clear()
             world.wall_rebuild_plan=draft.wall_rebuild.plan
             from . import funding
-            funding.publish(world,clock,self.rules,self.policy,draft.intelligence,
-                            min(start+self.policy.planning_seconds,time.monotonic()+.025))
+            world.funding_plan=[]
+            world.treasure_reserved_gold=0
             world.night_foraging_enabled=self.policy.night_foraging_enabled
             from . import day_access
             day_access.prepare(world,clock,min(start+self.policy.planning_seconds,time.monotonic()+.025),draft.day_access_choice)
             economy.prepare_wall_cycle(world, clock, self.rules, self.policy)
             draft.sunset_market.publish_checkout_targets(world)
             draft.wall_service.prepare(world, self.rules)
+            draft.repair.publish_demand(world,clock,self.rules,self.policy,
+                min(start+self.policy.planning_seconds,time.monotonic()+.04))
+            funding.publish(world,clock,self.rules,self.policy,draft.intelligence,
+                            min(start+self.policy.planning_seconds,time.monotonic()+.04))
             daily = draft.sunset_market.caretaker_day
             worker=draft.night_roster.w
             worker_unit=world.ours.get(worker)
@@ -773,6 +777,12 @@ class Agent:
                       "pioneer_trade": {"actors":sorted(world.pioneer_trade_ids), "reason":world.pioneer_trade_reason},
                       "task_lifecycle": world.task_lifecycle.snapshot(world) if hasattr(world, 'task_lifecycle') else {},
                       "sunset_market": draft.sunset_market.diagnostic,
+                      "llm_channel":dict(draft.llm_channel.pending),
+                      "wall_upgrade_orders":dict(
+                          due=[dict(id=u.id,position=u.pos,level=u.level) for u in wall_policy.daily_upgrade_targets(world)],
+                          grants=[r for r in world.funding_plan if r['purpose']=='wall_upgrade'],
+                          gold=world.gold,held={u.id:{k:v for k,v in u.inventory.items() if v and k.startswith('WallUpgradeVoucher')}
+                              for u in world.movers if u.backpack is not None}),
                       "treasure": draft.intelligence.diagnostic,
                       "rumour_llm": {"used":draft.tasks.budget.attempts,"status":draft.intelligence.llm_status,
                                      "clues":len(draft.intelligence.clues), 'cycle':draft.intelligence.cycle.number,

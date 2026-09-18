@@ -438,6 +438,19 @@ class Diagnostics(logging.Handler):
 
     def _work_item_events(self, state, raw, response, decision, units, number):
         """Never sample away item identity or confuse an offer with a receipt."""
+        orders=obj(decision.get('wall_upgrade_orders'))
+        market=obj(decision.get('sunset_market'))
+        upgrade=dict(orders=orders,wall_rebuild=decision.get('wall_rebuild'),market={k:market[k] for k in ('stage','buyer','quotes','excluded','blocked','worker_busy') if k in market},
+                     selected={a:self._command(c) for a,c in response.get('roleCommandMap',{}).items()
+                               if c.get('action') in ('buy','use','remove','build')})
+        marker=json.dumps(upgrade,sort_keys=True,default=str)
+        if orders.get('due') and (marker!=state.get('upgrade_marker') or number%self.interval==0):
+            self.archive('wall_upgrade_decision',marker)
+            state['upgrade_marker']=marker
+        channel=obj(decision.get('llm_channel'))
+        if channel and channel.get('request_id')!=state.get('llm_request_id'):
+            self._write_compact('llm_channel_request',**channel)
+            state['llm_request_id']=channel['request_id']
         sightings=state.setdefault('role_sightings',{})
         roster=obj(decision.get('night_roster'))
         for identity in {str(roster[k]) for k in ('w','p','m') if roster.get(k) is not None}:
@@ -554,6 +567,11 @@ class Diagnostics(logging.Handler):
                         self._write_compact("callback_error",count=count,outcome=self.local.outcome,
                                             issue=getattr(self.local,"issues",[])[:2])
                 return
+            # Repeat the immutable startup manifest after log rotation, once per day.
+            manifest_day=number//130
+            if getattr(self,'startup_manifest',None) and state.get('manifest_day')!=manifest_day:
+                self.archive('startup_files',self.startup_manifest,manifest_day=manifest_day)
+                state['manifest_day']=manifest_day
             self._work_item_events(state,raw,response,obj(getattr(self.local,"decision",{})),units,number)
             previous_round = state["round"]
             state["calls"] += 1
@@ -825,7 +843,8 @@ class Diagnostics(logging.Handler):
                   if p.is_file() and p.suffix in {".py", ".json"}}
         hashes["run.sh"] = hashlib.sha256((root / "run.sh").read_bytes()).hexdigest()
         self.sdk_fingerprint=hashlib.sha256(json.dumps(hashes,sort_keys=True).encode()).hexdigest()[:12]
-        self.archive("startup_files",json.dumps(hashes,sort_keys=True),files_count=len(hashes))
+        self.startup_manifest=json.dumps(hashes,sort_keys=True)
+        self.archive("startup_files",self.startup_manifest,files_count=len(hashes))
         if self.mode == "compact":
             self._write_compact("startup",mode="compact",every=self.interval,task_diag=2,python=sys.version.split()[0],
                 sdk=hashlib.sha256(json.dumps(hashes,sort_keys=True).encode()).hexdigest()[:12],

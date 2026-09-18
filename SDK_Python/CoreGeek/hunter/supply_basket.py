@@ -29,6 +29,8 @@ def stock_quantity(world, actor, name, target, available, reserve, space, planne
 
 def requirements(world, rules, policy):
     from .wall_policy import upgrade_rank
+    from .wall_policy import daily_upgrade_targets
+    daily={u.id for u in daily_upgrade_targets(world)}
     emergency = {u.id for u in world.stations if u.id in getattr(world, 'critical_base_ids', ()) and u.level in (1, 2)}
     result = []
     for unit in world.ours.values():
@@ -43,7 +45,7 @@ def requirements(world, rules, policy):
         if not prefix:
             continue
         rank = upgrade_rank(world, unit)
-        for level in range(unit.level, unit.level+1 if emergency else 3):
+        for level in range(unit.level, unit.level+1 if emergency or unit.id in daily else 3):
             result.append(dict(unit=unit, level=level, name=f'{prefix}UpgradeVoucher{level}', rank=rank))
     from .wall_service import pending_targets, service_key
     if not emergency:
@@ -106,6 +108,8 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
     emergency = any(u.id in getattr(world, 'critical_base_ids', ()) and u.level in (1, 2) for u in world.stations)
     if emergency:
         reserve = 0  # Restoring the endangered base takes precedence over optional funds.
+    else:
+        reserve=max(reserve,sum(r['granted'] for r in getattr(world,'funding_plan',()) if r['owner']!=actor.id))
     primary = getattr(world,'upgrade_checkout_actor',actor.id)==actor.id
     worker = carriers.get(roster.w)
     if not emergency and not any(g.id in stage_ids for g in world.weapons) and actor.id == roster.p and worker and world.shop.get('WallFixer',0)>0:
@@ -113,7 +117,10 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
         # W still needs for its normal stock. Adaptive extras must not freeze
         # P's wall upgrade money while W repeatedly consumes daytime packs.
         from .repair_decision import purchase_floor
-        reserve += max(0,purchase_floor(world,policy)-worker.inventory['WallFixer'])*world.shop['WallFixer']
+        worker_floor=max(0,purchase_floor(world,policy)-worker.inventory['WallFixer'])*world.shop['WallFixer']
+        worker_grant=sum(r['granted'] for r in getattr(world,'funding_plan',())
+                         if r['owner']==worker.id and 'WallFixer' in r['items'])
+        reserve+=max(0,worker_floor-worker_grant)
     available = max(0, (world.gold or 0)-reserve) if cash is None else max(0,cash-reserve)
     space = actor.capacity-len(actor.backpack)
     prepaid = set(covered)
@@ -133,7 +140,12 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
                and u.pos in world.monster_front_walls]
         price=world.shop.get('WallFixer',0)
         from .repair_decision import purchase_floor
-        count=min(space,available//price,max(0,purchase_floor(world,policy)-actor.inventory['WallFixer'])) if price>0 and (front or future_repair_sites) else 0
+        granted_stock=sum(min(r['items'].get('WallFixer',0),r.get('granted',0)//price)
+                          for r in getattr(world,'funding_plan',()) if r['owner']==actor.id) if price>0 else 0
+        # The cash ledger and checkout must quote the same adaptive stock.
+        # An old three-pack checkout cap cannot strand its own reserved money.
+        if limits is not None:limits['WallFixer']=max(limits['WallFixer'],granted_stock)
+        count=min(space,available//price,max(granted_stock,purchase_floor(world,policy)-actor.inventory['WallFixer'])) if price>0 and (front or future_repair_sites) else 0
         if limits is not None:count=min(count,limits['WallFixer'])
         if count:
             world.essential_repair_stock=dict(getattr(world,'essential_repair_stock',{}))

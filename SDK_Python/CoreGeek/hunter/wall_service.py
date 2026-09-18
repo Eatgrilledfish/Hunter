@@ -33,8 +33,15 @@ class WallService:
                 record['reconstruction'] = True
             if identity and identity!=previous:
                 record['generation'] = record.get('generation',0)+1
+            if (identity and identity==previous and wall.level is not None
+                    and record.get('level') is not None and wall.level>record['level']):
+                day=getattr(world,'strategy_day',None)
+                steps=record.get('upgrade_steps',0) if record.get('upgrade_day')==day else 0
+                record.update(upgrade_day=day,upgrade_steps=steps+wall.level-record['level'],
+                              last_progress_round=world.round)
             record.update(id=identity,level=wall.level if wall else None,
                 hp=wall.health if wall else None, builder=None, build_after=None,
+                target_level=3,
                 state='complete' if wall and wall.level==3 else 'upgrade' if wall else 'await_material')
             if rules:
                 from .repair_decision import eligible
@@ -118,7 +125,8 @@ def pending_targets(world, *, scheduled=False):
 def service_key(world, unit):
     from .wall_pressure import priority
     record = getattr(world,'wall_service',{}).get(unit.pos,{})
-    return (not record.get('reconstruction',False),priority(world,unit),unit.id)
+    return (not record.get('reconstruction',False),priority(world,unit),
+            unit.health if unit.health is not None else float('inf'),unit.id)
 
 
 def handoff_margin(world):
@@ -131,19 +139,21 @@ def handoff_margin(world):
 
 def use_permitted(world, candidate):
     command=candidate.command
-    if command.get('action')!='use' or command.get('name')!='WallUpgradeVoucher1':return True
+    name=command.get('name')
+    if command.get('action')!='use' or name not in ('WallUpgradeVoucher1','WallUpgradeVoucher2'):return True
+    tier=int(name[-1])
     actor=world.ours.get(candidate.actor)
     points=command.get('targetPos',[])
     if not actor or actor.backpack is None or len(points)!=1:return True
     point=(points[0].get('x'),points[0].get('y'))
     paid={world.ours[uid].pos for uid,level in getattr(world,'checkout_targets',{}).get(actor.id,())
-          if level==1 and uid in world.ours and world.ours[uid].alive
-          and world.ours[uid].kind=='wall' and world.ours[uid].level==1}
+          if level==tier and uid in world.ours and world.ours[uid].alive
+          and world.ours[uid].kind=='wall' and world.ours[uid].level==tier}
     if point in paid:return True
     reservations=[p for p,r in getattr(world,'wall_service',{}).items()
-                  if r.get('reserved_owner')==actor.id and r.get('level') not in (2,3)]
-    committed_elsewhere=actor.inventory['WallUpgradeVoucher1']<=len(paid)
-    if not committed_elsewhere and (point in reservations or actor.inventory['WallUpgradeVoucher1']>len(reservations)):return True
+                  if tier==1 and r.get('reserved_owner')==actor.id and r.get('level') not in (2,3)]
+    committed_elsewhere=actor.inventory[name]<=len(paid)
+    if not committed_elsewhere and (point in reservations or actor.inventory[name]>len(reservations)):return True
     wall=next((u for u in world.ours.values() if u.alive and u.kind=='wall' and u.pos==point),None)
     loss=getattr(world,'observed_wall_losses',{}).get(wall.id,0) if wall else 0
     return bool(wall and loss>0 and wall.health is not None and wall.health<=loss*2)

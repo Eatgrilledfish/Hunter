@@ -16,12 +16,17 @@ def registry(news, descriptions, world):
         if name not in world.shop:continue
         key='catalog:'+name+':'+fingerprint(text)[:12]
         result[key]=dict(text=text,hash=fingerprint(text),evidence_kind='catalog_description',item=name)
-    rules=dict(origin='bottom_left',x_positive='right',y_positive='up',distance='chebyshev',
+    rules=dict(origin='bottom_left',origin_coordinates=[0,0],x_positive='right',y_positive='up',distance='chebyshev',
                width=world.width,height=world.height,station_anchor='top_left',
                bases=[dict(id=u.id,side=side,x=u.pos[0],y=u.pos[1]) for side,units in ((world.side,world.ours),('enemy',world.enemies)) for u in units.values() if u.kind=='station' and u.alive],
                zones={k:sorted(v) for k,v in world.zones.items()})
     text=json.dumps(rules,ensure_ascii=False,sort_keys=True)
-    result['map:'+fingerprint(text)[:12]]=dict(text=text,hash=fingerprint(text),evidence_kind='map_rule',bases=rules['bases'])
+    result['map:'+fingerprint(text)[:12]]=dict(text=text,hash=fingerprint(text),evidence_kind='map_rule',
+        bases=rules['bases'],origin_coordinates=[0,0],zones=rules['zones'])
+    for key,row in result.items():
+        # Stable exact spans let the model select evidence instead of copying it.
+        row['spans']={f'{key}#{i}':dict(start=m.start(),end=m.end(),text=m.group())
+                      for i,m in enumerate(re.finditer(r'[^。！？\n]+[。！？]?|\n',row['text'])) if m.group().strip()}
     return result
 
 
@@ -35,6 +40,10 @@ def citations(value, sources, path='support', require_news=True):
         key=ref.get('source',ref.get('source_id'));entry=sources.get(key)
         if entry is None:raise EvidenceError('unknown_source_id',where,key)
         text=entry['text'];quote=ref.get('quote')
+        if 'span' in ref:
+            span=entry.get('spans',{}).get(ref['span'])
+            if not span:raise EvidenceError('unknown_span_id',where,key)
+            quote=text[span['start']:span['end']]
         if 'start' in ref or 'end' in ref:
             start,end=ref.get('start'),ref.get('end')
             if type(start) is not int or type(end) is not int or not 0<=start<end<=len(text):
@@ -54,7 +63,7 @@ def citations(value, sources, path='support', require_news=True):
 
 def item_evidence(candidate,sources):
     """V2 requires both the news condition and the actual catalog identity."""
-    if candidate.get('evidence_version')!=2:return
+    if candidate.get('evidence_version') not in (2,3):return
     rows=candidate.get('item_evidence')
     if not isinstance(rows,list):raise EvidenceError('item_mapping_unproved','item_evidence')
     from collections import Counter
@@ -93,7 +102,7 @@ def time_window(candidate,sources,clock):
         raise EvidenceError('invalid_time_semantics','time')
     if phase=='day' and not re.search(r'白昼|白天|daylight|daytime',quote,re.I):raise EvidenceError('phase_not_in_source','time.phase')
     if phase=='night' and not re.search(r'夜|night',quote,re.I):raise EvidenceError('phase_not_in_source','time.phase')
-    if mode!='within' and not re.search(r'起|开始|之后|以后|from|onward',quote,re.I):raise EvidenceError('onward_not_in_source','time.mode')
+    if mode!='within' and not re.search(r'起|开始|之后|以后|方可|才能|from|onward',quote,re.I):raise EvidenceError('onward_not_in_source','time.mode')
     begin=(day-1)*130+(70 if phase=='night' else 0)
     end=(day-1)*130+(69 if phase=='day' else 129)
     start=max(o+begin for o in clock.offsets)
@@ -103,12 +112,11 @@ def time_window(candidate,sources,clock):
 
 
 def location_evidence(candidate,sources,world):
-    """Check explicit coordinates or an evidenced cardinal grid displacement.
+    """Validate explicit derivations or a model's evidenced semantic inference.
 
-    Unsupported units/anchors remain unresolved; never default km to cells.
-    This deliberately covers a small auditable derivation, not arbitrary prose.
+    V3 accepts inferred units; arithmetic, anchors and map bounds remain strict.
     """
-    if candidate.get('evidence_version')!=2:return None
+    if candidate.get('evidence_version') not in (2,3):return None
     spec=candidate.get('location')
     if not isinstance(spec,dict):raise EvidenceError('location_derivation_missing','location')
     refs=citations(spec,sources,'location.support')
@@ -120,6 +128,38 @@ def location_evidence(candidate,sources,world):
         return ones[n] if n<10 else ('十' if n==10 else ('' if n//10==1 else ones[n//10])+'十'+(ones[n%10] if n%10 else ''))
     mode=spec.get('mode');point=candidate.get('position',{})
     wanted=(point.get('x'),point.get('y')) if isinstance(point,dict) else None
+    if mode=='inferred' and candidate.get('evidence_version')==3:
+        reference=spec.get('reference',{})
+        if isinstance(reference,str):reference={'kind':reference}
+        if not isinstance(reference,dict):raise EvidenceError('reference_unknown','location.reference')
+        anchor_refs=citations(reference,sources,'location.reference.support',require_news=False)
+        maps=[sources[r['source']] for r in anchor_refs if sources[r['source']].get('evidence_kind')=='map_rule']
+        if reference.get('kind')=='map_origin' and any(m.get('origin_coordinates')==[0,0] for m in maps):
+            anchor=(0,0)
+        else:
+            anchor=(reference.get('x'),reference.get('y'))
+            mapped=any((b['x'],b['y'])==anchor and b['id']==reference.get('base_id') for m in maps for b in m.get('bases',[]))
+            mapped|=any(anchor in [tuple(p) for p in m.get('zones',{}).get(reference.get('zone'),[])] for m in maps)
+            quoted=' '.join(r['quote'] for r in anchor_refs if sources[r['source']].get('evidence_kind','news_fragment')=='news_fragment')
+            if not mapped and pairs(quoted)!={anchor}:raise EvidenceError('reference_not_unique','location.reference')
+        displacement=spec.get('grid_displacement',{})
+        if not isinstance(displacement,dict):raise EvidenceError('displacement_unknown','location.grid_displacement')
+        east,north=displacement.get('east'),displacement.get('north')
+        if any(type(v) is not int for v in (*anchor,east,north)):
+            raise EvidenceError('displacement_unknown','location.grid_displacement')
+        summary=spec.get('reason_summary')
+        if not isinstance(summary,str) or not 1<=len(summary.strip())<=1500 or spec.get('confidence')!='high':
+            raise EvidenceError('inference_explanation_required','location')
+        resolved=(anchor[0]+east,anchor[1]+north)
+        if not world.inside(resolved) or resolved!=wanted:
+            raise EvidenceError('coordinate_derivation_mismatch','location')
+        alternatives=spec.get('alternatives',[])
+        if not isinstance(alternatives,list) or any(isinstance(a,dict) and a.get('confidence')=='high'
+                and a.get('position')!=point for a in alternatives):
+            raise EvidenceError('competing_location_interpretations','location.alternatives')
+        return dict(mode=mode,position=resolved,reference=anchor,east=east,north=north,
+                    basis='model_semantic_inference',reason_summary=summary,support=refs,
+                    reference_support=anchor_refs,alternatives=alternatives[:4])
     if mode=='absolute':
         positions=pairs(text)
         if positions!={wanted}:raise EvidenceError('absolute_coordinate_not_unique','location')
@@ -133,6 +173,8 @@ def location_evidence(candidate,sources,world):
     mapped=any(b['id']==reference.get('base_id') and (b['x'],b['y'])==anchor
         for ref in anchor_refs for b in sources[ref['source']].get('bases',[])
         if sources[ref['source']].get('evidence_kind')=='map_rule')
+    mapped|=reference.get('kind')=='map_origin' and anchor==(0,0) and any(
+        sources[r['source']].get('origin_coordinates')==[0,0] for r in anchor_refs)
     if not mapped and pairs(anchor_text)!={anchor}:raise EvidenceError('reference_not_unique','location.reference')
     east,north=spec.get('east'),spec.get('north');unit=spec.get('unit');scale=spec.get('cells_per_unit')
     if any(type(v) is not int or abs(v)>max(world.width,world.height) for v in (east,north)):

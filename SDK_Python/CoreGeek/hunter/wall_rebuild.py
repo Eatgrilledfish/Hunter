@@ -54,6 +54,8 @@ class WallRebuild:
             self.diagnostic = dict(stage='owner_unavailable', plan=dict(self.plan))
             return []
         p = self.plan
+        if p:
+            p.setdefault('target_level',2 if p['stage']=='UPGRADE' or any(p.get('paid_bindings',{}).values()) else 1)
         if p and p['actor'] != worker.id:
             # Inventory stays personal. A replacement must independently fund
             # the build before it can take over the same physical obligation.
@@ -81,6 +83,9 @@ class WallRebuild:
                             if (wall.id,level) not in saved:saved.append((wall.id,level))
                     session.wall_restore_observations[wall.id] = dict(round=world.round, level=1, hp=wall.health)
                     world.wall_restore_observations = session.wall_restore_observations
+                    if p.get('target_level',1)==1:
+                        self.diagnostic=dict(stage='DONE',position=p['position'],wall=wall.id,target_level=1)
+                        self.plan={};p={};world.wall_rebuild_plan={}
             elif action == 'use' and issued['command']['name'] == 'WallUpgradeVoucher1' and wall and wall.level >= 2:
                 if ack is True and worker.inventory['WallUpgradeVoucher1'] < issued['voucher']:
                     self.diagnostic = dict(stage='DONE', position=p['position'], wall=wall.id)
@@ -98,15 +103,34 @@ class WallRebuild:
             # hole or completed rebuild still keeps its existing owner.
             self.plan={};p={};world.wall_rebuild_plan={}
             self.diagnostic=dict(stage='direct_upgrade',wall=wall.id,reason='upgrade restores damaged level-one wall')
+        from .wall_policy import daily_upgrade_targets
+        due=daily_upgrade_targets(world)
+        held_front=any(u.inventory[f'WallUpgradeVoucher{target.level}'] for u in world.movers
+                       if u.backpack is not None for target in due)
+        funded_front=any(r['purpose']=='wall_upgrade' and r.get('granted',0)>=r['cost']
+                         for r in getattr(world,'funding_plan',()))
+        front_gap=bool(direct_upgrade-set(walls))
+        if (not p or p['stage']=='SUPPLY' and p.get('target_level',1)==1) and (front_gap or due and (held_front or funded_front)):
+            # An intact optional side wall has not acquired exclusive work rights.
+            if p:p.pop('segment',None)
+            return self._blocked(world,worker,'yield_front_upgrade')
+        if p and p['stage']=='SUPPLY' and p.get('target_level',1)==1:
+            if world.round<p.get('retry_after',0):
+                return self._blocked(world,worker,'unstarted_maintenance_yield')
+            if world.round-p.get('last_progress_round',world.round)>=12:
+                p.update(retry_after=world.round+4,last_progress_round=world.round)
+                p.pop('segment',None)
+                return self._blocked(world,worker,'unstarted_maintenance_no_progress')
         if not p:
             options = sorted((u for u in walls.values() if u.pos in required-direct_upgrade and damaged(world,u)),
                              key=lambda u:(distance(worker.pos,u.pos),u.health,u.id))
             if not options:return []
             wall=options[0]
             p=self.plan=dict(actor=worker.id,position=wall.pos,old_id=wall.id,stage='SUPPLY',
-                created=world.round,last_progress_round=world.round,
+                created=world.round,last_progress_round=world.round,target_level=1,
                 paid_bindings={i:[(uid,level) for uid,level in targets if uid==wall.id]
                     for i,targets in session.sunset_market.checkout_targets.items()})
+            if any(p['paid_bindings'].values()):p['target_level']=2
             world.wall_rebuild_plan=p
         wall=walls.get(p['position'])
         if wall and wall.level>=2:
@@ -115,11 +139,20 @@ class WallRebuild:
         if p['stage']=='SUPPLY' and wall and not damaged(world,wall):
             self.plan={};world.wall_rebuild_plan={};return []
         if wall is None:p['stage']='REBUILD'
-        elif wall.id!=p['old_id']:p.update(stage='UPGRADE',new_id=wall.id)
+        elif wall.id!=p['old_id']:
+            if p.get('target_level',1)==1:
+                self.plan={};world.wall_rebuild_plan={}
+                self.diagnostic=dict(stage='DONE',position=wall.pos,wall=wall.id,target_level=1);return []
+            p.update(stage='UPGRADE',new_id=wall.id)
+        if wall and p['stage']=='SUPPLY' and p.get('target_level',1)>1:
+            p['stage']='UPGRADE'  # An intact upgrade target never needs demolition first.
         snapshot=(worker.pos,tuple(sorted(worker.inventory.items())),wall.id if wall else None,
                   wall.level if wall else None,p['stage'])
         if snapshot!=p.get('observation'):
-            p.update(observation=snapshot,last_progress_round=world.round)
+            old=p.get('observation')
+            if not old or snapshot[1:]!=old[1:]:p['last_progress_round']=world.round
+            if not old or snapshot[0]!=old[0]:p['last_motion_round']=world.round
+            p['observation']=snapshot
         if worker.health<220 and worker.inventory['Medicine']:
             return self._offer(world,worker,dict(action='use',name='Medicine'),'heal_first')
         if self.pending:
@@ -132,15 +165,16 @@ class WallRebuild:
         missing_stone=max(0,rule.items['stone']-worker.inventory['stone']) if p['stage']!='UPGRADE' else 0
         paid_elsewhere=sum(level==1 and uid not in {p['old_id'],p.get('new_id')}
             for uid,level in getattr(world,'checkout_targets',{}).get(worker.id,()))
-        missing_voucher=worker.inventory['WallUpgradeVoucher1']<=paid_elsewhere
+        missing_voucher=p.get('target_level',1)>1 and worker.inventory['WallUpgradeVoucher1']<=paid_elsewhere
         home=distance_field(world,defence_duties.stands(world,worker.id),worker.pos,deadline)
         if time.monotonic()>=deadline or not getattr(home,'complete',True):
-            return self._blocked(world,worker,'planner_budget_exhausted',hold=bool(p.get('segment')))
+            return self._blocked(world,worker,'planner_budget_exhausted',hold=p['stage']=='REBUILD')
         # After opening a hole, close it before any shopping. All other stages
         # may carry a bounded supply trip across days without opening the wall.
         orders=[]
         slots=max(0,(worker.capacity or 0)-len(worker.backpack)-missing_stone)
-        stock=[('Medicine',1),('WallFixer',policy.caretaker_repair_target)]
+        from .repair_decision import stock_target
+        stock=[('Medicine',1),('WallFixer',stock_target(world,policy))]
         if worker.health>=220:stock.reverse()
         if p['stage']!='REBUILD':
             from .funding import permits_bundle
@@ -162,7 +196,7 @@ class WallRebuild:
         service_goals=interaction_cells(world,[p['position']],worker.pos)
         service=weighted_field(world,{q:home[q]+(2 if p['stage']=='UPGRADE' else 3 if p['stage']=='REBUILD' else 5)
                                      for q in service_goals if q in home},worker,deadline)
-        if service is None:return self._blocked(world,worker,'planner_budget_exhausted',hold=bool(p.get('segment')))
+        if service is None:return self._blocked(world,worker,'planner_budget_exhausted',hold=p['stage']=='REBUILD')
         mines=interaction_cells(world,world.zones.get('stone',()),worker.pos)
         shops=interaction_cells(world,world.zones.get('weaponShop',()),worker.pos)
         groups={}
@@ -190,7 +224,7 @@ class WallRebuild:
         full=quote(service) if can_finish else None
         chosen=full if full and full[0]<=clock.until_night else quote(home) if groups else None
         if time.monotonic()>=deadline:
-            return self._blocked(world,worker,'planner_budget_exhausted',hold=bool(p.get('segment')))
+            return self._blocked(world,worker,'planner_budget_exhausted',hold=p['stage']=='REBUILD')
         p['full_required']=full[0] if full else None
         if not chosen or chosen[0]>clock.until_night:
             p.pop('segment',None)

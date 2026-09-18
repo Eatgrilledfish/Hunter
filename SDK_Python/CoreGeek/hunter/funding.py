@@ -4,6 +4,7 @@ import time
 from .navigation import distance_field, interaction_cells
 from . import defence_duties
 from .protocol import fingerprint
+from .day_schedule import weighted_field
 
 
 def publish(world, clock, rules, policy, intelligence, deadline):
@@ -13,7 +14,8 @@ def publish(world, clock, rules, policy, intelligence, deadline):
     worker = world.ours.get(roster.w)
     if worker and worker.backpack is not None and len(world.weapons) == rules.weapon_limit:
         capacity=max(0,(worker.capacity or 0)-len(worker.backpack))
-        stock=[('WallFixer',policy.caretaker_repair_target),('Medicine',1)]
+        from .repair_decision import stock_target
+        stock=[('WallFixer',stock_target(world,policy)),('Medicine',1)]
         if worker.health<220:stock.reverse()
         due=world.round+clock.until_night
         if clock.phases=={'night'} and clock.day is not None and clock.day<10:
@@ -52,8 +54,41 @@ def publish(world, clock, rules, policy, intelligence, deadline):
                         deadline=min(limit,world.round+max(clock.until_night,min(trips))),
                         deadline_source='safe_supply_window_strategy',expires=world.round,
                         required_rounds=min(trips)))
+    from .wall_policy import daily_upgrade_targets
+    from .defence_duties import stands
+    due=daily_upgrade_targets(world)
+    if due and clock.phases=={'day'}:
+        actors=[u for u in (worker,actor) if u and u.alive and u.backpack is not None and u.capacity is not None
+                and (u.id==roster.w or not world.phase_task and not getattr(world,'news_task_hold',False)
+                     and not intelligence.treasures)]
+        held=sum((u.inventory for u in world.movers if u.backpack is not None),Counter())
+        routes={}
+        for target in due:
+            name=f'WallUpgradeVoucher{target.level}'
+            if held[name]:held[name]-=1;continue
+            price=world.shop.get(name,0)
+            if price<=0:continue
+            for buyer in sorted(actors,key=lambda u:(not world.near_zone(u.pos,'weaponShop'),u.id!=roster.w,u.id)):
+                allocated=sum(sum(r['items'].values()) for r in world.funding_plan if r['owner']==buyer.id)
+                if len(buyer.backpack)+allocated>=buyer.capacity:continue
+                if buyer.id not in routes:
+                    start=distance_field(world,{buyer.pos},buyer.pos,deadline)
+                    home=distance_field(world,stands(world,buyer.id),buyer.pos,deadline)
+                    routes[buyer.id]=(start,home)
+                start,home=routes[buyer.id]
+                service=weighted_field(world,{p:home[p]+1 for p in interaction_cells(world,[target.pos],buyer.pos)
+                                             if p in home},buyer,deadline) or {}
+                shops=interaction_cells(world,world.zones.get('weaponShop',()),buyer.pos)
+                trips=[start[p]+service[p]+1+policy.return_buffer+8 for p in shops&start.keys()&service.keys()]
+                if time.monotonic()>=deadline or not trips or min(trips)>clock.until_night:continue
+                world.funding_plan.append(dict(owner=buyer.id,purpose='wall_upgrade',items={name:1},cost=price,
+                    position=target.pos,target_id=target.id,level=target.level,
+                    generation=getattr(world,'wall_service',{}).get(target.pos,{}).get('generation'),
+                    deadline=world.round+clock.until_night,expires=world.round,required_rounds=min(trips)))
+                break
     plan=getattr(world,'wall_rebuild_plan',{})
     if (worker and worker.backpack is not None and plan.get('actor')==worker.id
+            and plan.get('target_level',1)>1
             and plan.get('stage') in {'SUPPLY','UPGRADE'} and not worker.inventory['WallUpgradeVoucher1']):
         allocated=sum(sum(r['items'].values()) for r in world.funding_plan if r['owner']==worker.id)
         rule=rules.build_rule(world,'wall')
@@ -67,7 +102,7 @@ def publish(world, clock, rules, policy, intelligence, deadline):
     for row in world.funding_plan:
         grant=min(cash,row['cost']);cash-=grant
         row.update(granted=grant,deficit=row['cost']-grant,
-            demand_id=fingerprint([row['owner'],row['purpose'],row['items']])[:16],
+            demand_id=fingerprint([row['owner'],row['purpose'],row['items'],row.get('target_id'),row.get('generation')])[:16],
             stage='funded_await_purchase' if grant==row['cost'] else 'cash_deficit')
         if row['purpose']=='treasure':world.treasure_reserved_gold=grant
 
@@ -93,15 +128,21 @@ def permits_bundle(world, candidates, spent):
     emergency=emergency or any(c.command.get('action')=='buy' and c.command.get('name')=='Medicine'
         and c.actor in world.ours and world.ours[c.actor].health<=110 for c in candidates)
     reserve=0
+    credits=Counter()
+    for c in candidates:
+        if c.command.get('action')=='buy':credits[c.actor,c.command['name']]+=c.command.get('num',1)
     for row in rows:
         if emergency:
             continue
-        credit=sum(min(c.command.get('num',1),row['items'][c.command['name']])*world.shop[c.command['name']]
-                   for c in candidates if fulfilled(row,c,world))
+        credit=0
+        for name,count in row['items'].items():
+            used=min(count,credits[row['owner'],name])
+            credit+=used*world.shop[name]
+            credits[row['owner'],name]-=used
         reserve+=max(0,row['granted']-credit)
     return world.gold is not None and spent+reserve<=world.gold
 
 
 def item_granted(world, actor, name, quantity=1):
-    return any(r['owner']==actor and r['items'].get(name,0)>=quantity
-               and r['granted']>=world.shop.get(name,0)*quantity for r in getattr(world,'funding_plan',()))
+    return sum(r['items'].get(name,0) for r in getattr(world,'funding_plan',())
+               if r['owner']==actor and r['granted']>=r['cost'])>=quantity

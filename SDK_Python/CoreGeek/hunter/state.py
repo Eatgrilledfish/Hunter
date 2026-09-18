@@ -6,6 +6,7 @@ from .protocol import obj, array, fingerprint, distance, position
 from .rules import Clock
 from .tasks import TaskEngine
 from .intelligence import Intelligence
+from .llm_channel import LLMChannel
 from .opponent import Opponent
 from .lookahead import RiskMemory
 from .joint_lookahead import Memory as JointMemory
@@ -64,6 +65,7 @@ class Session:
     feedback_counts: dict = field(default_factory=dict)
     tasks: TaskEngine = field(default_factory=TaskEngine)
     intelligence: Intelligence = field(default_factory=Intelligence)
+    llm_channel: LLMChannel = field(default_factory=LLMChannel)
     opponent: Opponent = field(default_factory=Opponent)
     risk: RiskMemory = field(default_factory=RiskMemory)
     joint_risk: JointMemory = field(default_factory=JointMemory)
@@ -291,8 +293,10 @@ class Session:
         # Exact raw strings are archived for the half, including oversized
         # sources. The marker above prevents claiming they fit local analysis.
         # Do not evict an old negation merely because more news arrived.
+        world.llm_channel=self.llm_channel
         self.tasks.reconcile(world, clock, self.epoch)
         self.intelligence.reconcile(world, clock, self)
+        self.llm_channel.sync(self,world)
         self.opponent.reconcile(world, clock)
         self.defence.reconcile(world, clock)
         self.medical.reconcile(world, clock)
