@@ -9,6 +9,39 @@ from .llm_trace import payload, decision
 class NewsAudit:
     def __init__(self):
         self.sessions=OrderedDict()
+        self.blobs=OrderedDict()
+
+    def prompt(self, logger, text, data, **metadata):
+        """Compact logs retain exact prompts through reusable text blocks."""
+        start=text.find('{"request_id":')
+        body=json.dumps(data,ensure_ascii=False)
+        if logger.mode!='compact' or start<0 or text[start:]!=body:
+            logger.archive('news_prompt',text,**metadata)
+            return
+        def block(value):
+            digest=hashlib.sha256(value.encode('utf-8')).hexdigest()
+            if digest not in self.blobs:
+                logger.archive('news_blob',value,blob_id=digest)
+            self.blobs[digest]=True
+            self.blobs.move_to_end(digest)
+            while len(self.blobs)>512:self.blobs.popitem(last=False)
+            return ['ref',digest]
+        def value_node(value):
+            encoded=json.dumps(value,ensure_ascii=False)
+            return block(encoded) if len(encoded)>=384 else ['value',value]
+        shared_maps={'sources','evidence_sources','evidence_index','field_state',
+                     'resolved_fields','runtime_state'}
+        fields=[]
+        for name,value in data.items():
+            if name in shared_maps and isinstance(value,dict):
+                node=['object',[[k,value_node(v)] for k,v in value.items()]]
+            elif isinstance(value,list) and len(json.dumps(value,ensure_ascii=False))>=384:
+                node=['array',[value_node(v) for v in value]]
+            else:node=value_node(value)
+            fields.append([name,node])
+        manifest=dict(format='news_prompt_refs_v1',prefix=block(text[:start]),fields=fields,
+            prompt_sha256=hashlib.sha256(text.encode('utf-8')).hexdigest(),total_chars=len(text))
+        logger.archive('news_prompt_ref',json.dumps(manifest,ensure_ascii=False,separators=(',',':')),**metadata)
 
     def state(self, raw):
         team=obj(raw.get('teamOur'))
@@ -53,10 +86,32 @@ class NewsAudit:
             return
         identity=data.get('request_id')
         if identity not in state['requests']:
-            logger.archive('news_prompt',text,team=key,request_id=identity,
+            self.prompt(logger,text,data,team=key,request_id=identity,
                 cycle_id=data.get('cycle_id'),day=data.get('day'),analysis_stage=data.get('analysis_stage'))
             state['requests'].add(identity)
         state['pending']=data
+
+
+def restore_prompt(manifest, blobs):
+    """Restore an exact prompt; missing/corrupt blocks fail explicitly."""
+    if manifest.get('format')!='news_prompt_refs_v1':raise ValueError('unknown prompt format')
+    def read_block(digest):
+        text=blobs[digest]
+        if hashlib.sha256(text.encode('utf-8')).hexdigest()!=digest:raise ValueError('corrupt news block')
+        return text
+    def decode(node):
+        kind,value=node
+        if kind=='ref':return json.loads(read_block(value))
+        if kind=='value':return value
+        if kind=='object':return {k:decode(v) for k,v in value}
+        if kind=='array':return [decode(v) for v in value]
+        raise ValueError('unknown prompt node')
+    text=read_block(manifest['prefix'][1])+json.dumps(
+        {k:decode(v) for k,v in manifest['fields']},ensure_ascii=False)
+    if (len(text)!=manifest['total_chars'] or
+            hashlib.sha256(text.encode('utf-8')).hexdigest()!=manifest['prompt_sha256']):
+        raise ValueError('prompt reconstruction mismatch')
+    return text
 
 
 def write_parts(logger, event, text, metadata):

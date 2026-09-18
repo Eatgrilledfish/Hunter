@@ -1,5 +1,6 @@
 """Copyable stdout summaries by default; full event capture is opt-in."""
 from collections import Counter, OrderedDict
+from copy import deepcopy
 from dataclasses import asdict, is_dataclass
 from types import SimpleNamespace
 import hashlib
@@ -34,6 +35,8 @@ class Diagnostics(logging.Handler):
         from .news_audit import NewsAudit
         self.news_audit=NewsAudit()
         self.news_analysis_seen={}
+        self.news_analysis_body={}
+        self.duty_details_seen=OrderedDict()
 
     @staticmethod
     def _brief(value, limit=160):
@@ -43,6 +46,24 @@ class Diagnostics(logging.Handler):
     @staticmethod
     def _pos(value):
         return f"{value.get('x','?')},{value.get('y','?')}" if isinstance(value, dict) else "?"
+
+    @staticmethod
+    def _funding_summary(grants):
+        fields=('owner','purpose','items','target_id','cost','granted','deficit','deadline',
+                'required_rounds','latest_departure','demand_id')
+        result=[];groups={}
+        for row in grants:
+            record={k:row[k] for k in fields if k in row}
+            if row.get('purpose') not in {'night_essential','night_buffer','night_attack'}:
+                result.append(record);continue
+            key=tuple(row.get(k) for k in ('owner','purpose','deadline','required_rounds','latest_departure'))
+            if key not in groups:
+                record.pop('demand_id',None);record.update(items={},cost=0,granted=0,deficit=0,demands=0)
+                groups[key]=record;result.append(record)
+            group=groups[key];group['demands']+=1
+            for name,count in row['items'].items():group['items'][name]=group['items'].get(name,0)+count
+            for name in ('cost','granted','deficit'):group[name]+=row.get(name,0)
+        return result
 
     def _command(self, command):
         action = command.get("action", "?")
@@ -74,8 +95,13 @@ class Diagnostics(logging.Handler):
                     detail=duty.get(section)
                     if not detail:continue
                     ref=llm_trace.digest(json.dumps(detail,sort_keys=True,ensure_ascii=False))
-                    self._write_compact('duty_detail',ref=ref,section=section,
-                        detail=llm_trace.fit(detail,850))
+                    identity=(section,ref)
+                    if identity not in self.duty_details_seen:
+                        self._write_compact('duty_detail',ref=ref,section=section,
+                            detail=llm_trace.fit(detail,850))
+                    self.duty_details_seen[identity]=True
+                    self.duty_details_seen.move_to_end(identity)
+                    while len(self.duty_details_seen)>256:self.duty_details_seen.popitem(last=False)
                     duty[section]={'ref':ref,'stage':detail.get('stage',detail.get('status'))}
         if isinstance(record.get('work'),dict):
             record['work']={i:{k:v for k,v in row.items() if v is not None}
@@ -196,7 +222,7 @@ class Diagnostics(logging.Handler):
             value=obj(decision.get(key))
             if value and value.get('stage')!='idle':duty[key]=value
         grants=decision.get('funding_plan',[])
-        if grants:duty['funding_plan']=[{k:r[k] for k in ('owner','purpose','items','target_id','cost','granted','deficit','deadline','required_rounds','latest_departure','demand_id') if k in r} for r in grants]
+        if grants:duty['funding_plan']=self._funding_summary(grants)
         if decision.get('work_rejections'):duty['work_rejections']=decision['work_rejections']
         if decision.get('guard_funding'):duty['guard_funding']=decision['guard_funding']
         outside_repair=obj(decision.get('exterior_repair'))
@@ -445,9 +471,15 @@ class Diagnostics(logging.Handler):
         upgrade=dict(orders=orders,wall_rebuild=decision.get('wall_rebuild'),market={k:market[k] for k in ('stage','buyer','quotes','excluded','blocked','worker_busy') if k in market},
                      selected={a:self._command(c) for a,c in response.get('roleCommandMap',{}).items()
                                if c.get('action') in ('buy','use','remove','build')})
-        marker=json.dumps(upgrade,sort_keys=True,default=str)
+        def stable(value):
+            volatile={'required','required_rounds','latest_departure','deadline','expires','left','steps',
+                      'created','last_motion_round','last_progress_round','observation','demand_id','full_required'}
+            if isinstance(value,dict):return {k:stable(v) for k,v in value.items() if k not in volatile}
+            if isinstance(value,(tuple,list)):return [stable(v) for v in value]
+            return value
+        marker=json.dumps(stable(upgrade),sort_keys=True,default=str)
         if orders.get('due') and (marker!=state.get('upgrade_marker') or number%self.interval==0):
-            self.archive('wall_upgrade_decision',marker)
+            self.archive('wall_upgrade_decision',json.dumps(upgrade,sort_keys=True,default=str))
             state['upgrade_marker']=marker
         channel=obj(decision.get('llm_channel'))
         if channel and channel.get('request_id')!=state.get('llm_request_id'):
@@ -537,9 +569,17 @@ class Diagnostics(logging.Handler):
         sites=obj(decision.get('wall_service'))
         marker=tuple((p,r.get('id'),r.get('level'),r.get('state'),r.get('reserved_owner'))
             for p,r in sorted(sites.items()))
-        if sites and (marker!=state.get('wall_service_marker') or number%self.interval==0):
-            self._write_compact('wall_service',sites=sites,access=decision.get('day_access'),
-                caretaker=decision.get('caretaker_stand'))
+        if (sites or state.get('wall_service_sites')) and (marker!=state.get('wall_service_marker') or number%self.interval==0):
+            previous_sites=state.get('wall_service_sites',{})
+            changed={p:r for p,r in sites.items() if r!=previous_sites.get(p)}
+            removed=sorted(set(previous_sites)-set(sites))
+            context=dict(access=decision.get('day_access'),caretaker=decision.get('caretaker_stand'))
+            if changed or removed or context!=state.get('wall_service_context'):
+                self._write_compact('wall_service',sites=changed,removed=removed,
+                    delta='wall_service_sites' in state,previous_round=state.get('wall_service_round'),**context)
+                state['wall_service_sites']=deepcopy(sites)
+                state['wall_service_context']=deepcopy(context)
+                state['wall_service_round']=number
             state['wall_service_marker']=marker
         previous=state.setdefault('work_stages',{})
         plans=obj(decision.get('work_plans'))
@@ -575,10 +615,13 @@ class Diagnostics(logging.Handler):
                         self._write_compact("callback_error",count=count,outcome=self.local.outcome,
                                             issue=getattr(self.local,"issues",[])[:2])
                 return
-            # Repeat the immutable startup manifest after log rotation, once per day.
+            # The immutable file list is already archived at startup. A short
+            # daily reference identifies code when only a rotated tail is kept.
             manifest_day=number//130
             if getattr(self,'startup_manifest',None) and state.get('manifest_day')!=manifest_day:
-                self.archive('startup_files',self.startup_manifest,manifest_day=manifest_day)
+                if state.get('manifest_day') is not None:
+                    self._write_compact('version',day=manifest_day,
+                        manifest_sha256=hashlib.sha256(self.startup_manifest.encode()).hexdigest())
                 state['manifest_day']=manifest_day
             self._work_item_events(state,raw,response,obj(getattr(self.local,"decision",{})),units,number)
             previous_round = state["round"]
@@ -803,7 +846,15 @@ class Diagnostics(logging.Handler):
                     signature=json.dumps([data.get('selected'),[(r.get('cells'),r.get('first_rejection'),r.get('cooldown')==0) for r in data.get('candidates',[])],(getattr(self.local,'round',0) or 0)//20],sort_keys=True)
                 digest=hashlib.sha256(signature.encode()).hexdigest()
                 if self.news_analysis_seen.get(key)!=digest:
-                    self.archive(event,payload)
+                    body={k:v for k,v in data.items() if k!='status'}
+                    body_hash=hashlib.sha256(json.dumps(body,ensure_ascii=False,sort_keys=True,default=str).encode()).hexdigest()
+                    if (self.mode=='compact' and event=='news_analysis'
+                            and self.news_analysis_body.get(key)==body_hash):
+                        self._write_compact('news_analysis_status',team=data.get('team'),
+                            cycle_id=data.get('cycle_id'),status=data.get('status'),analysis_ref=body_hash)
+                    else:
+                        self.archive(event,payload,**({'analysis_ref':body_hash} if event=='news_analysis' else {}))
+                    self.news_analysis_body[key]=body_hash
                     self.news_analysis_seen[key]=digest
                 return
             if self.mode == "compact":
