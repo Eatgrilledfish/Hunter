@@ -120,6 +120,12 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
     planned = []
     limits = Counter(order_limits) if order_limits is not None and not emergency else None
     from .rear_open import enabled as rear_enabled
+    if (rear_enabled(world) and actor.id==roster.w and not actor.inventory['Medicine']
+            and space>0 and world.shop.get('Medicine',0)>0):
+        from .funding import item_granted
+        if (actor.health<220 or item_granted(world,actor.id,'Medicine')) and available>=world.shop['Medicine']:
+            planned.append(dict(name='Medicine',rank=1.7,level=0,unit=None))
+            available-=world.shop['Medicine'];space-=1
     if (rear_enabled(world) and actor.id==roster.w and not emergency
             and not getattr(world,'critical_base_ids',())
             and len(world.weapons)==rules.weapon_limit):
@@ -195,7 +201,8 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
         price = world.shop.get(req['name'],0)
         if limits is not None and limits[req['name']] <= 0:
             continue
-        predecessor = req['level'] == req['unit'].level or (uid,req['level']-1) in covered
+        predecessor = req['level'] == req['unit'].level or any(
+            r['unit'] is not None and r['unit'].id==uid and r['level']==req['level']-1 for r in held+planned)
         if not predecessor or reachable(actor.id,req) is None or not 0 < price <= available:
             continue
         # Keep an actor's successive tiers together whenever it can carry them.

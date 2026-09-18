@@ -31,6 +31,9 @@ class Diagnostics(logging.Handler):
         self.sessions = OrderedDict()
         self.external_counts = Counter()
         self.max_health = {}
+        from .news_audit import NewsAudit
+        self.news_audit=NewsAudit()
+        self.news_analysis_seen={}
 
     @staticmethod
     def _brief(value, limit=160):
@@ -757,11 +760,26 @@ class Diagnostics(logging.Handler):
                 state["details"] = 0
                 state["critical_reported"] = False
 
+    def archive(self, event, text, **metadata):
+        from .news_audit import write_parts
+        write_parts(self,event,text,metadata)
+
     def event(self, event, **data):
         if self.mode == "off":
             return
         # Logging must never replace a valid competition response with a failure.
         try:
+            if event in {'news_analysis','task_admission'}:
+                payload=json.dumps(data,ensure_ascii=False,sort_keys=True,default=str)
+                key=(event,str(data.get('team')),data.get('cycle_id'))
+                signature=payload
+                if event=='task_admission':
+                    signature=json.dumps([data.get('selected'),[(r.get('cells'),r.get('first_rejection'),r.get('cooldown')==0) for r in data.get('candidates',[])],(getattr(self.local,'round',0) or 0)//20],sort_keys=True)
+                digest=hashlib.sha256(signature.encode()).hexdigest()
+                if self.news_analysis_seen.get(key)!=digest:
+                    self.archive(event,payload)
+                    self.news_analysis_seen[key]=digest
+                return
             if self.mode == "compact":
                 self._compact_event(event,data)
                 return
@@ -807,6 +825,7 @@ class Diagnostics(logging.Handler):
                   if p.is_file() and p.suffix in {".py", ".json"}}
         hashes["run.sh"] = hashlib.sha256((root / "run.sh").read_bytes()).hexdigest()
         self.sdk_fingerprint=hashlib.sha256(json.dumps(hashes,sort_keys=True).encode()).hexdigest()[:12]
+        self.archive("startup_files",json.dumps(hashes,sort_keys=True),files_count=len(hashes))
         if self.mode == "compact":
             self._write_compact("startup",mode="compact",every=self.interval,task_diag=2,python=sys.version.split()[0],
                 sdk=hashlib.sha256(json.dumps(hashes,sort_keys=True).encode()).hexdigest()[:12],
@@ -832,7 +851,11 @@ class Diagnostics(logging.Handler):
         started = time.monotonic()
         try:
             self.event("request", request=raw)
+            try:self.news_audit.observe(self,raw)
+            except Exception:self.event('news_audit_error',stage='request')
             response = function(raw)
+            try:self.news_audit.observe(self,raw,response)
+            except Exception:self.event('news_audit_error',stage='response')
             if self.mode == "compact":
                 try:
                     self._compact_turn(raw,response,(time.monotonic()-started)*1000)

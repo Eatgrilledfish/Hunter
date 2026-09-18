@@ -110,7 +110,11 @@ class Directive:
         """
         owner = candidate.command.get('controllerId') if candidate.command.get('action')=='attack' else candidate.actor
         if owner in self.committed_actions:
-            return candidate.command in self.survival_actions.get(owner,()) or candidate.command in self.committed_actions[owner]
+            if candidate.command.get('action')=='move':
+                targets=candidate.command.get('targetPos',[])
+                if len(targets)==1 and (targets[0].get('x'),targets[0].get('y')) in self.blocked_moves.get(owner,set()):return False
+            if owner in self.survival_actions:return candidate.command in self.survival_actions[owner]
+            return candidate.command in self.committed_actions[owner]
         if self.purchase_permit is not None and not self.purchase_permit(candidate):
             return self._permission(False,candidate,'purchase')
         identity = candidate.command.get('controllerId') if candidate.command.get('action')=='attack' else candidate.actor

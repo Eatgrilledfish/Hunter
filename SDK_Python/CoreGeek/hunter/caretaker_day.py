@@ -122,7 +122,8 @@ class CaretakerDay:
             and clock.day is not None and clock.day<10 and set(world.wall_targets or ())==yellow
             and plan['gate'] not in monster_face(world,plan['anchor'])
             and (plan['gate'] in missing or door and door.level==1) else 0)
-        retained_stone = stone
+        from .wall_rebuild import stone_reserve
+        retained_stone = stone + stone_reserve(world,actor.id,rules)
         if (clock.day is not None and clock.day<10 and set(world.wall_targets or ())==yellow
                 and missing<={plan['gate']} and len(world.weapons)==rules.weapon_limit
                 and all(u.level==3 for u in world.weapons) and rule):

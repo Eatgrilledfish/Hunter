@@ -1,8 +1,8 @@
 """Source for diagnostics/preflight INSIDE the competition task subprocess."""
 
 
-def prelude(root, scope='command-local'):
-    return '_hunter_task_root = ' + repr(root) + '\n_hunter_snapshot_scope = '+repr(scope)+'\n' + SOURCE
+def prelude(root, scope='command-local', checkers=()):
+    return '_hunter_task_root = ' + repr(root) + '\n_hunter_snapshot_scope = '+repr(scope)+'\n_hunter_declared_checkers = '+repr(tuple(checkers))+'\n' + SOURCE
 
 
 SOURCE = r'''
@@ -302,8 +302,23 @@ class _HunterPopen(_hunter_popen):
         # Only argv calls with keyword options can be inspected unambiguously.
         # Never reinterpret a shell string, opaque executable override or flags.
         if not positional and not kwargs.get('shell') and not kwargs.get('executable') and isinstance(args, (list, tuple)) and args:
+            args=list(args)
             executable = args[0]
             cwd = _ho.path.abspath(kwargs.get('cwd') or _ho.getcwd())
+            known={_ho.path.realpath(p) for p in [_hsys.executable,*[_hh.which(n) for n in ('python3','python','bash','sh')]] if p}
+            index=1 if len(args)>1 and isinstance(executable,str) and _hh.which(executable) and _ho.path.realpath(_hh.which(executable)) in known else 0
+            script=args[index]
+            if isinstance(script,str) and '/' in script and not script.startswith('/'):
+                root=_ho.path.realpath(_hunter_task_root)
+                requested=_ho.path.abspath(_ho.path.join(cwd,script))
+                canonical=_ho.path.normpath(script)
+                corrected=_ho.path.realpath(_ho.path.join(root,canonical))
+                if (canonical in _hunter_declared_checkers and not _ho.path.exists(requested)
+                        and _ho.path.commonpath([root,corrected])==root and _ho.path.isfile(corrected)):
+                    args[index]=corrected
+                    _hunter_event(kind='checker_path_repaired',requested=_ho.path.relpath(requested,root),path=canonical,
+                                  basis='complete_document_manifest_and_observed_file')
+                    executable=args[0]
             if isinstance(executable, str) and '/' in executable:
                 path = _ho.path.abspath(_ho.path.join(cwd, executable))
                 real = _ho.path.realpath(path)

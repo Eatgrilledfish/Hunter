@@ -25,9 +25,9 @@ def propose(world, clock, rules, policy, miner, deadline, *, stock=None):
     cost=missing*price
     available=max(0,world.gold-getattr(world,'treasure_reserved_gold',0))
     if buyer:
-        cost=sum(r['cost'] for r in world.funding_plan)
-        available=world.gold
-        missing=max(0,cost-available)
+        cost=sum(r['cost'] for r in world.funding_plan if r['owner']==worker.id and r['deadline']<=buyer['deadline'])
+        missing=sum(r['deficit'] for r in world.funding_plan if r['owner']==worker.id and r['deadline']<=buyer['deadline'])
+        available=cost-missing
     if not missing or available>=cost:return None,{}
     if clock.phases=={'day'}:horizon=clock.until_night
     elif clock.phases=={'night'} and clock.day<10:
@@ -62,7 +62,7 @@ def propose(world, clock, rules, policy, miner, deadline, *, stock=None):
     shops=interaction_cells(world,world.zones.get('weaponShop',()),worker.pos,blocked)
     reach=distance_field(world,{worker.pos},worker.pos,deadline,blocked)
     home=distance_field(world,defence_duties.stands(world,worker.id),worker.pos,deadline,blocked)
-    buy_rounds=len(buyer['items']) if buyer else 1
+    buy_rounds=len({name for row in world.funding_plan if row['owner']==worker.id and row['deadline']<=buyer['deadline'] for name in row['items']}) if buyer else 1
     options=[(max(sale_walk+len(stock)+1,reach[p])+buy_rounds+1+home[p]+policy.return_buffer,p)
              for p in shops&reach.keys()&home.keys()]
     if not options or time.monotonic()>=deadline:return None,{}

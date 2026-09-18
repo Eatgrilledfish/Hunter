@@ -70,6 +70,13 @@ def token_answer(task, data):
         fields={'token'}
     if not fields and any(re.search(r'\breturn\s+(?:its|the\s+checker[’\']?s)\s+token\s*[.;]',t,re.I) for t in texts):
         fields={'token'}
+    if not fields:
+        import json
+        for text in texts:
+            for match in re.finditer(r'(?:返回|提交)[^。\n]{0,60}?(\{[^{}\n]*\})',text):
+                try:value=json.loads(match[1])
+                except ValueError:continue
+                if isinstance(value,dict) and set(value)=={'token'}:fields={'token'}
     if not required or fields!={'token'} or not schema['json_required']:
         return None
     sources=[r.get('stdout','') for r in data.get('checker_outputs',[])

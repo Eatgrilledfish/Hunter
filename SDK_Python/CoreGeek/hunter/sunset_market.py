@@ -41,9 +41,19 @@ class SunsetMarket:
 
     def publish_checkout_targets(self,world):
         """Expose live paid ownership before repair and night candidates run."""
+        from .wall_rebuild import upgrade_ready
+        if not hasattr(world,'wall_delivery_waits'):world.wall_delivery_waits={}
+        released={i:[(uid,level) for uid,level in targets if uid in world.ours
+                     and world.ours[uid].kind=='wall' and not upgrade_ready(world,world.ours[uid])]
+                  for i,targets in self.checkout_targets.items()}
+        for identity,targets in released.items():
+            if targets:
+                self.checkout_intents.pop(identity,None)
+                getattr(world,'wall_delivery_waits',{}).update({identity:dict(reason='waiting_for_rebuild',released_targets=targets)})
         self.checkout_targets={i:[(uid,level) for uid,level in targets
             if uid in world.ours and world.ours[uid].alive
-            and world.ours[uid].level is not None and world.ours[uid].level<=level]
+            and world.ours[uid].level is not None and world.ours[uid].level<=level
+            and (world.ours[uid].kind!='wall' or upgrade_ready(world,world.ours[uid]))]
             for i,targets in self.checkout_targets.items() if i in world.ours and world.ours[i].alive}
         world.checkout_targets=self.checkout_targets
 

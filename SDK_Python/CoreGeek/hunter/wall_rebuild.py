@@ -6,6 +6,7 @@ from .arbitration import Candidate
 from .navigation import distance_field, interaction_cells, neighbours
 from .protocol import pos_json, distance
 from . import rear_open, defence_duties
+from .day_schedule import weighted_field
 
 
 def damaged(world, wall):
@@ -21,6 +22,19 @@ def damaged(world, wall):
 
 def commands(world, identity):
     return getattr(world, 'wall_rebuild_actions', {}).get(identity)
+
+
+def stone_reserve(world, identity, rules):
+    plan=getattr(world,'wall_rebuild_plan',{})
+    rule=rules.build_rule(world,'wall')
+    if not plan or plan.get('actor')!=identity or not rule:return 0
+    wall=next((u for u in world.ours.values() if u.alive and u.kind=='wall' and u.pos==plan['position']),None)
+    return rule.items.get('stone',0) if wall and damaged(world,wall) else 0
+
+
+def upgrade_ready(world, wall):
+    clock=getattr(world,'strategy_clock',None)
+    return not (clock and clock.phases=={'day'} and damaged(world,wall))
 
 
 @dataclass
@@ -76,102 +90,132 @@ class WallRebuild:
         if clock.phases != {'day'}:
             self.diagnostic = dict(stage='night_pause', plan=dict(p)) if p else self.diagnostic
             return []
-        # Never open a second gap. Existing mandatory construction goes first.
         required = set(world.wall_targets or ()) & rear_open.required(world)
         if not p:
-            if required - walls.keys():
-                return []
             options = sorted((u for u in walls.values() if u.pos in required and damaged(world,u)),
                              key=lambda u:(distance(worker.pos,u.pos),u.health,u.id))
-            if not options:
-                return []
-            wall = options[0]
-            p = self.plan = dict(actor=worker.id, position=wall.pos, old_id=wall.id,
-                                stage='SUPPLY', created=world.round,
-                                paid_bindings={i:[(uid,level) for uid,level in targets if uid==wall.id]
-                                    for i,targets in session.sunset_market.checkout_targets.items()})
-            world.wall_rebuild_plan = p
-        wall = walls.get(p['position'])
-        if wall and wall.level >= 2:
-            self.plan = {}; world.wall_rebuild_plan = {}
-            self.diagnostic = dict(stage='observed_upgraded', wall=wall.id)
-            return []
-        if p['stage'] == 'SUPPLY' and wall and not damaged(world,wall):
-            self.plan = {}; world.wall_rebuild_plan = {}
-            return []
-        if wall is None:
-            p['stage'] = 'REBUILD'  # A real externally destroyed wall also needs closure.
-        elif wall.id != p['old_id'] and p['stage'] != 'UPGRADE':
-            # An independent builder restored this coordinate; never remove it.
-            p.update(stage='UPGRADE', new_id=wall.id)
+            if not options:return []
+            wall=options[0]
+            p=self.plan=dict(actor=worker.id,position=wall.pos,old_id=wall.id,stage='SUPPLY',
+                created=world.round,last_progress_round=world.round,
+                paid_bindings={i:[(uid,level) for uid,level in targets if uid==wall.id]
+                    for i,targets in session.sunset_market.checkout_targets.items()})
+            world.wall_rebuild_plan=p
+        wall=walls.get(p['position'])
+        if wall and wall.level>=2:
+            self.plan={};world.wall_rebuild_plan={}
+            self.diagnostic=dict(stage='observed_upgraded',wall=wall.id);return []
+        if p['stage']=='SUPPLY' and wall and not damaged(world,wall):
+            self.plan={};world.wall_rebuild_plan={};return []
+        if wall is None:p['stage']='REBUILD'
+        elif wall.id!=p['old_id']:p.update(stage='UPGRADE',new_id=wall.id)
+        snapshot=(worker.pos,tuple(sorted(worker.inventory.items())),wall.id if wall else None,
+                  wall.level if wall else None,p['stage'])
+        if snapshot!=p.get('observation'):
+            p.update(observation=snapshot,last_progress_round=world.round)
+        if worker.health<220 and worker.inventory['Medicine']:
+            return self._offer(world,worker,dict(action='use',name='Medicine'),'heal_first')
         if self.pending:
-            self.diagnostic = dict(stage='pending_receipt', plan=dict(p))
-            world.wall_rebuild_actions[worker.id] = []
-            return []
-        if worker.health < 220 and worker.inventory['Medicine']:
-            return self._offer(world, worker, dict(action='use',name='Medicine'), 'heal_first')
+            return self._blocked(world,worker,'receipt_unknown',hold=True)
         if any(r.alive and r.target_team in (None,world.side) for r in world.robots.values()):
-            self.diagnostic = dict(stage='observed_threat_blocks_demolition', plan=dict(p))
-            return []
-        start = distance_field(world,{worker.pos},worker.pos,deadline)
-        home = distance_field(world,defence_duties.stands(world,worker.id),worker.pos,deadline)
-        stands = interaction_cells(world,[p['position']],worker.pos)
-        options = [(start[q]+home[q],q) for q in stands & start.keys() & home.keys()]
-        if not options:
-            self.diagnostic = dict(stage='no_service_route', plan=dict(p))
-            return []
-        _, stand = min(options)
-        service = distance_field(world,{stand},worker.pos,deadline)
-        needed_steps = start[stand]+home[stand]+policy.return_buffer+5
-        material = worker.inventory['stone'] > 0
+            return self._blocked(world,worker,'observed_threat_blocks_demolition')
+        rule=rules.build_rule(world,'wall')
+        if not rule or not rule.items.get('stone'):
+            return self._blocked(world,worker,'unknown_build_cost')
+        missing_stone=max(0,rule.items['stone']-worker.inventory['stone']) if p['stage']!='UPGRADE' else 0
         paid_elsewhere=sum(level==1 and uid not in {p['old_id'],p.get('new_id')}
             for uid,level in getattr(world,'checkout_targets',{}).get(worker.id,()))
-        voucher = worker.inventory['WallUpgradeVoucher1'] > paid_elsewhere
-        targets, action = {stand}, None
-        if not material and p['stage'] != 'UPGRADE':
-            goals = interaction_cells(world,world.zones.get('stone',()),worker.pos)
-            options = [(start[q]+1+service[q]+home[stand]+policy.return_buffer+5,q)
-                       for q in goals & start.keys() & service.keys()]
-            if not options:
-                self.diagnostic = dict(stage='personal_stone_unavailable', plan=dict(p)); return []
-            needed_steps, goal = min(options); targets = {goal}
-            if worker.pos == goal:
-                rock = min(q for q in world.zones['stone'] if distance(q,worker.pos)<=1)
-                action = dict(action='collect',targetPos=[pos_json(rock)])
-        elif not voucher and p['stage'] != 'REBUILD':
-            price = world.shop.get('WallUpgradeVoucher1')
-            reserve = getattr(world,'treasure_reserved_gold',0)
+        missing_voucher=worker.inventory['WallUpgradeVoucher1']<=paid_elsewhere
+        home=distance_field(world,defence_duties.stands(world,worker.id),worker.pos,deadline)
+        if time.monotonic()>=deadline or not getattr(home,'complete',True):
+            return self._blocked(world,worker,'planner_budget_exhausted',hold=bool(p.get('segment')))
+        # After opening a hole, close it before any shopping. All other stages
+        # may carry a bounded supply trip across days without opening the wall.
+        orders=[]
+        slots=max(0,(worker.capacity or 0)-len(worker.backpack)-missing_stone)
+        stock=[('Medicine',1),('WallFixer',policy.caretaker_repair_target)]
+        if worker.health>=220:stock.reverse()
+        if p['stage']!='REBUILD':
             from .funding import permits_bundle
-            quote=Candidate(worker.id,dict(action='buy',name='WallUpgradeVoucher1',num=1),0,'rebuild funding quote')
-            if not price or world.gold is None or world.gold < price+reserve or not permits_bundle(world,[quote],price):
-                self.diagnostic = dict(stage='upgrade_funding_wait', plan=dict(p), required=price)
-                return []
-            shops = interaction_cells(world,world.zones.get('weaponShop',()),worker.pos)
-            options = [(start[q]+1+service[q]+home[stand]+policy.return_buffer+5,q)
-                       for q in shops & start.keys() & service.keys()]
-            if not options:
-                self.diagnostic = dict(stage='upgrade_shop_unreachable', plan=dict(p)); return []
-            needed_steps, goal = min(options); targets = {goal}
-            if worker.pos == goal:
-                action = dict(action='buy',name='WallUpgradeVoucher1',num=1)
-        elif worker.pos == stand:
-            if p['stage'] == 'REBUILD':
-                action = dict(action='build',name='wall',targetPos=[pos_json(p['position'])])
-            elif p['stage'] == 'UPGRADE':
-                action = dict(action='use',name='WallUpgradeVoucher1',targetPos=[pos_json(p['position'])])
-            elif wall and wall.id == p['old_id'] and damaged(world,wall):
-                action = dict(action='remove',targetPos=[pos_json(p['position'])])
-        if needed_steps > clock.until_night and p['stage'] == 'SUPPLY':
-            self.diagnostic = dict(stage='daylight_window_insufficient', required=needed_steps, plan=dict(p))
-            return []
-        if action is None:
-            route = distance_field(world,targets,worker.pos,deadline)
-            steps = sorted(q for q in neighbours(worker.pos) if route.get(q,float('inf')) < route.get(worker.pos,0))
-            if not steps or time.monotonic() >= deadline:
-                return []
-            action = dict(action='move',targetPos=[pos_json(steps[0])])
-        # Demolition is never granted on a speculative future receipt.
-        return self._offer(world,worker,action,p['stage'])
+            for name,target in stock+([('WallUpgradeVoucher1',paid_elsewhere+1)] if missing_voucher else []):
+                price=world.shop.get(name,0)
+                qty=min(slots,max(0,target-worker.inventory[name])) if price>0 else 0
+                while qty:
+                    trial=orders+[dict(action='buy',name=name,num=qty)]
+                    quoted=[Candidate(worker.id,c,0,'wall supply') for c in trial]
+                    if permits_bundle(world,quoted,sum(world.shop[c['name']]*c['num'] for c in trial)):
+                        orders=trial;slots-=qty;break
+                    qty-=1
+        # Being at the shop is a real opportunity: fund personal treatment and
+        # stock first even when today's remaining demolition tour cannot fit.
+        if orders and world.near_zone(worker.pos,'weaponShop'):
+            needed=home.get(worker.pos,float('inf'))+len(orders)+policy.return_buffer+2
+            if needed<=clock.until_night or orders[0]['name']=='Medicine' and worker.health<220:
+                return self._offer(world,worker,orders[0],'supply_at_shop')
+        service_goals=interaction_cells(world,[p['position']],worker.pos)
+        service=weighted_field(world,{q:home[q]+(2 if p['stage']=='UPGRADE' else 3 if p['stage']=='REBUILD' else 5)
+                                     for q in service_goals if q in home},worker,deadline)
+        if service is None:return self._blocked(world,worker,'planner_budget_exhausted',hold=bool(p.get('segment')))
+        mines=interaction_cells(world,world.zones.get('stone',()),worker.pos)
+        shops=interaction_cells(world,world.zones.get('weaponShop',()),worker.pos)
+        groups={}
+        if missing_stone:groups['stone']=(mines,missing_stone)
+        if orders:groups['shop']=(shops,len(orders)+(1 if worker.health<220 and not worker.inventory['Medicine'] else 0))
+        can_finish=not missing_voucher or any(c['name']=='WallUpgradeVoucher1' for c in orders)
+        if p['stage']=='REBUILD':can_finish=True
+        gaps=required-walls.keys()-{p['position']}
+        # Recheck on every demolition attempt, not just when creating a plan.
+        if gaps and p['stage']=='SUPPLY':can_finish=False
+        def quote(tail):
+            sequences=[tuple(groups)]
+            if len(groups)==2:sequences.append(tuple(reversed(tuple(groups))))
+            options=[]
+            for seq in sequences:
+                current=tail;routes={}
+                for name in reversed(seq):
+                    goals,actions=groups[name]
+                    current=weighted_field(world,{q:current[q]+actions for q in goals if q in current},worker,deadline)
+                    if current is None:break
+                    routes[name]=current
+                if current is not None and worker.pos in current:
+                    options.append((current[worker.pos]+policy.return_buffer,seq,current,routes))
+            return min(options,key=lambda row:(row[0],row[1]!=tuple(p.get('segment',())))) if options else None
+        full=quote(service) if can_finish else None
+        chosen=full if full and full[0]<=clock.until_night else quote(home) if groups else None
+        if time.monotonic()>=deadline:
+            return self._blocked(world,worker,'planner_budget_exhausted',hold=bool(p.get('segment')))
+        p['full_required']=full[0] if full else None
+        if not chosen or chosen[0]>clock.until_night:
+            p.pop('segment',None)
+            return self._blocked(world,worker,'daylight_window_insufficient' if chosen or full else
+                'missing_personal_voucher' if missing_voucher else 'no_service_route',hold=p['stage']=='REBUILD')
+        needed,seq,route,_=chosen
+        p.update(segment=list(seq),expected_finish=world.round+needed,phase_deadline=world.round+clock.until_night)
+        if seq:
+            name=seq[0]
+            if name=='stone' and worker.pos in mines:
+                if (worker.capacity or 0)<=len(worker.backpack):return self._blocked(world,worker,'capacity')
+                rock=min(q for q in world.zones['stone'] if distance(q,worker.pos)<=1)
+                return self._offer(world,worker,dict(action='collect',targetPos=[pos_json(rock)]),'acquire_stone')
+            if name=='shop' and worker.pos in shops:
+                return self._offer(world,worker,orders[0],'acquire_supplies')
+        elif worker.pos in service_goals:
+            if p['stage']=='REBUILD':action=dict(action='build',name='wall',targetPos=[pos_json(p['position'])])
+            elif p['stage']=='UPGRADE':action=dict(action='use',name='WallUpgradeVoucher1',targetPos=[pos_json(p['position'])])
+            elif not gaps and not missing_stone and not missing_voucher:
+                action=dict(action='remove',targetPos=[pos_json(p['position'])])
+            else:return self._blocked(world,worker,'prerequisites_changed')
+            return self._offer(world,worker,action,p['stage'])
+        steps=sorted(q for q in neighbours(worker.pos) if route.get(q,float('inf'))<route.get(worker.pos,0))
+        if not steps:return self._blocked(world,worker,'route_incomplete',hold=p['stage']=='REBUILD')
+        return self._offer(world,worker,dict(action='move',targetPos=[pos_json(steps[0])]),
+                           'prepare_next_day' if chosen is not full else p['stage'])
+
+    def _blocked(self,world,worker,reason,hold=False):
+        self.diagnostic=dict(stage=reason,plan=dict(self.plan),next_action_owner=worker.id,
+                             blocked_reason=reason)
+        if hold:world.wall_rebuild_actions[worker.id]=[]
+        return []
 
     def _offer(self, world, worker, command, stage):
         world.wall_rebuild_actions[worker.id] = [command]

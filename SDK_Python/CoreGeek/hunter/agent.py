@@ -135,6 +135,7 @@ class Agent:
                 draft.sunset_market.upgrade_travellers.discard(incoming)
                 draft.night_clear.actor=None
                 draft.repair.active.clear()
+            world.wall_rebuild_plan=draft.wall_rebuild.plan
             from . import funding
             funding.publish(world,clock,self.rules,self.policy,draft.intelligence,
                             min(start+self.policy.planning_seconds,time.monotonic()+.025))
@@ -189,7 +190,7 @@ class Agent:
             draft.day_schedule.division.reconcile_assistance(world,build_jobs)
             draft.wall_service.assign(world,clock,build_jobs)
             rebuilding=draft.wall_rebuild.prepare(world,clock,self.rules,self.policy,
-                min(start+self.policy.planning_seconds,time.monotonic()+.025),draft)
+                min(start+self.policy.planning_seconds,time.monotonic()+.055),draft)
             build_jobs={i:j for i,j in build_jobs.items() if i not in world.wall_rebuild_actions}
             immediate = draft.filter_failures(economy.immediate(world, self.rules, task_actor, jobs=build_jobs, policy=self.policy), world.round)
             from .wall_service import build_permitted, use_permitted
@@ -200,7 +201,7 @@ class Agent:
             candidates = list(immediate)+rebuilding
             deadline = start + self.policy.planning_seconds
             task_choice = task_schedule.choose(world,clock,self.policy,min(deadline,time.monotonic()+.04),draft.tasks.timing)
-            if (self.policy.pioneer_rotation_enabled and clock.phases=={'day'} and task_choice
+            if (self.policy.pioneer_rotation_enabled and not world.six_task_priority and clock.phases=={'day'} and task_choice
                     and task_choice.get('selected') and not draft.tasks.active and not draft.tasks.accept_pending
                     and draft.sunset_market.upgrade_owner in (None,task_choice['actor'])):
                 actor=world.ours[task_choice['actor']]
@@ -217,8 +218,13 @@ class Agent:
             guidance.committed_actions = world.wall_rebuild_actions
             from .wall_policy import purchase_permitted
             from .wall_service import use_permitted
-            guidance.purchase_permit = lambda candidate: (purchase_permitted(world,self.rules,candidate)
-                and use_permitted(world,candidate) and build_permitted(world,candidate))
+            def service_permit(candidate):
+                for label,allowed in [('buy_policy',purchase_permitted(world,self.rules,candidate)),
+                                      ('wall_use_policy',use_permitted(world,candidate)),
+                                      ('wall_build_policy',build_permitted(world,candidate))]:
+                    if not allowed:return guidance._permission(False,candidate,label)
+                return True
+            guidance.purchase_permit = service_permit
             from . import return_recovery
             recovery_moves, return_recovery_report = return_recovery.propose(
                 world,clock,self.policy,min(deadline,time.monotonic()+.04))
@@ -399,8 +405,11 @@ class Agent:
                         and identity not in clearing_ids and identity not in draft.external_gate.commands
                         and not guidance.return_routes.get(identity, {}).get('due')):
                     approach = task_choice['candidates'] + draft.tasks.candidates(world, choice=task_choice)
+                    old_work=guidance.work_plans.pop(identity,None) if world.six_task_priority else None
                     approach = [c for c in draft.filter_failures(approach, world.round) if guidance.permit(c)]
-                    if approach or world.six_task_priority:
+                    waiting_here=(world.six_task_priority and world.ours[identity].pos==selected_task['goal'] and offer.get('coldDownRounds',0)>0)
+                    if not approach and not waiting_here and old_work:guidance.work_plans[identity]=old_work
+                    if approach or waiting_here:
                         guidance.work_plans[identity] = dict(owner='task_approach', phase='approach_or_accept',
                             commands=[c.command for c in approach])
                         candidates.extend(approach)
@@ -861,6 +870,16 @@ class Agent:
                       "empty_map_officially_verified": self.rules.empty_actions_verified}
             try:
                 self.telemetry.append(record)
+                self._diagnostic('news_analysis',team=(world.raw.get('teamOur') or {}).get('teamId'),
+                    cycle_id=draft.intelligence.cycle.number,status=draft.intelligence.llm_status,
+                    diagnostic=draft.intelligence.llm_diagnostic,fields=draft.intelligence.field_state,
+                    rejected=draft.intelligence.invalid_candidates,suspended=draft.intelligence.plans_suspended,
+                    treasures=draft.intelligence.treasures,purchases=draft.intelligence.preparations)
+                if getattr(world,'task_admission',None):
+                    record['task_admission']=world.task_admission
+                    self._diagnostic('task_admission',team=world.side,candidates=world.task_admission,
+                        selected=selected_task.get('goal') if selected_task else None,deadline=getattr(world,'six_task_deadline',{}))
+                record['wall_delivery_waits']=getattr(world,'wall_delivery_waits',{})
                 self._diagnostic("decision", **record)
                 if self.diagnostics is not None:
                     checks = []

@@ -149,6 +149,9 @@ def check_action(world, clock, rules, identity, command, *, task_actor=None, sum
                 return unknown("inventory unavailable")
             if any(actor.inventory[k] < n for k, n in rule.items.items()):
                 return invalid("insufficient personal materials")
+            from .wall_rebuild import stone_reserve
+            if actor.inventory["stone"]-rule.items.get("stone",0)<stone_reserve(world,identity,rules):
+                return invalid("stone bound to wall rebuild")
             r.gold = rule.gold
             r.items.update({(identity, k): n for k, n in rule.items.items()})
             r.cells.add(target)
@@ -178,6 +181,10 @@ def check_action(world, clock, rules, identity, command, *, task_actor=None, sum
         if action == "sell":
             if name not in MINERALS or name not in world.vendor or actor.inventory[name] < quantity:
                 return invalid("untradeable or insufficient minerals")
+            if name == "stone":
+                from .wall_rebuild import stone_reserve
+                if actor.inventory[name]-quantity < stone_reserve(world,identity,rules):
+                    return invalid("stone bound to wall rebuild")
             r.items[(identity, name)] = quantity
         else:
             if name not in world.shop:

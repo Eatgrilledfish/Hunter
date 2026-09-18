@@ -34,6 +34,8 @@ def gatling_upgrade_status(world, unit, policy, rules):
 
 def upgrade_allowed(world, unit, policy, rules):
     from .wall_policy import planned_gate, upgrade_targets
+    from .wall_rebuild import upgrade_ready
+    if unit.kind=='wall' and not upgrade_ready(world,unit):return False
     if unit.kind == 'wall' and unit.pos == planned_gate(world):
         return False
     if unit.kind == 'wall' and getattr(world, 'staged_walls', False):

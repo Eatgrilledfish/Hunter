@@ -43,8 +43,13 @@ def rank(world, clock, policy, timing, rows, deadline):
         ready={k:world.round+max(0,t.get('coldDownRounds',0)) for k,t in offers.items()}
         ready[first]=finish+31
         best=[float('inf'),[]]
+        prefix=[0,float('inf'),[]]
         def visit(now,pos,counts,cool,trace):
             if time.monotonic()>=deadline:return
+            back=to_home.get(pos)
+            end=now+task_return_reserve(world,policy,back,deadline) if back is not None else float('inf')
+            if end<horizon and (len(trace)>prefix[0] or len(trace)==prefix[0] and end<prefix[1]):
+                prefix[:]=[len(trace),end,trace]
             if not any(counts.values()):
                 back=to_home.get(pos)
                 if back is not None:
@@ -74,6 +79,9 @@ def rank(world, clock, policy, timing, rows, deadline):
         visit(finish,row['goal'],rem,ready,[(first,finish-row['minimum_solve_strategy_rounds']-2,finish)])
         row['six_task_finish_scenario']=best[0] if best[0]!=float('inf') else None
         row['six_task_sequence']=best[1]
+        row['tasks_before_deadline_scenario']=prefix[0]
+        row['partial_sequence_scenario']=prefix[2]
+        row['partial_finish_with_return']=prefix[1] if prefix[1]!=float('inf') else None
         results.append(row)
     forecast=min((r['six_task_finish_scenario'] for r in results if r['six_task_finish_scenario'] is not None),default=None)
     world.six_task_deadline=dict(deadline=horizon-1,forecast_with_return=forecast,

@@ -119,7 +119,8 @@ def choose(world, clock, policy, deadline, timing=None):
     field = distance_field(world,[actor.pos],actor.pos,deadline)
     home = home_cells(world, actor)
     home_field = distance_field(world,home,actor.pos,deadline) if home else {}
-    rows = []
+    rows = [];admission=[]
+    world.task_admission=admission
     interaction = {id(t):interaction_cells(world,world.task_cells(t),actor.pos) for t in tasks}
     for task in tasks:
         estimate = (timing or TaskTiming()).estimate(descriptor(task, world.task_cells(task)), task['timeoutRounds'])
@@ -127,11 +128,12 @@ def choose(world, clock, policy, deadline, timing=None):
         # acceptTask has no target ID. Do not promise a choice from a cell
         # touching multiple advertised task points.
         cells = interaction[id(task)] - set().union(*(interaction[id(t)] for t in tasks if t is not task))
-        routes = []
+        routes = [];blocked={}
+        def deny(reason):blocked[reason]=blocked.get(reason,0)+1
         for cell in sorted(cells & field.keys()):
             risk = exposure(world,clock,cell)
             if risk['unknown_robot_damage'] or risk['upper_per_attack_opportunity']*2 >= actor.health:
-                continue
+                deny('task_route_danger');continue
             travel = field[cell]
             back = home_field.get(cell) if home else 0
             duration = task['timeoutRounds']
@@ -140,13 +142,17 @@ def choose(world, clock, policy, deadline, timing=None):
             # Cold tasks reserve a declared strategy window, not their whole
             # possibly 120-round timeout; learned durations remain observations.
             if back is None or ready_in+1+solve_rounds+task_return_reserve(world,policy,back,deadline) > clock.until_night:
-                continue
+                deny('no_return_route' if back is None else 'solve_and_return_exceed_daylight');continue
             # Accept and finish use their own turns. Preserve the current
             # defence policy; conditional night release is a separate change.
             if policy.task_full_timeout_guard_enabled and clock.phases == {'day'} and home and (back is None or
                     ready_in+1+duration+task_return_reserve(world,policy,back,deadline) > clock.until_night):
-                continue
+                deny('full_timeout_guard');continue
             routes.append((risk['upper_per_attack_opportunity'],travel,cell,back))
+        admission.append(dict(cells=sorted(world.task_cells(task)),cooldown=task['coldDownRounds'],
+            solve_rounds=solve_rounds,until_night=clock.until_night,blocked=blocked,
+            first_rejection=next(iter(blocked),'no_unambiguous_reachable_cell') if not routes else None,
+            routes=[dict(risk=r,travel=t,goal=c,back=b,return_reserve=task_return_reserve(world,policy,b,deadline)) for r,t,c,b in sorted(routes)[:3]]))
         if not routes:
             continue
         risk,travel,cell,back = min(routes)
@@ -172,7 +178,8 @@ def choose(world, clock, policy, deadline, timing=None):
     from .task_deadline import rank, priority
     rows=rank(world,clock,policy,timing or TaskTiming(),rows,deadline)
     winner = min(rows,key=lambda r:(r['risk'],
-        r.get('six_task_finish_scenario') or float('inf') if priority(world,clock) else 0,
+        -r.get('tasks_before_deadline_scenario',0) if priority(world,clock) else 0,
+        r.get('six_task_finish_scenario') or r.get('partial_finish_with_return') or float('inf') if priority(world,clock) else 0,
         -r['full_correct_rate'],r['travel'],r['goal']))
     goal = winner['goal']
     candidates = []

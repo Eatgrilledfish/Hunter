@@ -1027,6 +1027,11 @@ class TaskEngine:
                 if recovered is not None:
                     data['checker_answer']=recovered
                     output={'format':'json','selector':['checker_answer']}
+            if output is None and pending['operation'] in {'run_python','run_tool'}:
+                task.diagnostic_events.append(dict(kind='auto_submit_not_attempted',round=world.round,
+                    reason='no explicit answer output or unique declared checker token contract',evidence=evidence_id,
+                    completeness=data.get('completeness')))
+                task.diagnostic_events=task.diagnostic_events[-8:]
             # A final successful calculation can arrive after the model's
             # last useful round. An explicit answer contract lets us submit
             # its complete JSON now, without guessing from prose or an API

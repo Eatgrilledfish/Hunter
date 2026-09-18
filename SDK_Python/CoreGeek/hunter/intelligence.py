@@ -58,6 +58,8 @@ class Intelligence:
     execution_blockers: dict = field(default_factory=dict)
     invalid_candidates: list = field(default_factory=list)
     validation_reviews: dict = field(default_factory=dict)
+    plans_suspended: bool = False
+    field_state: dict = field(default_factory=dict)
 
     @staticmethod
     def news_id(entry):
@@ -149,14 +151,21 @@ class Intelligence:
                     data.setdefault('treasures',[])
                     if not isinstance(data.get("events"), list) or not isinstance(data.get("treasures"), list):
                         raise ValueError("invalid news collections")
+                    from copy import deepcopy
+                    trial=deepcopy(self)
                     if policy.news_daily_enabled:
                         if data.get('decision','WAIT_INFO') not in {'WAIT_INFO','BUY_READY','DIG_READY'}:
                             raise ValueError('invalid news decision')
-                        # Each new accepted analysis revises the actionable plan;
-                        # an empty conclusion cannot leave yesterday's plan live.
-                        self.treasures.clear()
-                        self.preparations.clear()
-                    self._ingest(world, data, self.pending.get("citation_sources",self.pending["sources"]))
+                        trial.treasures=[];trial.preparations=[]
+                    reviewed=set(self.pending.get('validation_ids',()))
+                    trial.invalid_candidates=[v for v in trial.invalid_candidates if v['id'] not in reviewed]
+                    trial._ingest(world,data,self.pending.get('citation_sources',self.pending['sources']),self.pending.get('evidence_version'))
+                    for key in ('clues','events','rejections','unresolved','invalid_candidates','llm_diagnostic','field_state'):
+                        setattr(self,key,getattr(trial,key))
+                    rejected=bool(self.llm_diagnostic.get('rejected'))
+                    self.plans_suspended=rejected and not (trial.treasures or trial.preparations)
+                    if not self.plans_suspended:
+                        self.treasures,self.preparations=trial.treasures,trial.preparations
                     trip=self.preparation_trip
                     if (policy.news_daily_enabled and not self.preparations and not self.treasures
                             and trip and trip.get('phase') not in {'completed','handed_over'}):
@@ -167,14 +176,13 @@ class Intelligence:
                     self.reviewed_sources.update(self.pending.get('review_sources',()))
                     if self.pending.get('synthesis_corpus'):
                         self.synthesized_sources.add(self.pending['synthesis_corpus'])
-                    reviewed=set(self.pending.get('validation_ids',()))
-                    self.invalid_candidates=[v for v in self.invalid_candidates if v['id'] not in reviewed]
                     self.pending = None
                     if policy.news_daily_enabled:
-                        self.cycle.status = ('dig_ready' if self.treasures else 'buy_ready' if self.preparations else 'wait_info')
+                        self.cycle.status = ('revalidation_required' if self.plans_suspended else 'dig_ready' if self.treasures else 'buy_ready' if self.preparations else 'wait_info')
                     self.llm_status = ('accepted_without_plan' if self.llm_diagnostic.get('rejected')
                                        and not self.llm_diagnostic.get('progress',{}).get('new_hypotheses') else 'accepted')
                 except (ValueError, TypeError, KeyError) as exc:
+                    self.plans_suspended=True
                     self.llm_status = "invalid_response"
                     self.llm_diagnostic['reason']=str(exc)[:100]
                     self.pending['rejection']=self.llm_diagnostic.copy()
@@ -203,7 +211,7 @@ class Intelligence:
         folk={k:v for k,v in sources.items() if v['section']=='folkLegends'}
         self.treasure_complete=(set(folk)<=self.analyzed and not any(n['truncated_locally'] for n in folk.values()))
 
-    def _ingest(self, world, data, sources):
+    def _ingest(self, world, data, sources, required_evidence_version=None):
         prior_clues={c['id'] for c in self.clues}
         prior_hypotheses={h['id'] for h in self.treasures}
         rejected=Counter()
@@ -213,33 +221,32 @@ class Intelligence:
             'unknown_shop_item':'items must use exact IDs from the current shop and offering descriptions',
             'opening_window':'opening_round is an absolute integer round; optional closing_round >= opening_round, horizon <=1300',
             'unresolved_conditions':'confidence must be high and all_conditions_resolved true, only when supported by original clues'}
+        citation_issue={}
         def reject(candidate,reason):
             rejected[reason]+=1
             encoded=json.dumps(candidate,ensure_ascii=False)
             sample=(candidate if isinstance(candidate,dict) and len(encoded)<=6000 else
                     dict(type=type(candidate).__name__,sample=encoded[:600],truncated=len(encoded)>600))
             record=dict(id=fingerprint(candidate),candidate=sample,reason=reason,
-                expected=expected[reason],round=world.round)
+                expected=expected.get(reason,'Correct the cited field using supplied evidence; do not guess.'),
+                detail=dict(citation_issue) if citation_issue else {},round=world.round,
+                validation_revision=fingerprint([world.round,candidate,reason])[:16])
             self.invalid_candidates=[v for v in self.invalid_candidates if v['id']!=record['id']]
             self.invalid_candidates=(self.invalid_candidates+[record])[-4:]
 
         unresolved=data.get('unresolved',[])
         if isinstance(unresolved,list):
             self.unresolved=[s[:200] for s in unresolved[:6] if isinstance(s,str)]
+        from .news_evidence import citations, item_evidence, time_window, location_evidence, EvidenceError
         def support(value):
-            citations = value.get("support")
-            if not isinstance(citations, list) or not citations:
+            citation_issue.clear()
+            try:
+                refs=citations(value,sources)
+                value['support']=refs
+                return refs
+            except EvidenceError as exc:
+                citation_issue.update(reason=exc.reason,path=exc.path,source=exc.source)
                 return None
-            accepted = []
-            for citation in citations:
-                if not isinstance(citation, dict):
-                    return None
-                entry = sources.get(citation.get("source"))
-                quote = citation.get("quote")
-                if entry is None or not isinstance(quote, str) or not quote.strip() or quote not in entry["text"]:
-                    return None
-                accepted.append(citation)
-            return accepted
         clues=data.get('clues',[])
         for clue in (clues[:32] if isinstance(clues,list) else []):
             if not isinstance(clue,dict):continue
@@ -271,8 +278,9 @@ class Intelligence:
                 continue
             if event.get("effect") not in {"closed", "restored", "price_up", "price_down"}:
                 continue
-            publications = {sources[c["source"]]["observed_day"] for c in refs if sources[c["source"]]["publication_certain"]}
-            all_certain = all(sources[c["source"]]["publication_certain"] for c in refs)
+            news_refs=[sources[c["source"]] for c in refs if sources[c["source"]].get("evidence_kind","news_fragment")=="news_fragment"]
+            publications = {e.get("observed_day") for e in news_refs if e.get("publication_certain")}
+            all_certain = bool(news_refs) and all(e.get("publication_certain") for e in news_refs)
             day = next(iter(publications)) if all_certain and len(publications) == 1 else None
             record = {"resource": event["resource"], "effect": event["effect"], "start_offset": start,
                       "end_offset": end, "start_day": day+start if day else None,
@@ -285,8 +293,17 @@ class Intelligence:
             if not isinstance(candidate, dict) or support(candidate) is None:
                 reject(candidate,'unsupported_source')
                 continue
+            if required_evidence_version and candidate.get('evidence_version')!=required_evidence_version:
+                citation_issue.update(path='evidence_version');reject(candidate,'evidence_version_required');continue
+            try:
+                item_evidence(candidate,sources)
+                window=time_window(candidate,sources,getattr(world,'strategy_clock',None))
+                location=location_evidence(candidate,sources,world)
+            except EvidenceError as exc:
+                citation_issue.update(reason=exc.reason,path=exc.path,source=exc.source)
+                reject(candidate,exc.reason);continue
             pos, items = position(candidate.get("position")), candidate.get("items")
-            opening = candidate.get("opening_round")
+            opening = window["opening_round"] if window else candidate.get("opening_round")
             day=candidate.get('opening_day')
             clock=getattr(world,'strategy_clock',None)
             if opening is None and candidate.get('time_basis')=='day_onward' and integer(day,1) and day<=10 and clock:
@@ -311,6 +328,7 @@ class Intelligence:
             expiry_known = closing is not None
             if not expiry_known:
                 closing = 1300
+            if window:closing=min(closing,window['execution_window_end'])
             if pos is None or not world.inside(pos) or not isinstance(items, list) or not items or len(items) > 40:
                 reject(candidate,'position_or_items')
                 continue
@@ -325,16 +343,23 @@ class Intelligence:
                 continue
             record = {"position": pos, "items": sorted(items), "opening_round": opening, "closing_round": closing,
                       "support": support(candidate), "basis": "model_hypothesis_not_official", "confidence": "high"}
+            if window:record['time_window']=window
+            if location:record['location_derivation']=location
             if not expiry_known:
-                record['closing_source'] = 'half_horizon_not_treasure_expiry'
+                record['closing_source'] = 'safe_execution_window_not_official_expiry' if window else 'half_horizon_not_treasure_expiry'
             record["id"] = fingerprint(record)
             if (not any(t["id"] == record["id"] for t in self.treasures) and
                     not any(r['hypothesis_id'] == record['id'] for r in self.rejections)):
                 self.treasures.append(record)
-                self.invalid_candidates=[]
-        for candidate in (data.get('purchases',[])[:8] if data.get('decision') in (None,'BUY_READY') else []):
+        for candidate in (data.get('purchases',[])[:8] if data.get('decision') in (None,'BUY_READY','DIG_READY','WAIT_INFO') else []):
             if not isinstance(candidate,dict) or support(candidate) is None:
                 reject(candidate,'unsupported_source');continue
+            if required_evidence_version and candidate.get('evidence_version')!=required_evidence_version:
+                citation_issue.update(path='evidence_version');reject(candidate,'evidence_version_required');continue
+            try:item_evidence(candidate,sources)
+            except EvidenceError as exc:
+                citation_issue.update(reason=exc.reason,path=exc.path,source=exc.source)
+                reject(candidate,exc.reason);continue
             items=candidate.get('items')
             if not isinstance(items,list) or not 1<=len(items)<=40:
                 reject(candidate,'position_or_items');continue
@@ -345,8 +370,19 @@ class Intelligence:
             record=dict(items=sorted(items),support=support(candidate),basis='model_hypothesis_not_official')
             record['id']=fingerprint(record)
             if record not in self.preparations:self.preparations.append(record)
+        values={
+            'items':[p['items'] for p in self.treasures or self.preparations],
+            'location':[p['position'] for p in self.treasures],
+            'time':[p.get('time_window',dict(opening_round=p['opening_round'],closing_round=p['closing_round'])) for p in self.treasures],
+            'condition':[True] if self.treasures else []}
+        self.field_state={key:dict(status='validated_hypothesis' if values[key] else 'unresolved',
+            value=values[key][0] if len(values[key])==1 else None,candidates=values[key],
+            evidence=[c for c in self.clues if c['kind']==key],
+            missing_reason=[] if values[key] else self.unresolved or ['No complete supported candidate'],version=world.round)
+            for key in values}
         self.events, self.treasures = self.events[-64:], self.treasures[-16:]
         self.llm_diagnostic.update(hypotheses=len(self.treasures),proposed=len(data.get('treasures',[])),
+                                   proposed_purchases=len(data.get('purchases',[])),
                                    rejected=dict(rejected),unresolved=self.unresolved,
                                    progress=dict(new_clues=len({c['id'] for c in self.clues}-prior_clues),
                                        new_hypotheses=len({h['id'] for h in self.treasures}-prior_hypotheses)))
@@ -412,6 +448,9 @@ class Intelligence:
                     return movement(actor,steps,220,'complete treasure return obligation')
             else:
                 self.return_plan={}
+        if self.plans_suspended:
+            self.diagnostic=dict(stage='waiting',reason='invalid_analysis_requires_revalidation',errors=list(self.invalid_candidates))
+            return []
         if policy.news_daily_enabled and getattr(world,'news_task_hold',False):
             self.diagnostic=dict(stage='waiting',reason='daily_analysis_or_return')
             return []
@@ -468,7 +507,8 @@ class Intelligence:
             if len(self.diagnostic['rejections'])<8:
                 self.diagnostic['rejections'].append(dict(hypothesis=h['id'][:12],reason=reason))
         for hypothesis in sorted(self.treasures,key=lambda h:(h['id']!=self.execution.get('hypothesis'),h["closing_round"],h["opening_round"],h["id"])):
-            if world.round>hypothesis['closing_round']:continue
+            if world.round>hypothesis['closing_round']:
+                rejected(hypothesis,'safe_execution_window_elapsed_not_proven_expiry' if hypothesis.get('closing_source')=='safe_execution_window_not_official_expiry' else 'execution_window_elapsed');continue
             if any(a['items']==hypothesis['items'] and a.get('result')==3 for a in self.attempts):continue
             if any(a['hypothesis']==hypothesis['id'] for a in self.attempts):continue
             if len(self.attempts)>=policy.treasure_attempt_limit:continue

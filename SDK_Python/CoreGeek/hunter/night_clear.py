@@ -31,7 +31,8 @@ class NightClear:
         from . import rear_open
         if rear_open.enabled(world):
             built={u.pos for u in world.ours.values() if u.alive and u.kind=='wall'}
-            return len(rear_open.required(world)-built)*cost
+            from .wall_rebuild import stone_reserve
+            return len(rear_open.required(world)-built)*cost+stone_reserve(world,world.night_roster.w,rules)
         count=1
         if getattr(world,'wall_stage',None)=='front10':
             # The first-stage half ring expands tomorrow. Its missing walls
