@@ -37,6 +37,7 @@ def exposure(world, clock, pos):
 @dataclass
 class Directive:
     work_plans: dict = field(default_factory=dict)
+    committed_actions: dict = field(default_factory=dict)
     survival_actions: dict = field(default_factory=dict)
     duty_permit: object = None
     market_permit: object = None
@@ -107,6 +108,9 @@ class Directive:
         Medical/combat triage may override it. Reaching a stand permits stationary
         work, while ordinary movement cannot spend an already exhausted buffer.
         """
+        owner = candidate.command.get('controllerId') if candidate.command.get('action')=='attack' else candidate.actor
+        if owner in self.committed_actions:
+            return candidate.command in self.survival_actions.get(owner,()) or candidate.command in self.committed_actions[owner]
         if self.purchase_permit is not None and not self.purchase_permit(candidate):
             return self._permission(False,candidate,'purchase')
         identity = candidate.command.get('controllerId') if candidate.command.get('action')=='attack' else candidate.actor
@@ -133,6 +137,8 @@ class Directive:
         if identity in self.repair_stock_waits:
             return candidate.command.get('action')=='use' and candidate.command.get('name') in {'Medicine','Bomb','DizzyWeapon'}
         plan = self.work_plans.get(identity)
+        if plan and plan.get('owner')=='task_approach' and not plan['commands']:
+            return candidate.command.get('action')=='use' and candidate.command.get('name')=='Medicine'
         if plan and plan.get('waiting_for_route'):
             action = candidate.command.get('action')
             route = self.return_routes.get(identity, {})
@@ -324,7 +330,8 @@ def fallback_stands(world, *, include_pioneer, task_actor, allow_task_control, h
 
 def return_reserve(world, policy, length):
     """The mandatory route margin, shared with admission of optional tasks."""
-    return length+policy.return_buffer+(8 if world.defence_cells else 0)
+    from .rear_open import enabled as rear_enabled
+    return length+policy.return_buffer+(8 if world.defence_cells and not rear_enabled(world) else 0)
 
 
 def return_plan(world, clock, stands, policy, deadline=float("inf"), *, failed_steps=None, force_due=False):

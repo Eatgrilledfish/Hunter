@@ -1021,7 +1021,7 @@ class TaskEngine:
                                       if pending["operation"] in {"run_tool", "run_python"} else ""})
         if usable and not failure and pending.get("plan"):
             output = pending['plan'].get('answer_output')
-            if output is None and data.get('completeness')=='complete':
+            if (output is None or 'data' not in data) and data.get('completeness')=='complete':
                 from .checker_contract import token_answer
                 recovered=token_answer(task,data)
                 if recovered is not None:
@@ -1051,7 +1051,7 @@ class TaskEngine:
                     record_pagination_block(task,str(exc),world.round)
                     task.events.append({'kind':'answer_output_rejected','round':world.round})
                     task.diagnostic_events.append({'kind':'answer_output_rejected','round':world.round,
-                        'reason':str(exc),'answer_candidate':{'evidence_refs':[evidence_id],
+                        'auto_submit_block_reason':str(exc),'reason':str(exc),'answer_candidate':{'evidence_refs':[evidence_id],
                             'extract':{'evidence':evidence_id,'selector':output.get('selector')}}})
                     task.diagnostic_events=task.diagnostic_events[-8:]
                     self.programs.reject(pending.get('program_id'))

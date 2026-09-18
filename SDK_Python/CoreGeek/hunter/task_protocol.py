@@ -29,10 +29,13 @@ INSTRUCTIONS = (
     '判错或answer_validation_feedback只修相应取数/映射/聚合，保留有效程序。'
     'offset/total_count接口可用hunter_collect_offset_pages(fetch,rows_path=("data","records"),pagination_path=("data","pagination"))；fetch(offset)返回解析响应。路径、键名和identity_fields按文档设置，其它分页协议按文档实现。'
     '核对record_samples/record_fields及pagination；缺字段报错打印记录，禁止用猜测字段加默认零。字符串false不是布尔True，年代不按字典序猜测；不能用首页条数冒充总数。'
+    '最终答案赋值给全局HUNTER_ANSWER，再加cmd同级submit_output:true；包装器独立提取，不受调试stdout干扰。'
+    '完整分页会保存当前题的不可变snapshot文件；仅输出格式错误时，可用hunter_load_dataset(本题runtime中的snapshot名)读取完整原始响应页并重算答案，不重查首页覆盖完整集。'
+    'snapshot不能跨题、跨查询拼接；加载快照的执行不能同时重新查API，没有可信快照则重新取齐全部页。'
     '样本不能推算总数，每题重新查询。最终只打印json.dumps(答案对象)，cmd同级加submit_output:true，成功且通过校验后直接提交；中间结果不要加。'
     'latest_execution_failure.runtime含实际HTTP错误；401按服务端明确要求修正认证，400补齐指明的必填参数，不能重复失败请求。'
     '工程题先读spec，用实际检查器，无默认路径；按异常修正，不原样重试。'
-    'subprocess捕获检查器stdout时必须保留并打印实际结果；退出0不等于TOKEN已取得。'
+    '工程检查器使用subprocess.run(...,capture_output=True,text=True)，校验returncode并保留stdout，包装器捕获合法TOKEN后直接提交；退出0不等于TOKEN已取得。'
     'checker_outputs是当前执行捕获的实际输出，complete=false不能作为完整答案。'
     '检查器已结束但缺TOKEN时先核对已捕获结果、具体filename和cwd，勿重复全量改代码。'
     '只有明确允许重复执行且没有pending时才重跑检查器；同一文件错误连续出现应修路径契约。'
@@ -80,9 +83,10 @@ def normalize(data, evidence):
             else:raise ValueError('cmd must be Python source, a read request, or a list request')
         else:raise ValueError('cmd must be nonempty Python source or a file request')
         if 'submit_output' in data:
-            if data['submit_output'] is not True or plan['operation'] != 'run_python':
-                raise ValueError('submit_output must be true and accompany Python source')
-            plan['answer_output']={'format':'json','selector':['data']}
+            if type(data['submit_output']) is not bool or data['submit_output'] and plan['operation'] != 'run_python':
+                raise ValueError('submit_output:true requires Python source; omit it for read/list')
+            if data['submit_output']:
+                plan['answer_output']={'format':'json','selector':['data']}
         result.update(intent='execute',command_plan=plan)
     else:
         # Never fall back to an older successful execution after a newer failure.

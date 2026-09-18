@@ -1,8 +1,8 @@
 """Source for diagnostics/preflight INSIDE the competition task subprocess."""
 
 
-def prelude(root):
-    return '_hunter_task_root = ' + repr(root) + '\n' + SOURCE
+def prelude(root, scope='command-local'):
+    return '_hunter_task_root = ' + repr(root) + '\n_hunter_snapshot_scope = '+repr(scope)+'\n' + SOURCE
 
 
 SOURCE = r'''
@@ -17,6 +17,55 @@ _hunter_rows_observed = 0
 _hunter_json_dataset = None
 _hunter_page_sets = {}
 _hunter_coverages = {}
+_hunter_page_payloads = {}
+_hunter_loaded_snapshot = False
+
+def _hunter_snapshot(key, rows, value, offset, coverage):
+    if _hunter_loaded_snapshot:raise ValueError('do not mix a frozen dataset with new API reads')
+    if key not in _hunter_page_payloads and len(_hunter_page_payloads)>=8:return None
+    pages=_hunter_page_payloads.setdefault(key,{})
+    encoded=_hj.dumps(value,ensure_ascii=True,sort_keys=True,allow_nan=False)
+    if sum(len(v) for v in pages.values())+len(encoded)>262144:return None
+    if offset in pages and pages[offset]!=encoded:
+        raise ValueError('same dataset offset changed during collection')
+    pages[offset]=encoded
+    if not coverage.get('complete'):return None
+    body=dict(scope=_hunter_snapshot_scope,dataset_id=coverage['dataset_id'],
+        coverage=coverage,pages=[_hunter_json_loads(pages[k]) for k in sorted(pages)])
+    raw=_hj.dumps(body,ensure_ascii=True,sort_keys=True,allow_nan=False).encode()
+    digest=_hhash.sha256(raw).hexdigest()
+    name='.hunter-dataset-'+digest+'.json'
+    path=_ho.path.join(_hunter_task_root,name)
+    try:
+        fd=_ho.open(path,_ho.O_WRONLY|_ho.O_CREAT|_ho.O_EXCL,0o600)
+        with _ho.fdopen(fd,'wb') as output:output.write(raw)
+    except FileExistsError:
+        if _ho.path.islink(path):raise ValueError('snapshot symlink refused')
+        with open(path,'rb') as existing:
+            if existing.read(524289)!=raw:raise ValueError('snapshot identity conflict')
+    except OSError:
+        return None
+    return name
+
+def hunter_load_dataset(name):
+    global _hunter_loaded_snapshot
+    if not isinstance(name,str) or not _hre.fullmatch(r'\.hunter-dataset-[a-f0-9]{64}\.json',name):
+        raise ValueError('invalid frozen dataset name')
+    if _hunter_coverages:raise ValueError('cannot mix frozen snapshots with another execution dataset')
+    path=_ho.path.join(_hunter_task_root,name)
+    if _ho.path.islink(path):raise ValueError('snapshot symlink refused')
+    with open(path,'rb') as source:raw=source.read(524289)
+    if len(raw)>524288 or _hhash.sha256(raw).hexdigest()!=name[16:-5]:
+        raise ValueError('snapshot hash mismatch')
+    data=_hunter_json_loads(raw)
+    if data.get('scope')!=_hunter_snapshot_scope or not data.get('coverage',{}).get('complete'):
+        raise ValueError('snapshot task identity or coverage mismatch')
+    _hunter_loaded_snapshot=True
+    proof=dict(data['coverage'],snapshot=name,snapshot_scope='current_task_immutable')
+    _hunter_coverages[data['dataset_id']]=proof
+    _hunter_event(kind='json_shape',pagination_datasets=[proof])
+    return data['pages']
+
 def _hunter_sample(value, depth=0):
     if depth > 3:return '<nested value omitted>'
     if isinstance(value,dict):
@@ -31,6 +80,11 @@ def _hunter_event(**record):
     elif record.get('error') or isinstance(record.get('status'), int) and record['status'] >= 400:
         _hunter_events[-1] = record  # A late failed page must survive the log cap.
 def _hunter_report():
+    if 'HUNTER_ANSWER' in globals():
+        try:
+            answer=_hj.dumps(globals()['HUNTER_ANSWER'],ensure_ascii=True,allow_nan=False)
+            if len(answer)<=8192:print('\nHUNTER_ANSWER:'+answer,file=_hsys.stderr,flush=True)
+        except (ValueError,TypeError):pass
     audit=globals().get('HUNTER_STATISTICS_AUDIT')
     if isinstance(audit,dict):
         allowed=('field','definition','records_count','pages_complete','raw_time','sort_key','selected_name','output_value')
@@ -142,6 +196,8 @@ def _hunter_loads(*args,**kwargs):
                     _hunter_coverages[key]=dict(record['pagination_coverage'],path=_hunter_json_dataset[2],
                         query_fields=sorted({k for k,v in _hunter_json_dataset[3]}),
                         dataset_id=_hhash.sha256(repr(_hunter_json_dataset).encode()).hexdigest()[:16])
+                    snapshot=_hunter_snapshot(key,rows,value,offset,_hunter_coverages[key])
+                    if snapshot:_hunter_coverages[key]['snapshot']=snapshot
         if _hunter_coverages:
             # Preserve each separately keyed population when a later request
             # changes endpoint or query. Query values are never emitted.

@@ -131,6 +131,12 @@ def handoff_margin(world):
 
 def use_permitted(world, candidate):
     command=candidate.command
+    from .wall_rebuild import damaged
+    clock=getattr(world,'strategy_clock',None)
+    if clock and clock.phases=={'day'} and command.get('action')=='use' and command.get('name')=='WallUpgradeVoucher1':
+        target=command.get('targetPos',[])
+        wall=next((u for u in world.ours.values() if target==[{'x':u.pos[0],'y':u.pos[1]}] and damaged(world,u)),None)
+        if wall and command not in getattr(world,'wall_rebuild_actions',{}).get(candidate.actor,()):return False
     if command.get('action')!='use' or command.get('name')!='WallUpgradeVoucher1':return True
     actor=world.ours.get(candidate.actor)
     points=command.get('targetPos',[])

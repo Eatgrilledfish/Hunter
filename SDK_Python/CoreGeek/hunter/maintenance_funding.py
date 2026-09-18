@@ -3,7 +3,7 @@ import time
 from .navigation import distance_field, interaction_cells, neighbours
 from .protocol import MINERALS, distance, pos_json
 from .robot_threats import active
-from .repair_decision import stock_target
+from .repair_decision import purchase_floor
 from . import defence_duties, rear_open
 
 
@@ -13,15 +13,21 @@ def propose(world, clock, rules, policy, miner, deadline, *, stock=None):
             or miner.id!=world.night_roster.m or miner.id in world.night_defenders
             or getattr(world,'critical_base_ids',()) or clock.day is None):
         return None,{}
-    worker=world.ours.get(world.night_roster.w)
+    demands=[r for r in getattr(world,'funding_plan',()) if r.get('deficit',0)>0]
+    buyer=min(demands,key=lambda r:(r['purpose']!='night_essential',r['deadline'])) if demands else None
+    worker=world.ours.get(buyer['owner'] if buyer else world.night_roster.w)
     from .medical import needs_treatment
     if needs_treatment(world,miner,clock):return None,{}
     price=world.shop.get('WallFixer',0)
-    if (not worker or not worker.alive or worker.backpack is None or price<=0
+    if (not worker or not worker.alive or worker.backpack is None or (price<=0 and not buyer)
             or worker.capacity is None or len(worker.backpack)>=worker.capacity):return None,{}
-    missing=max(0,stock_target(world,policy)-worker.inventory['WallFixer'])
+    missing=max(0,purchase_floor(world,policy)-worker.inventory['WallFixer'])
     cost=missing*price
     available=max(0,world.gold-getattr(world,'treasure_reserved_gold',0))
+    if buyer:
+        cost=sum(r['cost'] for r in world.funding_plan)
+        available=world.gold
+        missing=max(0,cost-available)
     if not missing or available>=cost:return None,{}
     if clock.phases=={'day'}:horizon=clock.until_night
     elif clock.phases=={'night'} and clock.day<10:
@@ -29,12 +35,14 @@ def propose(world, clock, rules, policy, miner, deadline, *, stock=None):
         if not explicit or any(r.alive and r.target_team in (None,world.side) for r in world.robots.values()):return None,{}
         horizon=min(130-(clock.round-o)%130 for o in clock.offsets)+70
     else:return None,{}
+    if buyer:
+        horizon=min(horizon,max(0,buyer['deadline']-world.round))
     if stock is None:
         stock={k:miner.inventory[k] for k in MINERALS if miner.inventory[k] and world.vendor.get(k,0)>0}
         walls={u.pos for u in world.ours.values() if u.alive and u.kind=='wall'}
         rule=rules.build_rule(world,'wall')
         reserve=max(0,len(rear_open.required(world)-walls)*(rule.items.get('stone',0) if rule else 0)
-                    -worker.inventory['stone'])
+                    -world.ours[world.night_roster.w].inventory['stone'])
         if 'stone' in stock:stock['stone']=max(0,stock['stone']-reserve)
         stock={k:n for k,n in stock.items() if n>0}
     value=sum(n*world.vendor.get(k,0) for k,n in stock.items())
@@ -54,7 +62,8 @@ def propose(world, clock, rules, policy, miner, deadline, *, stock=None):
     shops=interaction_cells(world,world.zones.get('weaponShop',()),worker.pos,blocked)
     reach=distance_field(world,{worker.pos},worker.pos,deadline,blocked)
     home=distance_field(world,defence_duties.stands(world,worker.id),worker.pos,deadline,blocked)
-    options=[(max(sale_walk+len(stock)+1,reach[p])+2+home[p]+policy.return_buffer,p)
+    buy_rounds=len(buyer['items']) if buyer else 1
+    options=[(max(sale_walk+len(stock)+1,reach[p])+buy_rounds+1+home[p]+policy.return_buffer,p)
              for p in shops&reach.keys()&home.keys()]
     if not options or time.monotonic()>=deadline:return None,{}
     required,shop=min(options)
@@ -66,6 +75,7 @@ def propose(world, clock, rules, policy, miner, deadline, *, stock=None):
         if not steps:return None,{}
         command=dict(action='move',targetPos=[pos_json(steps[0])])
     report=dict(actor=miner.id,buyer=worker.id,stage='MAINTENANCE_FUNDING',
+        purposes=[r['purpose'] for r in demands],
         required_gold=cost,cash_gap=cost-available,actual_stock_value=value,
         required_rounds=required,deadline_round=world.round+horizon,shop=shop,
         basis='current personal stock and observed quotes; proceeds not yet spendable')

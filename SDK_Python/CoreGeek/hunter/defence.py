@@ -48,7 +48,8 @@ class DefenceProcurement:
         if guidance and guidance.base_critical:
             self.diagnostic['status'] = 'immediate_survival_precedes_future_purchase'
             return []
-        actors = [a for a in world.movers if a.id != task_actor]
+        roster=getattr(world,'night_roster',None)
+        actors = [a for a in world.movers if a.id != task_actor and (roster is None or a.id==roster.w)]
         self.diagnostic['status'] = 'inventory_or_purchase_unresolved'
         if self.pending or any(a.backpack is None for a in actors):
             return []

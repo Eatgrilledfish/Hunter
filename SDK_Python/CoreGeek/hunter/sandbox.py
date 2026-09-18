@@ -237,8 +237,11 @@ runpy.run_path(entry, run_name="__main__")
                 status = "invalid_encoding"
         if isinstance(text, str):
             lines = []
+            answers = []
             for line in text.splitlines(keepends=True):
-                if line.startswith('HUNTER_CHECKER_OUTPUTS:'):
+                if line.startswith('HUNTER_ANSWER:'):
+                    answers.append(line[len('HUNTER_ANSWER:'):])
+                elif line.startswith('HUNTER_CHECKER_OUTPUTS:'):
                     try:
                         captured=json.loads(line[len('HUNTER_CHECKER_OUTPUTS:'):])
                         if isinstance(captured,list):out['checker_outputs']=captured[:2]
@@ -263,7 +266,8 @@ runpy.run_path(entry, run_name="__main__")
                     return obj
                 def invalid_constant(value):
                     raise ValueError("nonfinite tool JSON number")
-                out["data"] = json.loads(text, object_pairs_hook=unique, parse_constant=invalid_constant)
+                if len(answers)>1:raise ValueError('ambiguous answer envelopes')
+                out["data"] = json.loads(answers[0] if answers else text, object_pairs_hook=unique, parse_constant=invalid_constant)
             except ValueError:
                 pass
     else:
@@ -392,7 +396,7 @@ def compile_operation(context, plan, environment, evidence):
             feedback=list(environment.get('api_observations',[]))+[event for record in evidence.values()
                       if record.get('data',{}).get('operation') in ('run_python','run_tool')
                       for event in record['data'].get('runtime_events',[])])
-        runtime = runtime_prelude(root) + '\nexec(compile(' + repr(runtime) + ', "<task_program>", "exec"))'
+        runtime = runtime_prelude(root, hashlib.sha256(repr([environment.get('receipt_namespace'),context.get('task_instance',context)]).encode()).hexdigest()) + '\nexec(compile(' + repr(runtime) + ', "<task_program>", "exec"))'
         payload.update(runtime_code=runtime, program_adapters=adapters, program_contract=contract,
                        runtime_sha256=hashlib.sha256(runtime.encode()).hexdigest())
     else:

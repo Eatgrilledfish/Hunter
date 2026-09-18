@@ -137,7 +137,8 @@ def select(world, clock, rules, policy, candidates, deadline, *, task_actor=None
                 progress *= (2*robot.health-progress)/work_scale
             total += weight * progress
             if amount >= robot.health:
-                total += weight * 12
+                from .robot_targets import cleanup
+                total += (1000 + 100 / max(1, robot.health)) if cleanup(world) else weight * 12
         # A future control opportunity is counted once across the whole bundle.
         # No future suppression credit for already dizzy or predicted-dead units;
         # this does not assert that lethal damage prevents this turn's attack.
@@ -152,6 +153,8 @@ def select(world, clock, rules, policy, candidates, deadline, *, task_actor=None
     beam = [(0.0, [], Resources(), {})]
     best_complete=beam[0]
     def preserves_reserve(bundle, resources):
+        from .funding import permits_bundle
+        if not permits_bundle(world,bundle,resources.gold):return False
         floors = []
         for candidate in bundle:
             # A reserve earmarked for a specific purchase is fulfilled by

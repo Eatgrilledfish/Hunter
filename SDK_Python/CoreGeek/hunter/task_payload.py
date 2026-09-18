@@ -36,7 +36,7 @@ def statistics_review(task, answer_only=False):
     if not re.search(r'API|统计|count|aggregate|分页',text,re.I):return None
     result = {
         'oldest_era':'先读取本题对 oldest_era 的完整定义，确认返回的是年代值还是对应记录名称，不能仅凭字段名或历史城市答案推断。按本城市完整记录的明确时间字段排序，核对 temporal_value_counts 中全部已观察年代、实际数值年份及所需排序依据；响应顺序和字符串 min 不能证明最早。复核最早候选的原始时间值、名称及最终输出字段，缺失年代必须单独处理，不能用猜测年份、空值默认值或别的城市年代代入。',
-        'execution':'用简短程序一次完成分页、断言、统计；同题已有完整计算结果时直接提交，不要重复查询。最终 stdout 只输出题目要求的一个完整 JSON 对象；不能夹杂调试、首页响应或说明文字，否则无法提取答案。计算最终答案时必须在cmd同级加 submit_output:true，省去最后一次模型往返。统计缺字段应明确失败。',
+        'execution':'用简短程序一次完成分页、断言、统计；同题已有完整计算结果时直接提交，不要重复查询。最终答案赋给全局HUNTER_ANSWER；也可让stdout只输出题目要求的一个完整JSON对象；不能夹杂调试、首页响应或说明文字，否则无法提取答案。计算最终答案时必须在cmd同级加 submit_output:true，省去最后一次模型往返。统计缺字段应明确失败。',
         'feedback':'收到官方某字段不符时，定位该字段的记录和转换逻辑并重新运行；保留其他实际计算值，不凭记忆改答案。',
         'coverage':'temporal_value_counts 为有界当前执行观察，标记 partial；须由程序根据实际分页确认全部数据。'}
     if 'oldest_era' not in text:result.pop('oldest_era')

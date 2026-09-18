@@ -27,6 +27,7 @@ class NightRoster:
     m: str | None = None
     p: str | None = None
     substituting: bool = False
+    generation: int = 0
     handoff_requested: bool = False
     handoff_task: tuple = ()
     traffic: dict = field(default_factory=dict)
@@ -58,6 +59,8 @@ class NightRoster:
             # defender disappears from the complete role snapshot. A revival
             # becomes the exterior worker; distance never swaps a living W.
             self.w, self.m = self.m, self.w
+            self.generation += 1
+            world.role_handoff = dict(worker=self.w,former_worker=self.m,generation=self.generation)
             self.return_recovery = {}
             self.traffic = {}; self.exit_pending = {}
         # A living P remains the second defender while returning from a task. M is
@@ -102,6 +105,10 @@ def operators(world, include_pioneer=True, task_actor=None, allow_task_control=F
 
 
 def permits(world, clock, candidate):
+    owner=candidate.command.get('controllerId') if candidate.command.get('action')=='attack' else candidate.actor
+    claimed=getattr(world,'wall_rebuild_actions',{})
+    if owner in claimed:
+        return candidate.command in claimed[owner] or (candidate.command.get('action')=='use' and candidate.command.get('name')=='Medicine')
     recovery = getattr(world,'return_recovery_actions',{})
     if candidate.actor in recovery:
         return candidate.command in recovery[candidate.actor] or (candidate.command.get('action')=='use'

@@ -56,8 +56,19 @@ def check_action(world, clock, rules, identity, command, *, task_actor=None, sum
                 return invalid('opponent base defeated; no useful summon target')
             if target_status == 'unknown':
                 return unknown('surviving opponent base not observed')
+    roster = getattr(world, 'night_roster', None)
+    if roster and action in {'buy','use'} and command.get('name') in {'Bomb','DizzyWeapon'}:
+        if identity != roster.w:
+            emergency = (action == 'use' and identity == roster.m and
+                command in getattr(world, 'emergency_consumable_actions', {}).get(identity, ()))
+            if not emergency:
+                return invalid('attack consumables belong to maintenance worker')
     if action != "attack" and actor.kind not in MOBILE:
         return invalid("stationary entity cannot perform mobile action")
+    owner=command.get('controllerId') if action=='attack' else identity
+    claims=getattr(world,'wall_rebuild_actions',{})
+    if owner in claims and command not in claims[owner] and not (action=='use' and command.get('name')=='Medicine'):
+        return invalid('wall transaction owns actor until its observed handoff')
     targets = [position(p) for p in command.get("targetPos", [])]
     if any(not world.inside(p) for p in targets):
         return invalid("target outside map")
@@ -153,7 +164,8 @@ def check_action(world, clock, rules, identity, command, *, task_actor=None, sum
                 return invalid("no own wall at target")
             if getattr(getattr(world,'strategy_policy',None),'pioneer_rotation_enabled',False):
                 from .wall_policy import monster_face
-                if any(target in monster_face(world,base.pos) for base in world.stations):
+                rebuild=(clock.phases=={'day'} and command in getattr(world,'wall_rebuild_actions',{}).get(identity,()))
+                if not rebuild and any(target in monster_face(world,base.pos) for base in world.stations):
                     return invalid('preserve monster-facing wall; use a side or rear gate')
             r.locks.add(walls[0].id)
             r.cells.add(target)

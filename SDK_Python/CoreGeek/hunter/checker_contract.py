@@ -68,6 +68,8 @@ def token_answer(task, data):
         and (r['data'].get('path')==task.statement_path or str(r['data'].get('path','')).endswith('spec.md'))]
     if not fields and any(re.search(r'\breturn\s+JSON\s+with\s+(?:field\s+)?[`\"\']?token[`\"\']?\s*[.;\n]',t,re.I) for t in texts):
         fields={'token'}
+    if not fields and any(re.search(r'\breturn\s+(?:its|the\s+checker[’\']?s)\s+token\s*[.;]',t,re.I) for t in texts):
+        fields={'token'}
     if not required or fields!={'token'} or not schema['json_required']:
         return None
     sources=[r.get('stdout','') for r in data.get('checker_outputs',[])

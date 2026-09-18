@@ -189,6 +189,11 @@ class Diagnostics(logging.Handler):
         cleared = obj(decision.get('night_clear'))
         funding=obj(decision.get('maintenance_funding'))
         if funding:duty['maintenance_funding']=funding
+        for key in ('wall_rebuild','six_task_deadline','role_handoff','effective_defenders'):
+            value=obj(decision.get(key))
+            if value and value.get('stage')!='idle':duty[key]=value
+        grants=decision.get('funding_plan',[])
+        if grants:duty['funding_plan']=[{k:r[k] for k in ('owner','purpose','cost','granted','deficit','deadline') if k in r} for r in grants[:4]]
         outside_repair=obj(decision.get('exterior_repair'))
         if outside_repair.get('stage') not in (None,'inactive','NO_DEMAND'):
             duty['exterior_repair']=outside_repair
@@ -806,6 +811,7 @@ class Diagnostics(logging.Handler):
             self._write_compact("startup",mode="compact",every=self.interval,task_diag=2,python=sys.version.split()[0],
                 sdk=hashlib.sha256(json.dumps(hashes,sort_keys=True).encode()).hexdigest()[:12],
                 config=hashlib.sha256(repr((agent.rules,agent.policy)).encode()).hexdigest()[:12],bind="0.0.0.0",
+                files_count=len(hashes),manifest_sha256=hashlib.sha256(json.dumps(hashes,sort_keys=True).encode()).hexdigest(),
                 strategy={'staged_walls':agent.policy.staged_walls_enabled,
                           'economy_first':agent.policy.economy_first_enabled})
             return

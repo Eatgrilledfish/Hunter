@@ -8,7 +8,7 @@ from .rays import clear_centre_ray, primitive_step
 from .protocol import MOBILE, distance, pos_json
 from .base_fire import BasePressure
 from .night_roles import operators, weapon_allowed
-from .robot_targets import opposing, protected_area, line_clear
+from .robot_targets import opposing, protected_area, line_clear, eligible, cleanup
 
 
 def threat_weights(world):
@@ -20,6 +20,9 @@ def threat_weights(world):
     weights = {}
     for robot in world.robots.values():
         if not robot.alive:
+            continue
+        if cleanup(world):
+            weights[robot.id] = 1.0 / max(1, robot.health)
             continue
         near = min((distance(robot.pos, p) for p in assets), default=30)
         intent = 0.0 if opposing(world,robot) else 1.0
@@ -166,7 +169,7 @@ def fire_status(world, clock, rules, response, candidates):
     rows = []
     for gun in world.weapons:
         controllers = [u.id for u in operators(world) if distance(u.pos, gun.pos) <= 1 and weapon_allowed(world, u.id, gun.id)]
-        targets = sorted((r for r in world.robots.values() if r.alive and not opposing(world,r) and
+        targets = sorted((r for r in world.robots.values() if eligible(world,r) and
                           distance(gun.pos,r.pos) <= (gun.attack_range or 0)), key=lambda r:r.id)
         count = sum(c.actor == gun.id and c.command.get("action") == "attack" for c in candidates)
         fired = response["roleCommandMap"].get(gun.id,{}).get("action") == "attack"
@@ -175,7 +178,10 @@ def fire_status(world, clock, rules, response, candidates):
                "arbitration_or_controller_busy" if count else "no_damage_candidate")
         row = {"id":gun.id,"cd":gun.cooldown,"range":gun.attack_range,"controllers":controllers,
                "targets":len(targets),"fired":fired,"why":why,"candidates":count}
-        row['ignored_opponent_camp'] = sum(r.alive and opposing(world,r) for r in world.robots.values())
+        row['ignored_opponent_camp'] = sum(r.alive and opposing(world,r) and not cleanup(world) for r in world.robots.values())
+        row['combat_mode'] = 'CLEANUP' if cleanup(world) and targets else 'IDLE_CLEAR' if cleanup(world) else 'DEFEND'
+        row['opponent_in_range'] = sum(r.alive and opposing(world,r) and distance(gun.pos,r.pos)<=(gun.attack_range or 0) for r in world.robots.values())
+        row['preferred'] = [dict(id=r.id,hp=r.health,distance=distance(gun.pos,r.pos)) for r in sorted(targets,key=lambda r:(r.health,r.id))[:3]]
         row['unknown_camp_targets'] = sum(r.target_team is None for r in targets)
         if why == "no_damage_candidate" and gun.kind != "rocket":
             robot_cells = {r.pos for r in world.robots.values() if r.alive}
@@ -207,7 +213,7 @@ def propose(world, clock, rules, deadline, task_actor=None, *, base_fire_enabled
     weights = threat_weights(world)
     pressure = BasePressure(world, clock) if base_fire_enabled else None
     result = []
-    robots = [r for r in world.robots.values() if r.alive and not opposing(world,r)]
+    robots = [r for r in world.robots.values() if eligible(world,r)]
     protected = protected_area(world)
     for weapon in world.weapons:
         if time.monotonic() >= deadline:
@@ -349,12 +355,15 @@ def area_targets(world, robots, deadline, forbidden=frozenset()):
 
 
 def propose_consumables(world, deadline, task_actor=None):
-    actors = [u for u in world.movers if u.id != task_actor and
-              (u.inventory["Bomb"] or u.inventory["DizzyWeapon"])]
+    roster = getattr(world, 'night_roster', None)
+    actors = [u for u in world.movers if u.id != task_actor
+              and (roster is None or u.id == roster.w or u.id == roster.m)
+              and not cleanup(world)
+              and (u.inventory["Bomb"] or u.inventory["DizzyWeapon"])]
     if not actors:
         return []
     weights = threat_weights(world)
-    robots = [r for r in world.robots.values() if r.alive and not opposing(world,r)]
+    robots = [r for r in world.robots.values() if eligible(world,r)]
     centres = area_targets(world, robots, deadline, protected_area(world))
     bombs = sorted(centres, key=lambda row: (-sum(weights[i]*min(world.robots[i].health, 100)
                                                for i in sorted(row[1])), row[0]))
@@ -416,4 +425,13 @@ def propose_consumables(world, deadline, task_actor=None):
                 result.append(Candidate(actor.id, {"action": "use", "name": "DizzyWeapon", "targetPos": [pos_json(p)]},
                                         -35, "joint future suppression coverage; uncalibrated opportunity value",
                                         suppression=identities))
+    if roster:
+        # Preserve M's existing personal escape stock only against a robot
+        # already able to hit M. Ordinary offensive supplies belong to W.
+        miner=world.ours.get(roster.m)
+        direct={r.id for r in robots if miner and r.abnormal!='dizzy'
+                and r.attack_range is not None and r.attack_power is not None and r.attack_power>0
+                and distance(miner.pos,r.pos)<=r.attack_range}
+        result=[c for c in result if c.actor!=roster.m or (set(c.damage)|set(c.suppression))&direct]
+        world.emergency_consumable_actions={roster.m:[c.command for c in result if c.actor==roster.m]}
     return result

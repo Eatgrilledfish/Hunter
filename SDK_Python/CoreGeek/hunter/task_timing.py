@@ -66,7 +66,7 @@ class TaskTiming:
             # public rewards/deadlines as a prior, never as a family identity.
             rows = [r for k, group in self.samples.items() if k[1:] == key[1:] for r in group]
             pooled = True
-        usable = len(rows) >= 3 and all(r['kind'] == 'acknowledged_full_submission' for r in rows)
+        usable = bool(rows) and all(r['kind'] == 'acknowledged_full_submission' for r in rows)
         duration = min(timeout, max(r['duration'] for r in rows) + 2) if usable else timeout
         source = ('pooled_public_descriptor_submission_scenario' if pooled else
                   'observed_submission_upper_plus_margin') if usable else 'deadline_fallback'

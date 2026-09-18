@@ -24,6 +24,7 @@ from .repair_supply import RepairSupply
 from .exterior_repair import ExteriorRepair
 from .wall_service import WallService
 from .wall_health import WallHealth
+from .wall_rebuild import WallRebuild
 from .wall_pressure import WallPressure
 from .opening_wave import OpeningWave
 from .navigation import neighbours
@@ -82,6 +83,7 @@ class Session:
     exterior_repair: ExteriorRepair = field(default_factory=ExteriorRepair)
     wall_service: WallService = field(default_factory=WallService)
     wall_health: WallHealth = field(default_factory=WallHealth)
+    wall_rebuild: WallRebuild = field(default_factory=WallRebuild)
     opening_wave: OpeningWave = field(default_factory=OpeningWave)
 
     def task_actor(self, world):

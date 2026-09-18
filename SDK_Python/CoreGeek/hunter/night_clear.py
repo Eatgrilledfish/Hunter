@@ -59,6 +59,7 @@ class NightClear:
         robots=list(world.robots.values())
         if any(r.alive and r.target_team==world.side for r in robots):self.seen_day=clock.day
         explicit=isinstance(world.raw.get('robot'),dict) and isinstance(world.raw['robot'].get('roles'),list)
+        explicit=explicit and len(world.raw['robot']['roles'])==len(robots)
         clear=explicit and not any(r.alive and r.target_team in (None,world.side) for r in robots)
         world.own_wave_cleared=clear and self.seen_day==clock.day
         worker=world.ours.get(self.actor or world.night_roster.w)

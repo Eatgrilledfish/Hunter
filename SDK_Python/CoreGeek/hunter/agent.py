@@ -109,6 +109,12 @@ class Agent:
             world.news_task_hold = (self.policy.news_daily_enabled and
                 (bool(draft.intelligence.return_plan) or
                  draft.intelligence.cycle.hold(draft.intelligence,world,clock,draft,self.policy)))
+            from .task_deadline import priority as task_priority
+            world.six_task_priority=task_priority(world,clock)
+            # A request channel can run while P approaches a point. Do not
+            # freeze the actor merely because ordinary news analysis is due.
+            if world.six_task_priority and not draft.intelligence.return_plan:
+                world.news_task_hold=False
             from . import pioneer_trade
             pioneer_trade.prepare(world, clock)
             task_actor = draft.task_actor(world)
@@ -117,6 +123,21 @@ class Agent:
                                       min(start + self.policy.planning_seconds, time.monotonic() + .12))
             world.duty_budget = DutyBudget(start+self.policy.planning_seconds)
             draft.night_roster.prepare(world)
+            if getattr(world,'role_handoff',None):
+                incoming=draft.night_roster.w
+                draft.exterior_escape.clear()
+                draft.day_schedule.active.pop(incoming,None)
+                draft.day_schedule.division.helper_batches.pop(incoming,None)
+                draft.day_schedule.division.helper_clearance.pop(incoming,None)
+                draft.economic_routes.active.pop(incoming,None)
+                draft.external_gate.commands.pop(incoming,None)
+                draft.sunset_market.checkout_intents.pop(incoming,None)
+                draft.sunset_market.upgrade_travellers.discard(incoming)
+                draft.night_clear.actor=None
+                draft.repair.active.clear()
+            from . import funding
+            funding.publish(world,clock,self.rules,self.policy,draft.intelligence,
+                            min(start+self.policy.planning_seconds,time.monotonic()+.025))
             world.night_foraging_enabled=self.policy.night_foraging_enabled
             from . import day_access
             day_access.prepare(world,clock,min(start+self.policy.planning_seconds,time.monotonic()+.025),draft.day_access_choice)
@@ -167,13 +188,16 @@ class Agent:
                 build_jobs={i:j for i,j in build_jobs.items() if i not in draft.external_gate.commands}
             draft.day_schedule.division.reconcile_assistance(world,build_jobs)
             draft.wall_service.assign(world,clock,build_jobs)
+            rebuilding=draft.wall_rebuild.prepare(world,clock,self.rules,self.policy,
+                min(start+self.policy.planning_seconds,time.monotonic()+.025),draft)
+            build_jobs={i:j for i,j in build_jobs.items() if i not in world.wall_rebuild_actions}
             immediate = draft.filter_failures(economy.immediate(world, self.rules, task_actor, jobs=build_jobs, policy=self.policy), world.round)
             from .wall_service import build_permitted, use_permitted
             immediate=[candidate for candidate in immediate
                        if build_permitted(world,candidate) and use_permitted(world,candidate)]
             incumbent = self._base(world, clock, task_actor, immediate)
             fallback = incumbent.response
-            candidates = list(immediate)
+            candidates = list(immediate)+rebuilding
             deadline = start + self.policy.planning_seconds
             task_choice = task_schedule.choose(world,clock,self.policy,min(deadline,time.monotonic()+.04),draft.tasks.timing)
             if (self.policy.pioneer_rotation_enabled and clock.phases=={'day'} and task_choice
@@ -190,6 +214,7 @@ class Agent:
                 admit_task_departure(world, clock, task_choice, budget_end), min(deadline,time.monotonic()+.02))
             guidance = director.propose(world, clock, task_actor, draft.tasks.active, min(deadline, time.monotonic()+0.12), self.policy, draft.risk,
                                         failed_steps=draft.failed_move_steps(world) if self.policy.return_detour_enabled else None)
+            guidance.committed_actions = world.wall_rebuild_actions
             from .wall_policy import purchase_permitted
             from .wall_service import use_permitted
             guidance.purchase_permit = lambda candidate: (purchase_permitted(world,self.rules,candidate)
@@ -368,22 +393,30 @@ class Agent:
                 approach_key = (offer.get('taskType'), tuple(sorted(world.task_cells(offer))))
                 identity = task_choice['actor']
                 prior = draft.task_approach
-                if (prior.get('round') == world.round-1 and prior.get('actor') == identity
-                        and prior.get('key') == approach_key and offer.get('isValid') is True
-                        and offer.get('coldDownRounds') == 0 and not world.critical_base_ids
+                if ((world.six_task_priority or prior.get('round') == world.round-1 and prior.get('actor') == identity
+                        and prior.get('key') == approach_key) and (world.six_task_priority or offer.get('isValid') is True)
+                        and (world.six_task_priority or offer.get('coldDownRounds') == 0) and not world.critical_base_ids
                         and identity not in clearing_ids and identity not in draft.external_gate.commands
                         and not guidance.return_routes.get(identity, {}).get('due')):
                     approach = task_choice['candidates'] + draft.tasks.candidates(world, choice=task_choice)
                     approach = [c for c in draft.filter_failures(approach, world.round) if guidance.permit(c)]
-                    if approach:
+                    if approach or world.six_task_priority:
                         guidance.work_plans[identity] = dict(owner='task_approach', phase='approach_or_accept',
                             commands=[c.command for c in approach])
                         candidates.extend(approach)
             world.treasure_actions = {}
-            world.treasure_reserved_gold = 0
+            # Funding is published before any consumer, including M's sale planner.
             if not draft.tasks.active and not draft.tasks.accept_pending:
                 world.pioneer_trade_stands = guidance.operator_stands
-                treasure = draft.intelligence.candidates(world,clock,self.policy,min(deadline,time.monotonic()+.15))
+                from .robot_targets import cleanup_targets
+                trip=draft.intelligence.execution
+                trip_actor=world.ours.get(trip.get('actor'))
+                underway=bool(draft.intelligence.return_plan or (trip_actor and trip.get('home')
+                    and trip_actor.pos!=tuple(trip['home']) and trip.get('stage') in
+                    {'procure','travel','prepare_return','wait_open','summon'}))
+                cleanup_hold=bool(cleanup_targets(world)) and not underway
+                treasure = ([] if cleanup_hold else draft.intelligence.candidates(world,clock,self.policy,min(deadline,time.monotonic()+.15)))
+                if cleanup_hold:draft.intelligence.diagnostic=dict(stage='waiting',reason='opponent_cleanup_owns_pioneer')
                 report=draft.intelligence.diagnostic
                 treasure_actor=report.get('actor')
                 clear_treasure=(clock.phases=={'night'} and getattr(world,'own_wave_cleared',False)
@@ -403,11 +436,11 @@ class Agent:
                             return c.command in commands or (c.command.get('action')=='use' and c.command.get('name') in {'Medicine','Bomb','DizzyWeapon'})
                         return prior(c) if prior else None
                     guidance.duty_permit=clear_permit
-                if self.policy.news_daily_enabled and (treasure or report.get('stage')=='wait_open'):
+                if self.policy.news_daily_enabled and not world.six_task_priority and (treasure or report.get('stage')=='wait_open'):
                     if guidance.work_plans.get(treasure_actor,{}).get('owner')=='task_approach':
                         guidance.work_plans.pop(treasure_actor)
                 treasure = [c for c in draft.filter_failures(treasure,world.round) if guidance.permit(c)]
-                task_reserved = bool(task_choice and task_choice.get('selected') and not self.policy.news_daily_enabled)
+                task_reserved = bool(task_choice and task_choice.get('selected') and (world.six_task_priority or not self.policy.news_daily_enabled))
                 if task_reserved:
                     # The bounded task plan has a stated score and deadline.
                     # Treasure observation still runs, but must not erase that
@@ -426,7 +459,7 @@ class Agent:
                         world.news_task_hold=True
                     world.treasure_actions[identity] = [c.command for c in treasure]
                     if report.get("cost",0):
-                        world.treasure_reserved_gold = report["cost"]+self.policy.reserve_gold
+                        world.treasure_reserved_gold = max(world.treasure_reserved_gold,report["cost"])
                     guidance.treasure_actions = world.treasure_actions
                     world.pioneer_trade_ids.discard(identity)
                     candidates = [c for c in candidates if not (c.actor==identity and c.command.get('action')=='acceptTask')]
@@ -444,7 +477,8 @@ class Agent:
                         guidance.work_plans[identity] = dict(owner='mine_batch',
                             phase='harvest' if helpers[identity].get('helper_collect') else 'build',commands=commands)
                 candidates.extend(helper_choices)
-            market_excluded = {task_actor} | clearing_ids | set(draft.external_gate.commands) | set(world.treasure_actions) | set(helpers) | set(guidance.work_plans)
+            market_excluded = set(world.wall_rebuild_actions) | {task_actor} | clearing_ids | set(draft.external_gate.commands) | set(world.treasure_actions) | set(helpers) | set(guidance.work_plans)
+            if world.six_task_priority:market_excluded.add(draft.night_roster.p)
             if draft.external_gate.stage.startswith('BACKUP_'):
                 market_excluded.update(u.id for u in world.movers)
             if draft.night_roster.traffic:
@@ -693,6 +727,7 @@ class Agent:
             draft.external_gate.finalize(world,decision.response)
             draft.night_clear.finalize(world,decision.response)
             draft.repair.finalize(world,decision.response)
+            draft.wall_rebuild.finalize(world,decision.response)
             draft.repair_supply.finalize(world,decision.response)
             draft.exterior_repair.finalize(world,decision.response)
             draft.sunset_market.finalize(world,decision.response)
@@ -760,6 +795,14 @@ class Agent:
                       "work_plans":guidance.work_plans,
                       "permission_rejections":guidance.permission_rejections,
                       "repair":draft.repair.diagnostic,
+                      "wall_rebuild":draft.wall_rebuild.diagnostic,
+                      "funding_plan":world.funding_plan,
+                      "six_task_deadline":getattr(world,"six_task_deadline",{}),
+                      "role_handoff":getattr(world,"role_handoff",{}),
+                      "effective_defenders":dict(assigned=len(world.night_defenders),
+                          on_station=sum(bool(getattr(world,'task_side_plan',None)) and u.id in world.night_defenders and u.pos in defence_duties.stands(world,u.id) for u in world.movers),
+                          repair_capable=sum(bool(getattr(world,'task_side_plan',None)) and u.id==draft.night_roster.w and u.inventory['WallFixer']>0
+                              and u.pos in defence_duties.stands(world,u.id) for u in world.movers)),
                       "repair_supply":draft.repair_supply.diagnostic,
                       "exterior_repair":draft.exterior_repair.diagnostic,
                       "wall_service":{f'{p[0]},{p[1]}':v for p,v in draft.wall_service.sites.items()},

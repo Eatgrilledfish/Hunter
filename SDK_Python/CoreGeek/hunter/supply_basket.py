@@ -228,9 +228,9 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
     # Upgrade ownership serializes shared building investment, not personal
     # guard ammunition. W must budget its sale/checkout before sealing even
     # when the free pioneer owns the team's upgrade purchases.
-    if (primary or actor.id == roster.w) and not emergency:
-        stock.extend((('DizzyWeapon', 2), ('Bomb', 60)))
-    if primary and not emergency:
+    if actor.id == roster.w and not emergency:
+        stock.extend((('DizzyWeapon', 1), ('Bomb', 1)))
+    if actor.id == roster.w and not emergency:
         # Spend smaller residuals on next-wave pressure only after personal
         # defence stock. Held orders across all bags already occupy the quota.
         slots=getattr(world,'summon_purchase_slots',0)

@@ -275,6 +275,9 @@ def purchase_permitted(world, rules, candidate):
         return True
     name=command.get('name','');actor=world.ours.get(candidate.actor)
     if not actor:return False
+    from .funding import item_granted
+    if item_granted(world,actor.id,name,command.get('num',1)):
+        return True  # All grants are charged together by final arbitration.
     if 'UpgradeVoucher' in name:
         prefix=name.split('UpgradeVoucher')[0]
         allowed={'Weapon' if u.kind in {'rocket','gatling','railgun'} else 'Wall' if u.kind=='wall' else 'Station'

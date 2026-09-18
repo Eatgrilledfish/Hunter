@@ -29,6 +29,8 @@ def checkout_before_task(world, clock, rules, policy, selected, actor, committed
     An already started checkout may finish before admitting another task.
     Having enough gold alone says nothing about this trip being executable.
     """
+    from .task_deadline import priority
+    if priority(world,clock):return False
     from copy import copy
     from . import supply_basket
     offer=selected['task']
@@ -167,7 +169,11 @@ def choose(world, clock, policy, deadline, timing=None):
         return None
     if not rows:
         return {'actor':actor.id,'selected':None,'candidates':[], 'reason':'no feasible bounded task route'}
-    winner = min(rows,key=lambda r:(r['risk'],-r['full_correct_rate'],r['travel'],r['goal']))
+    from .task_deadline import rank, priority
+    rows=rank(world,clock,policy,timing or TaskTiming(),rows,deadline)
+    winner = min(rows,key=lambda r:(r['risk'],
+        r.get('six_task_finish_scenario') or float('inf') if priority(world,clock) else 0,
+        -r['full_correct_rate'],r['travel'],r['goal']))
     goal = winner['goal']
     candidates = []
     if goal != actor.pos:

@@ -287,10 +287,27 @@ class Intelligence:
                 continue
             pos, items = position(candidate.get("position")), candidate.get("items")
             opening = candidate.get("opening_round")
+            day=candidate.get('opening_day')
+            clock=getattr(world,'strategy_clock',None)
+            if opening is None and candidate.get('time_basis')=='day_onward' and integer(day,1) and day<=10 and clock:
+                quote=' '.join(ref['quote'] for ref in support(candidate))
+                chinese=('一','二','三','四','五','六','七','八','九','十')[day-1]
+                stated=bool(re.search(r'第(?:'+str(day)+'|'+chinese+r')(?:日|天)(?:起|开始|以后|之后)',quote)
+                            or re.search(r'from\s+day\s+'+str(day)+r'\b',quote,re.I))
+                if stated:opening=max(o+(day-1)*130 for o in clock.offsets)
             # The taskbook specifies an opening condition, not a mandatory
             # expiry. 1300 is the half's maximum horizon, never a claimed
             # treasure closing time. Preserve an explicitly supplied expiry.
             closing = candidate.get('closing_round')
+            close_day=candidate.get('closing_day')
+            if closing is None and integer(close_day,1) and close_day<=10 and clock:
+                # This is an explicit model/source-supported expiry, not a default.
+                quote=' '.join(ref['quote'] for ref in support(candidate))
+                if re.search(r'(?:第'+str(close_day)+r'(?:天|日).{0,6}(?:结束|截止)|until\s+(?:the\s+end\s+of\s+)?day\s+'+str(close_day)+r'\b)',quote,re.I):
+                    closing=min(o+close_day*130-1 for o in clock.offsets)
+            if close_day is not None and closing is None:
+                reject(candidate,'unresolved_closing_day')
+                continue
             expiry_known = closing is not None
             if not expiry_known:
                 closing = 1300
@@ -443,7 +460,8 @@ class Intelligence:
         home=distance_field(world,home_goals,actor.pos,deadline)
         start=distance_field(world,[actor.pos],actor.pos,deadline)
         if time.monotonic()>=deadline:return []
-        margin=policy.return_buffer+(8 if world.defence_cells else 0)
+        from .director import return_reserve
+        margin=return_reserve(world,policy,0)
         result=[];options=[];preparations=[]
         def rejected(h, reason):
             self.execution_blockers[h['id']]=dict(reason=reason,observed_round=world.round)
@@ -465,7 +483,8 @@ class Intelligence:
             cash_reserve=policy.reserve_gold
             if getattr(world,'staged_walls',False):
                 from .wall_policy import investment_fund
-                cash_reserve=max(cash_reserve,investment_fund(world)[0])
+                from .funding import reserve_for
+                cash_reserve=max(cash_reserve,reserve_for(world,'treasure'))
             if needed and (self.treasure_spent+cost>policy.treasure_gold_limit or world.gold is None
                     or cost+cash_reserve>world.gold):
                 rejected(hypothesis,'observed_gold_or_attempt_budget');continue
@@ -585,7 +604,8 @@ class Intelligence:
         reserve=policy.reserve_gold
         if getattr(world,'staged_walls',False):
             from .wall_policy import investment_fund
-            reserve=max(reserve,investment_fund(world)[0])
+            from .funding import reserve_for
+            reserve=max(reserve,reserve_for(world,'treasure'))
         if needed and (world.gold is None or cost+reserve>world.gold or self.treasure_spent+cost>policy.treasure_gold_limit):return []
         goal=min(home_goals,key=lambda p:(start.get(p,float('inf')),p))
         if not needed:

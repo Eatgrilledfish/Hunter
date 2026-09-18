@@ -18,6 +18,8 @@ INSTRUCTIONS = (
     'opening_round:有依据的绝对回合,confidence:high,all_conditions_resolved:true,support:引用。'
     '只有原文明确关闭期限才给closing_round；省略不表示不能执行。'
     '坐标可由原文和current_map唯一推导；解释依据。clock_origin未知时不能猜绝对回合。'
+    '若原文明示第N日起且无其他时分条件，可给opening_day:N及time_basis:day_onward，程序按所有clock_origin候选窗口求交；有日期截止可给closing_day。'
+    '用品已唯一确定但坐标或时间未解时应返回BUY_READY而不是只返回WAIT_INFO；各字段缺口互不替代。'
     '位置推导须分别核对原点、方向、距离单位/格子比例、相对参照物；公里不能默认等于一格。'
     'WAIT_INFO的unresolved须指出缺哪条原始依据；已有来源能消除缺口时必须复核，不重复笼统说坐标未知。'
     'BUY_READY在purchases给出items数组,confidence:high,all_item_conditions_resolved:true,support:引用。'
