@@ -46,7 +46,7 @@ def merge(intel, world, data, sources, reject):
                 # Citation wording may change without changing the conclusion.
                 old_value=old['value']
                 equivalent=(name=='location' and tuple(old_value.get('position',()))==tuple(value.get('position',()))
-                    or name=='time' and all(old_value.get(k)==value.get(k) for k in ('opening_round','execution_window_end')))
+                    or name=='time' and all(old_value.get(k)==value.get(k) for k in ('opening_round','execution_window_end','phase','official_expiry')))
                 if not equivalent:raise EvidenceError('field_revision_requires_counterevidence',name)
             intel.resolved_fields[name]=dict(value=value,spec=deepcopy(spec),evidence=refs,
                 status='inferred' if name=='location' and spec.get('mode')=='inferred' else 'validated_hypothesis',

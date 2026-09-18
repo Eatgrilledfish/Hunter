@@ -33,7 +33,7 @@ def gatling_upgrade_status(world, unit, policy, rules):
 
 
 def upgrade_allowed(world, unit, policy, rules):
-    from .wall_policy import planned_gate, upgrade_targets
+    from .wall_policy import planned_gate, investment_targets
     from .wall_rebuild import upgrade_ready
     if unit.kind=='wall' and not upgrade_ready(world,unit):return False
     if unit.kind == 'wall' and unit.pos == planned_gate(world):
@@ -42,7 +42,7 @@ def upgrade_allowed(world, unit, policy, rules):
         plan=getattr(world,'wall_rebuild_plan',{})
         paid=any((unit.id,unit.level) in targets for targets in getattr(world,'checkout_targets',{}).values())
         explicit=plan.get('position')==unit.pos and plan.get('target_level',1)>unit.level
-        if unit.pos not in upgrade_targets(world) and not paid and not explicit:
+        if unit.pos not in investment_targets(world) and not paid and not explicit:
             return False
     if (world.battery_plan is not None and unit.kind == 'rocket' and unit.level == 1
             and any(g.kind == 'gatling' and g.level == 1 for g in world.weapons)):

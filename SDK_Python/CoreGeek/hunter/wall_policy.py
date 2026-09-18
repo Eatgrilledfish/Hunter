@@ -37,6 +37,16 @@ def upgrade_targets(world):
     return frozenset(getattr(world, 'monster_front_walls', ())) - {planned_gate(world)}
 
 
+def investment_targets(world):
+    """Finish all six front walls before opening the remaining required tier."""
+    front=upgrade_targets(world)
+    from .rear_open import enabled, required
+    walls={u.pos:u for u in world.ours.values() if u.alive and u.kind=='wall'}
+    if enabled(world) and front and all(p in walls and walls[p].level==3 for p in front):
+        return frozenset(required(world))-{planned_gate(world)}
+    return front
+
+
 def daily_upgrade_targets(world):
     """A bounded front-wall investment floor alongside unfinished weapons."""
     from .rear_open import enabled
@@ -267,6 +277,16 @@ def pressure_ready(world):
 def purchase_units(world):
     """Allow next-stage checkout once weapon purchases are fully funded."""
     current = priority_units(world)
+    from .rear_open import enabled
+    if enabled(world) and len(world.weapons)==3:
+        if any(u.id in getattr(world,'critical_base_ids',()) and u.level in (1,2) for u in world.stations):
+            return current
+        # Stage rank orders affordable work; a costly weapon/base must not
+        # hide a feasible wall voucher after the daily investment floor.
+        ids={u.id for u in current}
+        return current+[u for u in world.ours.values() if u.alive and u.id not in ids
+            and u.level in (1,2) and (u.kind=='wall' and u.pos in investment_targets(world)
+                                     or u.kind=='station')]
     daily=daily_upgrade_targets(world)
     if daily:
         ids={u.id for u in current}

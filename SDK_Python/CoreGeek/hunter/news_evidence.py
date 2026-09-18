@@ -106,9 +106,39 @@ def time_window(candidate,sources,clock):
     begin=(day-1)*130+(70 if phase=='night' else 0)
     end=(day-1)*130+(69 if phase=='day' else 129)
     start=max(o+begin for o in clock.offsets)
-    stop=min(o+end for o in clock.offsets) if mode=='within' else 1300
+    # A daylight operating window is not proof that the treasure expires.
+    # Only an explicitly exclusive date/closing statement ends the plan.
+    day_pattern=r'(?:第(?:'+str(day)+'|'+chinese+r')(?:日|天)|day\s+'+str(day)+r'\b)'
+    exclusive=bool(re.search(r'(?:仅(?:在|限)?|只(?:在|有)|only\s+(?:on\s+)?)\s*'+day_pattern,quote,re.I))
+    expiry_day=spec.get('closing_day')
+    expiry_end=None
+    if expiry_day is not None:
+        if type(expiry_day) is not int or not day<=expiry_day<=10:raise EvidenceError('invalid_expiry_day','time.closing_day')
+        cn=('一','二','三','四','五','六','七','八','九','十')[expiry_day-1]
+        date=r'(?:第(?:'+str(expiry_day)+'|'+cn+r')(?:日|天)|day\s+'+str(expiry_day)+r'\b)'
+        if not re.search(r'(?:截止|截至|until|expires?).{0,12}'+date+r'|'+date+r'.{0,12}(?:结束|截止|失效|关闭|expires?)',quote,re.I):
+            raise EvidenceError('expiry_not_in_source','time.closing_day')
+        expiry_end=expiry_day*130-1
+    # An explicit but unparsed deadline cannot be silently discarded.
+    if not exclusive and expiry_day is None and re.search(r'截止|截至|失效|关闭|until|expires?|第[一二三四五六七八九十\d]+(?:日|天).{0,8}结束',quote,re.I):
+        raise EvidenceError('explicit_expiry_requires_closing_day','time.closing_day')
+    if exclusive and mode!='within':raise EvidenceError('exclusive_time_requires_within','time.mode')
+    stop=min(o+(expiry_end if expiry_end is not None else end) for o in clock.offsets) if exclusive or expiry_end is not None else 1300
     return dict(opening_round=start,execution_window_end=stop,day=day,phase=phase,mode=mode,
-                basis='intersection_of_origin_candidates',official_expiry=False,support=refs)
+                first_safe_window_end=min(o+end for o in clock.offsets),
+                basis='intersection_of_origin_candidates',official_expiry=exclusive or expiry_end is not None,support=refs)
+
+
+def next_execution_round(hypothesis, earliest, clock):
+    """Intersect the source's phase with both possible calendar origins."""
+    moment=max(earliest,hypothesis['opening_round'])
+    phase=hypothesis.get('time_window',{}).get('phase','all')
+    closing=hypothesis['closing_round']
+    # At most one full day is needed to find a recurring phase intersection.
+    for candidate in range(moment,min(closing,moment+130)+1):
+        if all(phase=='all' or ('day' if (candidate-o)%130<70 else 'night')==phase
+               for o in clock.offsets):return candidate
+    return closing+1
 
 
 def location_evidence(candidate,sources,world):

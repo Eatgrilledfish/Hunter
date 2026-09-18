@@ -23,7 +23,9 @@ INSTRUCTIONS = (
     'time:{day:1至10,phase:day|night|all,mode:within|from_start|onward,confidence,support};'
     'condition:{resolved:true,confidence,support:其他必要条件已解决的依据}。'
     '时间由程序按所有clock_origin候选求共同回合窗口，不要猜绝对回合。'
-    '第N日白昼用within；原文表示从此开启可用from_start；不把安全窗口末尾当官方关闭期限。'
+    '区分最早开启、明确失效和每日昼夜条件：第N日方可/开始用from_start；仅限第N日用within。'
+    '没有截止/关闭依据不能推断当日日落后永久失效；phase仍表示献祭需满足的昼夜条件。'
+    '原文明示截止日期时在time补closing_day并引用截止原句；日期内昼夜要求继续用phase，不能忽略明确截止。'
     '相对明天仅在发布日期已知时给anchor:publication_day,day_offset:1。重复观察不是重新发布。'
     '地点完整但未来才开启也可DIG_READY，程序等待窗口；祭品确定即可BUY_READY，其余字段缺口不否定祭品。'
     '真正未知写unresolved:[{field:items|location|time|condition,reason:缺口或具体竞争解释}]，不要编造额外条件。'
@@ -127,12 +129,9 @@ class NewsCycle:
         return None
 
     def hold(self, intel, world, clock, session, policy):
-        if session.tasks.active or session.tasks.accept_pending or world.phase_task:
-            return False
-        if intel.treasures and intel.treasure_complete and not intel.plans_suspended:return False
-        if intel.pending:
-            return world.round <= intel.pending['round']+2
-        return self.request_reason(intel,world,clock,session,policy) is not None
+        # News reasoning uses the shared channel, not a movement/action slot.
+        # Actual treasure travel and return are reserved by their exact actions.
+        return False
 
     def emit(self, intel, world, clock, session, response, policy, descriptions):
         from .llm_channel import available, claim

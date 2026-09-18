@@ -97,7 +97,8 @@ class WallRebuild:
             return []
         required = set(world.wall_targets or ()) & rear_open.required(world)
         from .wall_policy import upgrade_targets
-        direct_upgrade=set(upgrade_targets(world))
+        from .wall_policy import investment_targets
+        direct_upgrade=set(investment_targets(world))
         if p and p['stage']=='SUPPLY' and wall and wall.pos in direct_upgrade:
             # An unopened transaction can yield to direct upgrading. A real
             # hole or completed rebuild still keeps its existing owner.
@@ -174,8 +175,8 @@ class WallRebuild:
         orders=[]
         slots=max(0,(worker.capacity or 0)-len(worker.backpack)-missing_stone)
         from .repair_decision import stock_target
-        stock=[('Medicine',1),('WallFixer',stock_target(world,policy))]
-        if worker.health>=220:stock.reverse()
+        from .guard_stock import requirements as guard_requirements
+        stock=guard_requirements(world,worker,policy)
         if p['stage']!='REBUILD':
             from .funding import permits_bundle
             for name,target in stock+([('WallUpgradeVoucher1',paid_elsewhere+1)] if missing_voucher else []):

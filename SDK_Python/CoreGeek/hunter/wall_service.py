@@ -140,6 +140,14 @@ def handoff_margin(world):
 def use_permitted(world, candidate):
     command=candidate.command
     name=command.get('name')
+    clock=getattr(world,'strategy_clock',None)
+    if clock and clock.phases=={'day'} and command.get('action')=='use' and name in ('WallFixer','WallUpgradeVoucher1','WallUpgradeVoucher2'):
+        points=command.get('targetPos',[])
+        point=(points[0].get('x'),points[0].get('y')) if len(points)==1 else None
+        wall=next((u for u in world.ours.values() if u.alive and u.kind=='wall' and u.pos==point),None)
+        if wall:
+            from .day_maintenance import owner
+            if owner(world,wall) not in (None,candidate.actor):return False
     if command.get('action')!='use' or name not in ('WallUpgradeVoucher1','WallUpgradeVoucher2'):return True
     tier=int(name[-1])
     actor=world.ours.get(candidate.actor)

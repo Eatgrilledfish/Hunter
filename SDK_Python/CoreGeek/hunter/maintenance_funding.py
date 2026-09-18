@@ -1,5 +1,6 @@
 """A real ore sale may fund W's personal maintenance before its deadline."""
 import time
+from copy import copy
 from .navigation import distance_field, interaction_cells, neighbours
 from .protocol import MINERALS, distance, pos_json
 from .robot_threats import active
@@ -14,7 +15,7 @@ def propose(world, clock, rules, policy, miner, deadline, *, stock=None):
             or getattr(world,'critical_base_ids',()) or clock.day is None):
         return None,{}
     demands=[r for r in getattr(world,'funding_plan',()) if r.get('deficit',0)>0]
-    buyer=min(demands,key=lambda r:(r['purpose']!='night_essential',r['deadline'])) if demands else None
+    buyer=min(demands,key=lambda r:(r.get('latest_departure',r['deadline']),r['purpose']!='night_essential')) if demands else None
     worker=world.ours.get(buyer['owner'] if buyer else world.night_roster.w)
     from .medical import needs_treatment
     if needs_treatment(world,miner,clock):return None,{}
@@ -65,6 +66,16 @@ def propose(world, clock, rules, policy, miner, deadline, *, stock=None):
     buy_rounds=len({name for row in world.funding_plan if row['owner']==worker.id and row['deadline']<=buyer['deadline'] for name in row['items']}) if buyer else 1
     options=[(max(sale_walk+len(stock)+1,reach[p])+buy_rounds+1+home[p]+policy.return_buffer,p)
              for p in shops&reach.keys()&home.keys()]
+    if buyer and buyer.get('target_id') in world.ours:
+        # Price the same shop -> assigned building -> duty tour as the grant.
+        # M's sale and the buyer's outward walk can progress concurrently.
+        from .day_schedule import weighted_field
+        target=world.ours[buyer['target_id']]
+        view=copy(world);view.occupied=world.occupied|blocked
+        service=weighted_field(view,{p:home[p]+1 for p in
+            interaction_cells(world,[target.pos],worker.pos,blocked) if p in home},worker,deadline) or {}
+        options=[(max(sale_walk+len(stock)+1,reach[p])+buy_rounds+service[p]+policy.return_buffer+8,p)
+                 for p in shops&reach.keys()&service.keys()]
     if not options or time.monotonic()>=deadline:return None,{}
     required,shop=min(options)
     if required>horizon:return None,{}
@@ -78,6 +89,7 @@ def propose(world, clock, rules, policy, miner, deadline, *, stock=None):
         purposes=[r['purpose'] for r in demands],
         required_gold=cost,cash_gap=cost-available,actual_stock_value=value,
         required_rounds=required,deadline_round=world.round+horizon,shop=shop,
+        latest_sale_departure=world.round+horizon-required,
         basis='current personal stock and observed quotes; proceeds not yet spendable')
     world.maintenance_funding=report
     return command,report

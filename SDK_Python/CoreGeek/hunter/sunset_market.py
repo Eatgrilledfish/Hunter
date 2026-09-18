@@ -37,6 +37,7 @@ class SunsetMarket:
     checkout_deliveries: set = field(default_factory=set)
     checkout_stage: tuple = ()
     checkout_primary: str | None = None
+    maintenance_assignment: dict = field(default_factory=dict)
     caretaker_day: CaretakerDay = field(default_factory=CaretakerDay)
 
     def publish_checkout_targets(self,world):
@@ -56,6 +57,17 @@ class SunsetMarket:
             and (world.ours[uid].kind!='wall' or upgrade_ready(world,world.ours[uid]))]
             for i,targets in self.checkout_targets.items() if i in world.ours and world.ours[i].alive}
         world.checkout_targets=self.checkout_targets
+        job=self.maintenance_assignment
+        target=world.ours.get(job.get('target'))
+        clock=getattr(world,'strategy_clock',None)
+        if job and (not target or not target.alive or target.level!=job['level']
+                    or world.phase_task or not clock or clock.phases!={'day'}
+                    or world.round-job['selected_round']>3):
+            self.maintenance_assignment={};job={}
+        if job:
+            # Health eligibility is rechecked by the maintenance producer.
+            world.maintenance_targets=dict(getattr(world,'maintenance_targets',{}))
+            world.maintenance_targets[target.id]=job['owner']
 
     def prepare(self, world, clock, rules, policy, guidance, jobs, excluded, deadline):
         guidance.market_permit = lambda candidate: permits(world, candidate)
@@ -120,10 +132,11 @@ class SunsetMarket:
             # A new day expires the route/quote, not personally paid delivery.
         from .day_access import gate as access_gate
         context=(world.gold,access_gate(world),
-            tuple(sorted((u.id,u.pos) for u in world.ours.values() if u.alive and u.kind in WEAPONS|{'wall','station'})),
+            tuple(sorted((u.id,u.pos,u.level,u.health) for u in world.ours.values() if u.alive and u.kind in WEAPONS|{'wall','station'})),
             tuple(sorted((u.id,tuple(sorted((k,n) for k,n in u.inventory.items()
                 if k in {'Medicine','WallFixer','DizzyWeapon','Bomb'})))
-                for u in world.movers if u.backpack is not None)))
+                for u in world.movers if u.backpack is not None)),tuple(sorted(i for i in excluded if i is not None)),
+            tuple(sorted(getattr(world,'guard_attack_targets',{}).items())))
         if self.checkout_context and context!=self.checkout_context:
             for identity in list(self.checkout_intents):
                 actor=world.ours.get(identity)
@@ -135,7 +148,7 @@ class SunsetMarket:
                     self.checkout_intents.pop(identity,None)
         self.checkout_context=context
         from .wall_policy import purchase_units
-        stage=tuple(sorted((u.kind,u.pos) for u in purchase_units(world)))
+        stage=tuple(sorted((u.kind,u.pos,u.level) for u in purchase_units(world)))
         if self.checkout_stage and stage!=self.checkout_stage:
             # A confirmed weapon receipt can unlock the wall stage while the
             # carrier is still at the counter. Requote there with the same
@@ -197,10 +210,10 @@ class SunsetMarket:
                     owner=min(at_shop)
                 if owner is None:
                     owner = min(at_shop) if at_shop else roster.p if roster.p in reachable else roster.w
-                funded=[r['owner'] for r in getattr(world,'funding_plan',()) if r['purpose']=='wall_upgrade'
+                funded=[r['owner'] for r in getattr(world,'funding_plan',()) if r['purpose'].endswith('_upgrade')
                         and r['granted']==r['cost'] and r['owner'] in reachable]
                 if funded and owner not in self.checkout_deliveries and owner not in self.pending:
-                    owner=min(funded,key=lambda i:(i not in at_shop,i!=roster.w,i))
+                    owner=min(funded,key=lambda i:(i not in at_shop,i!=roster.p,i))
                 if owner != self.checkout_primary and owner in world.ours:
                     buyer = world.ours[owner]
                     if (owner not in self.pending and not any(n and 'UpgradeVoucher' in name
@@ -441,10 +454,8 @@ class SunsetMarket:
             self.diagnostic['blocked']='weapon_construction';return []
         if job.get('defer_build') and not job.get('gate'):
             self.diagnostic['blocked']='wall_material_project';return []
-        choices=[('WallFixer',max(0,2-buyer.inventory['WallFixer'])),
-                 ('Medicine',max(0,1-buyer.inventory['Medicine']))]
-        if not buyer.inventory['Bomb'] and not buyer.inventory['DizzyWeapon']:
-            choices += [('Bomb',1),('DizzyWeapon',1)]
+        from .guard_stock import requirements
+        choices=[(name,max(0,target-buyer.inventory[name])) for name,target in requirements(world,buyer,policy)]
         costs=[r.gold for k in WEAPONS if (r:=rules.build_rule(world,k)) is not None]
         reserve=min(costs,default=0)*max(0,rules.weapon_limit-len(world.weapons))
         reserve+=getattr(world,'treasure_reserved_gold',0)
@@ -518,11 +529,12 @@ class SunsetMarket:
         choices=[(t['name'],1) for t in demands]
         walls=[u for u in world.ours.values() if u.alive and u.kind=='wall'
                and any(distance(p,u.pos)<=1 for p in stand)]
-        if walls and buyer.kind == 'worker':choices.append(('WallFixer',max(0,2-buyer.inventory['WallFixer'])))
-        choices.append(('Medicine',max(0,1-buyer.inventory['Medicine'])))
-        # One ranged emergency item after local maintenance stock and upgrades.
-        if not buyer.inventory['Bomb'] and not buyer.inventory['DizzyWeapon']:
-            choices.extend((name,1) for name in ('Bomb','DizzyWeapon'))
+        if buyer.id==world.night_roster.w:
+            from .guard_stock import requirements
+            choices=[(name,max(0,target-buyer.inventory[name]))
+                     for name,target in requirements(world,buyer,policy)]+choices
+        else:
+            choices.append(('Medicine',max(0,1-buyer.inventory['Medicine'])))
         for name,num in choices:
             price=world.shop.get(name)
             if num and price is not None and price>0 and cash>=price:
@@ -533,6 +545,12 @@ class SunsetMarket:
         courier=self.diagnostic.get('buyer')
         issued=response['roleCommandMap'].get(courier,{})
         actor=world.ours.get(courier)
+        if (self.diagnostic.get('stage')=='day_repair' and actor
+                and issued in getattr(world,'sunset_actions',{}).get(courier,())):
+            job=self.diagnostic['maintenance'];target=world.ours[job['target']]
+            self.maintenance_assignment=dict(job,owner=courier,level=target.level,selected_round=world.round)
+        elif courier==self.maintenance_assignment.get('owner'):
+            self.maintenance_assignment={}
         if (self.diagnostic.get('stage') in ('upgrade_deliver','upgrade_return')
                 and not self.diagnostic.get('basket') and courier not in self.pending
                 and issued.get('action') in ('move','use')
@@ -545,8 +563,8 @@ class SunsetMarket:
             self.checkout_deliveries.add(courier)
         for actor,command in response['roleCommandMap'].items():
             from .rear_open import enabled as rear_enabled
-            maintenance_order=(rear_enabled(world) and actor==world.night_roster.w
-                               and command.get('name')=='WallFixer')
+            maintenance_order=(rear_enabled(world) and actor in (world.night_roster.w,world.night_roster.p)
+                               and command.get('name') in {'WallFixer','Medicine','Bomb','DizzyWeapon'})
             if command.get('action')=='buy' and ('UpgradeVoucher' in command.get('name','') or maintenance_order):
                 self.pending.setdefault(actor,dict(name=command['name'],num=command.get('num',1),
                     prior=world.ours[actor].inventory[command['name']],round=world.round))

@@ -55,7 +55,17 @@ class RepairPlan:
         if clock.phases!={'day'} or not actor or not actor.alive or actor.backpack is None:return
         reachable=distance_field(world,{actor.pos},actor.pos,deadline)
         home=distance_field(world,defence_duties.stands(world,actor.id),actor.pos,deadline)
-        options=[(w.health,reachable[p],w.id,p,w) for w in damaged_walls(world,rules)
+        from .procurement import upgrade_allowed
+        from .wall_service import use_permitted
+        from .day_maintenance import owner
+        walls=[u for u in damaged_walls(world,rules) if owner(world,u) in (None,actor.id)]
+        for wall in world.ours.values():
+            if (wall.alive and wall.kind=='wall' and wall.level==1 and actor.inventory['WallUpgradeVoucher1']
+                    and wall.health is not None and rules.health_limit(world,wall)
+                    and wall.health<rules.health_limit(world,wall) and upgrade_allowed(world,wall,policy,rules)
+                    and use_permitted(world,Candidate(actor.id,dict(action='use',name='WallUpgradeVoucher1',
+                        targetPos=[pos_json(wall.pos)]),260,'direct restoration'))):walls.append(wall)
+        options=[(w.health,reachable[p],w.id,p,w) for w in walls
                  for p in interaction_cells(world,[w.pos],actor.pos) if p in reachable and p in home
                  and reachable[p]+1+home[p]+policy.return_buffer<=clock.until_night]
         if time.monotonic()>=deadline:return
@@ -71,6 +81,10 @@ class RepairPlan:
                     and use_permitted(world,candidate)):
                 item=coupon;supplies[coupon]-=1
             items[identity]=item
+        # Never spend a pack on a daylight level-one wall. Another damaged
+        # wall may have consumed the one available coupon during matching.
+        options=[row for row in options if row[4].level!=1 or items[row[2]]!='WallFixer']
+        live={row[2] for row in options};items={k:v for k,v in items.items() if k in live}
         world.day_repair_demand=sum(name=='WallFixer' for name in items.values())
         world.day_repair_quote=(options,items)
 
@@ -120,7 +134,12 @@ class RepairPlan:
                 from .procurement import upgrade_allowed
                 from .wall_service import use_permitted
                 world.day_repair_demand=sum(item=='WallFixer' for item in items.values())
-                funded=[row for row in options if actor.inventory[items[row[2]]]>0]
+                from .day_maintenance import owner
+                upgrading={r.get('target_id') for r in getattr(world,'funding_plan',())
+                           if r['purpose']=='wall_upgrade' and r['granted']>=r['cost']}
+                funded=[row for row in options if actor.inventory[items[row[2]]]>0
+                        and owner(world,row[4]) in (None,actor.id)
+                        and not (items[row[2]]=='WallFixer' and row[2] in upgrading)]
                 if funded and time.monotonic()<deadline:
                     _,length,_,stand,wall=min(funded,key=lambda x:x[:4])
                     item=items[wall.id]
@@ -130,6 +149,8 @@ class RepairPlan:
                              DaySchedule.moves(actor,distance_field(world,{stand},actor.pos,deadline),
                                                'repair damaged wall before harvesting'))
                     world.repair_commands[actor.id]=[c.command for c in choices]
+                    world.maintenance_targets=dict(getattr(world,'maintenance_targets',{}))
+                    world.maintenance_targets[wall.id]=actor.id
                     world.day_repair_steps[actor.id]=length+1
                     world.day_repair_urgent=(wall.health<=rules.health_limit(world,wall)*policy.wall_repair_health_fraction
                                             or pressure(world,wall) not in (None,0))

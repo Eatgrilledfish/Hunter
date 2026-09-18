@@ -90,8 +90,10 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
         if time.monotonic() >= deadline:
             return None
         uid = req['unit'].id
+        from .day_maintenance import owner as maintenance_owner
+        reserved=maintenance_owner(world,req['unit'])
         possible = [(not committed(req,i),owners.get(uid) != i, reachable(i,req), i) for i in carriers
-                    if supply[i][req['name']] and reachable(i,req) is not None]
+                    if reserved in (None,i) and supply[i][req['name']] and reachable(i,req) is not None]
         if possible:
             _, _, _, owner = min(possible)
             supply[owner][req['name']] -= 1
@@ -100,7 +102,7 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
             if owner == actor.id: held.append(req)
             if req['name']=='WallUpgradeVoucher1' and req.get('pending'):
                 world.wall_service[req['unit'].pos]['reserved_owner']=owner
-        else:
+        elif reserved in (None,actor.id):
             unfilled.append(req)
     costs = [r.gold for k in WEAPONS if (r:=rules.build_rule(world,k)) is not None]
     reserve = (min(costs,default=0)*max(0,rules.weapon_limit-len(world.weapons))
@@ -203,11 +205,26 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
                 planned.extend(dict(name='WallFixer',rank=1.8,level=0,unit=None) for _ in range(count))
                 available-=count*world.shop['WallFixer'];space-=count
                 if limits is not None:limits['WallFixer']-=count
+    if actor.id==roster.w and not emergency:
+        from .guard_stock import ATTACK_ITEMS
+        for name in ATTACK_ITEMS:
+            price=world.shop.get(name,0)
+            granted=sum(min(r['items'].get(name,0),r['granted']//price)
+                for r in getattr(world,'funding_plan',()) if r['owner']==actor.id) if price>0 else 0
+            count=min(space,available//price,granted) if price>0 else 0
+            if count:
+                if limits is not None:limits[name]=max(limits[name],count)
+                planned.extend(dict(name=name,rank=1.95,level=0,unit=None) for _ in range(count))
+                available-=count*price;space-=count
+                if limits is not None:limits[name]-=count
     for req in unfilled:
         if not primary:break
         if space <= 0 or time.monotonic() >= deadline:
             break
         uid = req['unit'].id
+        claims=[r['owner'] for r in getattr(world,'funding_plan',())
+                if r.get('target_id')==uid and r.get('granted',0)>=r['cost']]
+        if claims and actor.id not in claims:continue
         if uid not in stage_ids:
             continue
         price = world.shop.get(req['name'],0)
@@ -248,7 +265,8 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
     # guard ammunition. W must budget its sale/checkout before sealing even
     # when the free pioneer owns the team's upgrade purchases.
     if actor.id == roster.w and not emergency:
-        stock.extend((('DizzyWeapon', 1), ('Bomb', 1)))
+        from .guard_stock import ATTACK_ITEMS
+        stock.extend((n,getattr(world,'guard_attack_targets',{}).get(n,1)) for n in ATTACK_ITEMS)
     if actor.id == roster.w and not emergency:
         # Spend smaller residuals on next-wave pressure only after personal
         # defence stock. Held orders across all bags already occupy the quota.

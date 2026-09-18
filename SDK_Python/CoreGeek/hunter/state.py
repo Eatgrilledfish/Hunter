@@ -11,6 +11,7 @@ from .opponent import Opponent
 from .lookahead import RiskMemory
 from .joint_lookahead import Memory as JointMemory
 from .defence import DefenceProcurement
+from .guard_stock import GuardStock
 from .medical import MedicalSupply
 from .recovery import BaseRecovery
 from .economic_routes import EconomicRoutes
@@ -70,6 +71,7 @@ class Session:
     risk: RiskMemory = field(default_factory=RiskMemory)
     joint_risk: JointMemory = field(default_factory=JointMemory)
     defence: DefenceProcurement = field(default_factory=DefenceProcurement)
+    guard_stock: GuardStock = field(default_factory=GuardStock)
     medical: MedicalSupply = field(default_factory=MedicalSupply)
 
     recovery: BaseRecovery = field(default_factory=BaseRecovery)

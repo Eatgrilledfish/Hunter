@@ -192,11 +192,12 @@ class Diagnostics(logging.Handler):
         cleared = obj(decision.get('night_clear'))
         funding=obj(decision.get('maintenance_funding'))
         if funding:duty['maintenance_funding']=funding
-        for key in ('wall_rebuild','six_task_deadline','role_handoff','effective_defenders'):
+        for key in ('wall_rebuild','six_task_deadline','role_handoff','effective_defenders','guard_stock','treasure_inventory'):
             value=obj(decision.get(key))
             if value and value.get('stage')!='idle':duty[key]=value
         grants=decision.get('funding_plan',[])
-        if grants:duty['funding_plan']=[{k:r[k] for k in ('owner','purpose','cost','granted','deficit','deadline') if k in r} for r in grants[:4]]
+        if grants:duty['funding_plan']=[{k:r[k] for k in ('owner','purpose','items','target_id','cost','granted','deficit','deadline','required_rounds','latest_departure','demand_id') if k in r} for r in grants]
+        if decision.get('work_rejections'):duty['work_rejections']=decision['work_rejections']
         outside_repair=obj(decision.get('exterior_repair'))
         if outside_repair.get('stage') not in (None,'inactive','NO_DEMAND'):
             duty['exterior_repair']=outside_repair
@@ -205,7 +206,7 @@ class Diagnostics(logging.Handler):
                 'night_remaining','economic_remaining','own_wall_material_needed','reason') if k in cleared}
         market = obj(decision.get('sunset_market'))
         if market.get('stage') not in (None,'inactive'):
-            duty['market'] = {k:market[k] for k in ('stage','buyer','fallback_worker','waiting','item','num','gold','blocked','target','required','worker_busy') if k in market}
+            duty['market'] = {k:market[k] for k in ('stage','buyer','fallback_worker','waiting','item','num','gold','blocked','target','required','worker_busy','quotes','excluded') if k in market}
             if market.get('worker_day'):
                 duty['market']['worker_day'] = market['worker_day']
         evasion = obj(decision.get('exterior_evasion'))
@@ -476,6 +477,9 @@ class Diagnostics(logging.Handler):
                       obj(units.get(pending.get('target'))) if pending.get('target') else actor)
             bag = actor.get('backpack')
             self._write_compact('item_receipt', actor=pending['actor'], item=pending['item'],
+                order_id=pending.get('order_id'),command=pending.get('command'),
+                backpack_before=pending.get('backpack'),backpack_after=bag,
+                counts_after=dict(Counter(bag)) if isinstance(bag,list) else None,
                 sent=pending['round'], consecutive=number==pending['round']+1,
                 accepted=feedback.get(pending['actor']) if number==pending['round']+1 else None,
                 hp_after=target.get('health'),level_after=target.get('level'),
@@ -512,6 +516,8 @@ class Diagnostics(logging.Handler):
                 maximum=220 if target['roleType']=='worker' else 200
             bag=actor.get('backpack')
             self._write_compact('item_use' if command['action']=='use' else 'item_buy',
+                order_id=f'{self.run_id}:{number}:{identity}',command=command,
+                backpack_before=bag,counts_before=dict(Counter(bag)) if isinstance(bag,list) else None,
                 actor=str(identity)[:32],item=item,target=target_id,
                 target_pos=points[0] if area and points else target.get('pos'),target_type=target.get('roleType'),
                 hp_before=target.get('health'),max_hp=maximum,level_before=target.get('level'),
@@ -524,6 +530,7 @@ class Diagnostics(logging.Handler):
                 escape={k:obj(decision.get('exterior_evasion')).get(k) for k in ('decision','to','known_damage_after')}
                        if str(identity)==str(obj(decision.get('night_roster')).get('m')) else None)
             state.setdefault('item_pending',[]).append(dict(actor=str(identity),item=item,
+                order_id=f'{self.run_id}:{number}:{identity}',command=dict(command),backpack=bag,
                 target=target_id,round=number,area=area,
                 target_pos=points[0] if area and points else None,robots=affected[:12]))
         sites=obj(decision.get('wall_service'))

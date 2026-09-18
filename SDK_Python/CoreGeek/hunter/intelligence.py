@@ -348,8 +348,8 @@ class Intelligence:
             if close_day is not None and closing is None:
                 reject(candidate,'unresolved_closing_day')
                 continue
-            expiry_known = closing is not None
-            if not expiry_known:
+            expiry_known = closing is not None or bool(window and window['official_expiry'])
+            if closing is None:
                 closing = 1300
             if window:closing=min(closing,window['execution_window_end'])
             if pos is None or not world.inside(pos) or not isinstance(items, list) or not items or len(items) > 40:
@@ -468,6 +468,21 @@ class Intelligence:
                 return True
         return False
 
+    def inventory_report(self, world):
+        actor=next((u for u in world.movers if u.kind=='pioneer'),None)
+        lists={tuple(h['items']) for h in self.treasures or self.preparations}
+        if not actor or actor.backpack is None:return dict(reason='personal_inventory_unknown')
+        rows=[]
+        for items in sorted(lists):
+            required=Counter(items)
+            rows.append(dict(required=dict(required),owned={n:actor.inventory[n] for n in required},
+                missing=dict(required-actor.inventory),
+                excess={n:actor.inventory[n]-q for n,q in required.items() if actor.inventory[n]>q}))
+        return dict(actor=actor.id,backpack=list(actor.backpack),inventory=dict(actor.inventory),plans=rows,
+            pending=self.pending_purchases.get(actor.id),fields={k:{n:v.get(n) for n in ('status','missing_reason','version')}
+                for k,v in self.field_state.items()},
+            blocking=self.diagnostic.get('reason'),rejections=self.diagnostic.get('rejections',[]))
+
     def candidates(self, world, clock, policy, deadline):
         clear_night=clock.phases=={'night'} and getattr(world,'own_wave_cleared',False)
         remaining=min(130-(world.round-o)%130 for o in clock.offsets)
@@ -580,7 +595,8 @@ class Intelligence:
                 if not paths:
                     rejected(hypothesis,'shop_or_altar_unreachable');continue
                 travel,to_shop,shop=min(paths)
-                summon=max(world.round+travel,hypothesis['opening_round'])
+                from .news_evidence import next_execution_round
+                summon=next_execution_round(hypothesis,world.round+travel,clock)
                 # Include every buy, walking leg, opening wait, summon action,
                 # and the real return leg. No invisible gate opening is assumed.
                 required=summon-world.round+1+home[stand]+margin
@@ -596,7 +612,7 @@ class Intelligence:
                     if future_walk is not None and clock.day is not None:
                         for day_offset in range(1,11-clock.day):
                             begin=future_start+(day_offset-1)*130
-                            moment=max(begin+future_walk,hypothesis['opening_round'])
+                            moment=next_execution_round(hypothesis,begin+future_walk,clock)
                             if (moment<=hypothesis['closing_round']
                                     and moment+1+home[stand]+margin<=begin+70):
                                 future_ok=True;break
@@ -646,7 +662,7 @@ class Intelligence:
                 if home.get(p,float('inf'))<home.get(actor.pos,0)]
             result=movement(actor,steps,220,'return with confirmed offerings; resume in a later daylight window')
             stage='prepare_return' if result else 'wait_future_day'
-        elif actor.pos==stand and world.round>=hypothesis['opening_round']:
+        elif actor.pos==stand and next_execution_round(hypothesis,world.round,clock)==world.round:
             result=[Candidate(actor.id,{'action':'summonTreasure','targetPos':[pos_json(hypothesis['position'])],
                                         'item':hypothesis['items']},220,reason)]
             stage='summon'

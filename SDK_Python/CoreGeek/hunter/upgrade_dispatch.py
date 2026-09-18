@@ -91,7 +91,17 @@ def prepare(market, world, clock, rules, policy, guidance, jobs, excluded, deadl
                 choices=[Candidate(actor.id,dict(action='use',name=item),240,
                                    'use owned next-wave order within observed daily quota before returning')]
                 stage='pressure_use';num=1
-            elif actor.id in market.upgrade_travellers or market.upgrade_owner==actor.id:
+            if not choices and actor.id==roster.p:
+                from .day_maintenance import propose
+                choices,repair=propose(view,actor,clock,rules,policy,deadline,home)
+                market.diagnostic['quotes'][actor.id]['maintenance']=repair
+                if choices:
+                    stage='day_repair';item='WallFixer';num=1
+                    world.essential_repair_stock=getattr(view,'essential_repair_stock',{})
+                    world.repair_commands=dict(getattr(world,'repair_commands',{}))
+                    world.repair_commands[actor.id]=[c.command for c in choices]
+                    trip=dict(trip,required=repair['required'],maintenance=repair)
+            if not choices and (actor.id in market.upgrade_travellers or market.upgrade_owner==actor.id):
                 choices=DaySchedule.moves(actor,home,'complete shopping return before night')
         preview=copy(guidance)
         preview.return_routes={i:r for i,r in guidance.return_routes.items() if i!=actor.id}
@@ -109,6 +119,9 @@ def prepare(market, world, clock, rules, policy, guidance, jobs, excluded, deadl
         proposals.append((priority,actor,choices,trip,stage,item,num))
     if not proposals:return []
     _,actor,choices,trip,stage,item,num=min(proposals,key=lambda p:p[0])
+    if stage=='day_repair':
+        world.maintenance_targets=dict(getattr(world,'maintenance_targets',{}))
+        world.maintenance_targets[trip['maintenance']['target']]=actor.id
     world.sunset_actions[actor.id]=[c.command for c in choices]
     guidance.day_actions[actor.id]=list(world.sunset_actions[actor.id])
     guidance.funded_actions[actor.id]=list(world.sunset_actions[actor.id])
@@ -123,6 +136,7 @@ def prepare(market, world, clock, rules, policy, guidance, jobs, excluded, deadl
         if cost + trip['reserve'] <= (world.gold or 0):
             world.checkout_cash_reserve = cost + trip['reserve']
     market.diagnostic.update(stage=stage,buyer=actor.id,item=item,num=num,
+        maintenance=trip.get('maintenance'),
         basket=dict(trip['orders']),required=trip['required'],blocked=None,
         worker_busy=bool(jobs.get(roster.w)))
     return choices

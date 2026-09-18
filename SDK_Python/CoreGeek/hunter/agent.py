@@ -123,6 +123,7 @@ class Agent:
                                       min(start + self.policy.planning_seconds, time.monotonic() + .12))
             world.duty_budget = DutyBudget(start+self.policy.planning_seconds)
             draft.night_roster.prepare(world)
+            draft.guard_stock.prepare(world,clock)
             if getattr(world,'role_handoff',None):
                 incoming=draft.night_roster.w
                 draft.exterior_escape.clear()
@@ -503,6 +504,7 @@ class Agent:
                 market_excluded.add(draft.tasks.accept_pending.get('actor'))
             if task_choice and task_choice.get('selected'):
                 market_excluded.add(task_choice['actor'])
+            funding.release_busy(world,market_excluded)
             from .opponent import next_wave_window, SUMMONS, summon_target_status
             summon_window=next_wave_window(clock)
             world.summon_use_remaining=(draft.opponent.remaining if summon_window and clock.phases=={'day'}
@@ -736,6 +738,7 @@ class Agent:
             draft.intelligence.finalize(world, clock, draft, decision.response, self.policy)
             draft.opponent.finalize(decision.response, world)
             draft.defence.finalize(world, decision.response)
+            draft.guard_stock.finalize(world,clock,decision.response)
             draft.medical.finalize(world, decision.response)
             draft.external_gate.finalize(world,decision.response)
             draft.night_clear.finalize(world,decision.response)
@@ -816,6 +819,9 @@ class Agent:
                       "repair":draft.repair.diagnostic,
                       "wall_rebuild":draft.wall_rebuild.diagnostic,
                       "funding_plan":world.funding_plan,
+                      "work_rejections":getattr(world,'work_rejections',[]),
+                      "treasure_inventory":draft.intelligence.inventory_report(world),
+                      "guard_stock":getattr(world,'guard_stock_report',{}),
                       "six_task_deadline":getattr(world,"six_task_deadline",{}),
                       "role_handoff":getattr(world,"role_handoff",{}),
                       "effective_defenders":dict(assigned=len(world.night_defenders),
