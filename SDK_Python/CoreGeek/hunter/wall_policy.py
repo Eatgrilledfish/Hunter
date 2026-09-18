@@ -34,11 +34,17 @@ def planned_gate(world):
 
 def upgrade_targets(world):
     """One permanent target set for purchases, held deliveries and completion."""
-    return frozenset(getattr(world, 'monster_front_walls', ())) - {planned_gate(world)}
+    front=frozenset(getattr(world, 'monster_front_walls', ()))
+    from .rear_open import enabled, required
+    # Continue one cell around each front corner along the existing side walls.
+    # Keep the geometric monster-facing edge unchanged for combat positioning.
+    sides={p for p in required(world)-front
+           if any(abs(p[0]-q[0])+abs(p[1]-q[1])==1 for q in front)} if enabled(world) else set()
+    return (front | sides) - {planned_gate(world)}
 
 
 def investment_targets(world):
-    """Finish all six front walls before opening the remaining required tier."""
+    """Finish the front and its two side extensions before the remaining tier."""
     front=upgrade_targets(world)
     from .rear_open import enabled, required
     walls={u.pos:u for u in world.ours.values() if u.alive and u.kind=='wall'}
