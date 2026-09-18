@@ -198,6 +198,7 @@ class Diagnostics(logging.Handler):
         grants=decision.get('funding_plan',[])
         if grants:duty['funding_plan']=[{k:r[k] for k in ('owner','purpose','items','target_id','cost','granted','deficit','deadline','required_rounds','latest_departure','demand_id') if k in r} for r in grants]
         if decision.get('work_rejections'):duty['work_rejections']=decision['work_rejections']
+        if decision.get('guard_funding'):duty['guard_funding']=decision['guard_funding']
         outside_repair=obj(decision.get('exterior_repair'))
         if outside_repair.get('stage') not in (None,'inactive','NO_DEMAND'):
             duty['exterior_repair']=outside_repair

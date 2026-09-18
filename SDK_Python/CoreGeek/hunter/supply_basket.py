@@ -128,6 +128,13 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
     prepaid = set(covered)
     planned = []
     limits = Counter(order_limits) if order_limits is not None and not emergency else None
+    grants=getattr(world,'funding_plan',())
+    if limits is not None:
+        for name in ('WallUpgradeVoucher1','WallUpgradeVoucher2','StationUpgradeVoucher1',
+                     'StationUpgradeVoucher2','WeaponUpgradeVoucher1','WeaponUpgradeVoucher2'):
+            funded=sum(r['items'].get(name,0) for r in grants
+                       if r['owner']==actor.id and r.get('granted',0)>=r['cost'])
+            limits[name]=max(limits[name],funded)
     from .rear_open import enabled as rear_enabled
     if (rear_enabled(world) and actor.id==roster.w and not actor.inventory['Medicine']
             and space>0 and world.shop.get('Medicine',0)>0):
@@ -218,13 +225,15 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
                 available-=count*price;space-=count
                 if limits is not None:limits[name]-=count
     for req in unfilled:
-        if not primary:break
         if space <= 0 or time.monotonic() >= deadline:
             break
         uid = req['unit'].id
         claims=[r['owner'] for r in getattr(world,'funding_plan',())
                 if r.get('target_id')==uid and r.get('granted',0)>=r['cost']]
         if claims and actor.id not in claims:continue
+        # The global checkout leader coordinates optional purchases, not all
+        # funded work. W owns wall grants even while P is the shop leader.
+        if not primary and actor.id not in claims:continue
         if uid not in stage_ids:
             continue
         price = world.shop.get(req['name'],0)

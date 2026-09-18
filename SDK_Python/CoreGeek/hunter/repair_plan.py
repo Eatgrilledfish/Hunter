@@ -50,8 +50,8 @@ class RepairPlan:
             self.night_usage[day]=self.night_usage.get(day,0)+1
             self.usage_observed_round=world.round
         previous_day=(clock.day or 0)-1
-        world.caretaker_repair_target=max(2,policy.caretaker_repair_target,
-            min(6,self.night_usage.get(previous_day,0)+len(self.unserved_stock.get(previous_day,set()))+1))
+        world.caretaker_repair_target=repair_decision.carry_target(clock,policy,
+            self.night_usage.get(previous_day,0),len(self.unserved_stock.get(previous_day,set())))
         if clock.phases!={'day'} or not actor or not actor.alive or actor.backpack is None:return
         reachable=distance_field(world,{actor.pos},actor.pos,deadline)
         home=distance_field(world,defence_duties.stands(world,actor.id),actor.pos,deadline)
@@ -118,8 +118,8 @@ class RepairPlan:
                 self.night_usage[day]=self.night_usage.get(day,0)+1
                 self.usage_observed_round=world.round
             previous_day=(clock.day or 0)-1
-            world.caretaker_repair_target=max(2,policy.caretaker_repair_target,
-                min(6,self.night_usage.get(previous_day,0)+len(self.unserved_stock.get(previous_day,set()))+1))
+            world.caretaker_repair_target=repair_decision.carry_target(clock,policy,
+                self.night_usage.get(previous_day,0),len(self.unserved_stock.get(previous_day,set())))
         world.repair_policy_active = bool(policy.repair_plan_enabled and plan)
         if world.repair_policy_active and defence_duties.enabled(world) and clock.phases == {'day'}:
             self.active={}

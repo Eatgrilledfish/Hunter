@@ -409,8 +409,7 @@ class CaretakerDay:
         if (self.phase == 'harvest' and missing-{plan['gate']}
                 and actor.inventory['stone'] >= stone and self.front_rebuild_pending):
             self.phase = 'close'
-        investment=bool(trip and getattr(world,'upgrade_checkout_actor',None)==actor.id
-                        and any('UpgradeVoucher' in name for name in trip['orders']))
+        investment=bool(trip and any('UpgradeVoucher' in name for name in trip['orders']))
         sale_funded=bool(investment and stock and required is not None
             and required+margin<=clock.until_night
             and sum(world.shop[name]*amount for name,amount in trip['orders'].items())
@@ -428,7 +427,9 @@ class CaretakerDay:
             from .repair_decision import stock_target
             repair_reserve=(actor.inventory['WallFixer']<stock_target(world,policy)
                             and trip['orders'].get('WallFixer',0)>0)
-            if investment or repair_reserve:
+            personal_stock=any(trip['orders'].get(name,0)>0
+                               for name in ('Medicine','DizzyWeapon','Bomb'))
+            if investment or repair_reserve or personal_stock:
                 # A fully funded executable investment no longer waits until
                 # all remaining harvesting time has been consumed. Material,
                 # use, closure and return are already in this very quote.
@@ -437,7 +438,7 @@ class CaretakerDay:
                 required=(required if self.phase=='sell' else checkout[actor.pos])
                 self.last_required=required+margin
                 self.diagnostic.update(required=self.last_required,
-                    harvest_released='funded investment' if investment else 'funded personal repair reserve')
+                    harvest_released='funded investment' if investment else 'funded personal defence stock')
         if (self.phase in {'harvest','close','home'} and next_exit_stone and missing<={plan['gate']}
                 and stone<=actor.inventory['stone']<stone+next_exit_stone
                 and actor.capacity-len(actor.backpack)>=stone+next_exit_stone-actor.inventory['stone']

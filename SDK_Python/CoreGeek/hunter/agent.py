@@ -822,6 +822,7 @@ class Agent:
                       "work_rejections":getattr(world,'work_rejections',[]),
                       "treasure_inventory":draft.intelligence.inventory_report(world),
                       "guard_stock":getattr(world,'guard_stock_report',{}),
+                      "guard_funding":getattr(world,'guard_funding_report',{}),
                       "six_task_deadline":getattr(world,"six_task_deadline",{}),
                       "role_handoff":getattr(world,"role_handoff",{}),
                       "effective_defenders":dict(assigned=len(world.night_defenders),

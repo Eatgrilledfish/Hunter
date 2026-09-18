@@ -183,9 +183,8 @@ class SunsetMarket:
                     excluded=set(excluded)|{roster.p}  # Only new, unpaid departures wait for dawn analysis.
                 free = {i for i in (roster.w,roster.p) if i not in excluded and i in world.ours
                         and world.ours[i].alive and world.ours[i].backpack is not None}
-                # Only one guard budgets the team's upgrade basket. Otherwise
-                # W reserves P's entire shopping tour and stops collecting even
-                # while the free pioneer is already going to the counter.
+                # The leader budgets unassigned purchases; per-building grants
+                # also let W carry its own wall work during P's shopping trip.
                 # A free pioneer may still be trapped behind the worker at C.
                 # Assign checkout only to a guard with an observed route to
                 # the shop; otherwise both reserve work for an immobile P.

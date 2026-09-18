@@ -38,6 +38,13 @@ def premaintenance(world, wall, rules, policy=None):
                 or damage>0 and wall.health<=damage)
 
 
+def carry_target(clock, policy, used=0, unserved=0):
+    """Strategy reserve, not a claim about future monster damage or bag size."""
+    day=max(1,clock.day or 1)
+    baseline=(3,6,10,15,20)[min(day,5)-1]
+    return max(baseline,policy.caretaker_repair_target,used+unserved+1)
+
+
 def stock_target(world, policy):
     """Actual daytime service debt plus the next night's personal carry target."""
     return (max(2,getattr(world,'caretaker_repair_target',policy.caretaker_repair_target))

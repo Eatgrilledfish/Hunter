@@ -35,11 +35,14 @@ def publish(world, clock, rules, policy, intelligence, deadline):
             count = min(max(0,target-worker.inventory[name]),capacity)
             if price > 0 and count:
                 capacity-=count
-                attack=name in {'DizzyWeapon','Bomb'}
-                for index in range(count if attack else 1):
-                    quantity=1 if attack else count
-                    world.funding_plan.append(dict(owner=worker.id,purpose='night_attack' if attack else 'night_essential',
-                        items={name:quantity},cost=price*quantity,stock_index=worker.inventory[name]+index,
+                from .repair_decision import purchase_floor
+                for index in range(count):
+                    owned=worker.inventory[name]+index
+                    purpose=('night_attack' if name in {'DizzyWeapon','Bomb'} else
+                             'night_buffer' if name=='WallFixer' and owned>=purchase_floor(world,policy)
+                             else 'night_essential')
+                    world.funding_plan.append(dict(owner=worker.id,purpose=purpose,
+                        items={name:1},cost=price,stock_index=owned,
                         deadline=due,required_rounds=required,latest_departure=due-required,
                         deadline_source='next_night',expires=world.round))
     actor = world.ours.get(roster.p)
@@ -70,7 +73,8 @@ def publish(world, clock, rules, policy, intelligence, deadline):
                         required_rounds=min(trips)))
     from .wall_policy import purchase_units, upgrade_rank
     from .defence_duties import stands
-    due=sorted(purchase_units(world),key=lambda u:(upgrade_rank(world,u),u.level,u.id))
+    due=sorted(purchase_units(world),key=lambda u:(u.id not in getattr(world,'critical_base_ids',()),
+        u.kind!='wall',upgrade_rank(world,u),u.level,u.id))
     if due and clock.phases=={'day'}:
         actors=[u for u in (worker,actor) if u and u.alive and u.backpack is not None and u.capacity is not None
                 and (u.id==roster.w and not getattr(world,'wall_rebuild_plan',{})
@@ -79,6 +83,9 @@ def publish(world, clock, rules, policy, intelligence, deadline):
         held=sum((u.inventory for u in world.movers if u.backpack is not None),Counter())
         routes={}
         for target in due:
+            if time.monotonic()>=deadline:
+                world.work_rejections.append(dict(reason='funding_planning_budget',target_id=target.id))
+                break
             if not target.alive or target.level not in (1,2):continue
             from .procurement import upgrade_allowed
             if not upgrade_allowed(world,target,policy,rules):continue
@@ -87,7 +94,11 @@ def publish(world, clock, rules, policy, intelligence, deadline):
             if held[name]:held[name]-=1;continue
             price=world.shop.get(name,0)
             if price<=0:continue
-            for buyer in sorted(actors,key=lambda u:(not world.near_zone(u.pos,'weaponShop'),u.id!=roster.p,u.id)):
+            from .day_maintenance import owner
+            reserved=owner(world,target)
+            preferred=roster.w if target.kind=='wall' else roster.p
+            for buyer in sorted(actors,key=lambda u:(u.id!=preferred,not world.near_zone(u.pos,'weaponShop'),u.id)):
+                if reserved not in (None,buyer.id):continue
                 allocated=sum(sum(r['items'].values()) for r in world.funding_plan if r['owner']==buyer.id)
                 if len(buyer.backpack)+allocated>=buyer.capacity:continue
                 if buyer.id not in routes:
@@ -99,7 +110,10 @@ def publish(world, clock, rules, policy, intelligence, deadline):
                                              if p in home},buyer,deadline) or {}
                 shops=interaction_cells(world,world.zones.get('weaponShop',()),buyer.pos)
                 trips=[start[p]+service[p]+1+policy.return_buffer+8 for p in shops&start.keys()&service.keys()]
-                if time.monotonic()>=deadline or not trips or min(trips)>clock.until_night:
+                if time.monotonic()>=deadline:
+                    world.work_rejections.append(dict(owner=buyer.id,target_id=target.id,reason='funding_planning_budget'))
+                    break
+                if not trips or min(trips)>clock.until_night:
                     world.work_rejections.append(dict(owner=buyer.id,target_id=target.id,reason='shop_service_return_deadline',required=min(trips) if trips else None))
                     continue
                 world.funding_plan.append(dict(owner=buyer.id,purpose='wall_upgrade' if prefix=='Wall' else 'base_upgrade' if prefix=='Station' else 'weapon_upgrade',items={name:1},cost=price,
@@ -127,9 +141,19 @@ def allocate(world):
     # Rescue precedes reserves; unaffordable optional purchases reserve zero,
     # so a 100-gold consumable never blocks a feasible 20-gold wall step.
     critical=getattr(world,'critical_base_ids',())
-    order={'night_essential':1,'treasure':2,'night_attack':3}
-    world.funding_plan.sort(key=lambda r:(0 if r.get('target_id') in critical else order.get(r['purpose'],4),
-        r.get('stock_index',0) if r['purpose']=='night_attack' else 0))
+    # Keep two executable wall steps ahead of bulk stores on every checkout.
+    # This is a spending priority, not a daily upgrade cap. Spare cash can
+    # still finish all other walls after personal night supplies are funded.
+    walls=[r for r in world.funding_plan if r['purpose'] in {'wall_upgrade','wall_rebuild'}][:2]
+    def priority(row):
+        if row.get('target_id') in critical:return 0
+        if row['purpose']=='night_essential':return 1
+        if row['purpose']=='treasure':return 2
+        if any(row is r for r in walls):return 3
+        if row['purpose']=='night_buffer':return 4
+        if row['purpose']=='night_attack':return 5 if row.get('stock_index',0)==0 else 7
+        return 6
+    world.funding_plan.sort(key=lambda r:(priority(r),r.get('stock_index',0)))
     cash=max(0,world.gold or 0)
     for row in world.funding_plan:
         unit_cost=row['cost']//max(1,sum(row['items'].values()))
@@ -143,6 +167,16 @@ def allocate(world):
             demand_id=fingerprint([row['owner'],row['purpose'],row['items'],row.get('target_id'),row.get('generation'),row.get('stock_index')])[:16],
             stage='funded_await_purchase' if grant==row['cost'] else 'cash_deficit')
         if row['purpose']=='treasure':world.treasure_reserved_gold=grant
+    worker=world.ours.get(world.night_roster.w)
+    if worker and worker.backpack is not None:
+        targets=dict(getattr(world,'guard_attack_targets',{}),Medicine=1,
+            WallFixer=getattr(world,'caretaker_repair_target',3)+getattr(world,'day_repair_demand',0))
+        world.guard_funding_report={name:dict(owned=worker.inventory[name],target=targets.get(name,1),
+            missing=max(0,targets.get(name,1)-worker.inventory[name]),
+            planned=sum(r['items'].get(name,0) for r in world.funding_plan if r['owner']==worker.id),
+            funded=sum(min(r['items'].get(name,0),r['granted']//world.shop[name])
+                       for r in world.funding_plan if r['owner']==worker.id) if world.shop.get(name,0)>0 else 0)
+            for name in ('WallFixer','Medicine','DizzyWeapon','Bomb')}
 
 
 def release_busy(world, excluded):

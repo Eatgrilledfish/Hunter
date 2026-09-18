@@ -47,12 +47,14 @@ class GuardStock:
         used=self.usage.get(previous,{})
         missed=self.unserved.get(previous,{})
         # A bounded policy target; bag and observed cash still constrain buys.
-        targets={name:min(4,max(1,used.get(name,0)+(len(missed.get(name,()))+2)//3)) for name in ATTACK_ITEMS}
+        baseline=min(3,1+max(0,(clock.day or 1)-1)//2)
+        targets={name:min(4,max(baseline,used.get(name,0)+(len(missed.get(name,()))+2)//3)) for name in ATTACK_ITEMS}
         world.guard_attack_targets=targets
         world.guard_stock_report=dict(actor=actor.id,target=targets,
             owned={n:actor.inventory[n] for n in ATTACK_ITEMS},
             previous_night_used=dict(used),previous_night_unserved={n:len(v) for n,v in missed.items()},
-            demand_basis='confirmed consumption plus distinct in-range threats while out of stock')
+            day_baseline=baseline,
+            demand_basis='day reserve plus confirmed consumption and distinct unserved threats')
 
     def finalize(self, world, clock, response):
         actor=world.ours.get(world.night_roster.w)
