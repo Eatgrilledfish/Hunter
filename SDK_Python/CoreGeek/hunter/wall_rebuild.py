@@ -33,8 +33,8 @@ def stone_reserve(world, identity, rules):
 
 
 def upgrade_ready(world, wall):
-    clock=getattr(world,'strategy_clock',None)
-    return not (clock and clock.phases=={'day'} and damaged(world,wall))
+    # Damage is not a prerequisite to repair: a legal upgrade restores HP.
+    return wall.alive and wall.level in (1,2)
 
 
 @dataclass
@@ -91,8 +91,15 @@ class WallRebuild:
             self.diagnostic = dict(stage='night_pause', plan=dict(p)) if p else self.diagnostic
             return []
         required = set(world.wall_targets or ()) & rear_open.required(world)
+        from .wall_policy import upgrade_targets
+        direct_upgrade=set(upgrade_targets(world))
+        if p and p['stage']=='SUPPLY' and wall and wall.pos in direct_upgrade:
+            # An unopened transaction can yield to direct upgrading. A real
+            # hole or completed rebuild still keeps its existing owner.
+            self.plan={};p={};world.wall_rebuild_plan={}
+            self.diagnostic=dict(stage='direct_upgrade',wall=wall.id,reason='upgrade restores damaged level-one wall')
         if not p:
-            options = sorted((u for u in walls.values() if u.pos in required and damaged(world,u)),
+            options = sorted((u for u in walls.values() if u.pos in required-direct_upgrade and damaged(world,u)),
                              key=lambda u:(distance(worker.pos,u.pos),u.health,u.id))
             if not options:return []
             wall=options[0]

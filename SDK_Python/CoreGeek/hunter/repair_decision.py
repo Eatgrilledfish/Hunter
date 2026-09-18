@@ -3,7 +3,7 @@ def eligible(world, wall, rules, policy=None, *, service_steps=1, pressure=0):
     from .rear_open import enabled
     clock=getattr(world,'strategy_clock',None)
     if enabled(world) and clock and clock.phases=={'day'} and wall.kind=='wall' and wall.level==1:
-        return False  # Daylight level-one restoration belongs to remove/build/upgrade.
+        return False  # Upgrade targets restore HP directly; other level-one walls use the rebuild transaction.
     restored=getattr(world,'wall_restore_observations',{}).get(wall.id)
     if (restored and restored['level']==wall.level and wall.health is not None
             and wall.health>=restored['hp']):return False
