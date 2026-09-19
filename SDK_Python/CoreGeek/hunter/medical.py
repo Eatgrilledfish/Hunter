@@ -130,7 +130,8 @@ class MedicalSupply:
                 continue
             w_identity = getattr(getattr(world, 'night_roster', None), 'w', None)
             market = getattr(world, 'procurement_market', None)
-            migrated_w = market is not None and actor.id == w_identity
+            from .purchase_roles import managed
+            migrated_w = market is not None and managed(world, actor.id)
             if migrated_w and market.purchase_pending(world, actor.id):
                 continue
             price = world.shop.get('Medicine')
@@ -211,8 +212,9 @@ class MedicalSupply:
         w_identity = getattr(getattr(world, 'night_roster', None), 'w', None)
         for identity, order in self.offered.items():
             if response['roleCommandMap'].get(identity) == {'action': 'buy', 'name': 'Medicine', 'num': 1}:
-                if identity == w_identity and getattr(world, 'procurement_market', None) is not None:
-                    # The market ledger owns W's purchase pending; keep only the
+                from .purchase_roles import managed
+                if managed(world, identity) and getattr(world, 'procurement_market', None) is not None:
+                    # The market ledger owns the guard's purchase pending; keep only the
                     # day-budget charge here.
                     self.spent[order['day']] = self.spent.get(order['day'], 0)+order['price']
                     continue

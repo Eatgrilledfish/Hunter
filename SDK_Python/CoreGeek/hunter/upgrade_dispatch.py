@@ -60,7 +60,7 @@ def prepare(market, world, clock, rules, policy, guidance, jobs, excluded, deadl
             choices=([Candidate(actor.id,dict(action='sell',name=item,num=num),240,'sell only personally held pioneer ore')]
                      if world.near_zone(actor.pos,'vendor') else DaySchedule.moves(actor,trip['sale'],'sell actual personal ore before checkout'))
             stage='personal_sale'
-        elif trip['orders'] and trip['fits'] and world.sunset_buyer in (None,actor.id):
+        elif trip['orders'] and trip['fits']:
             item,num=next(iter(trip['orders'].items()))
             choices=([Candidate(actor.id,dict(action='buy',name=item,num=num),240,
                         'buy complete upgrade chain and night stock with observed cash',gold_reserve=trip['reserve'])]
@@ -104,6 +104,21 @@ def prepare(market, world, clock, rules, policy, guidance, jobs, excluded, deadl
                     trip=dict(trip,required=repair['required'],maintenance=repair)
             if not choices and (actor.id in market.upgrade_travellers or market.upgrade_owner==actor.id):
                 choices=DaySchedule.moves(actor,home,'complete shopping return before night')
+        if choices and actor.id in (roster.w, roster.p):
+            # The guard's basket/delivery circuit is one procurement work in the ledger.
+            work = market.work_for(world, actor.id, 'day_checkout')
+            if work is None:
+                # A conflicting live trip owns this actor; unreferenced candidates must not
+                # bypass the ledger, so nothing is offered this frame.
+                market.diagnostic['blocked'] = 'procurement_work_busy'
+                continue
+            market.attach_quote(world, work, pw.Quote(
+                status=pw.FEASIBLE if trip.get('fits', True) else pw.quote_status_for('no_route'),
+                round=world.round, actor=actor.id, orders=dict(trip.get('orders', {})),
+                required=trip.get('required'), reserve=trip.get('reserve') or 0,
+                cost=sum(world.shop.get(n, 0)*c for n, c in trip.get('orders', {}).items()),
+                source='upgrade_dispatch'))
+            choices = market.propose_step(world, work, choices, stage)
         preview=copy(guidance)
         preview.return_routes={i:r for i,r in guidance.return_routes.items() if i!=actor.id}
         proposed=bool(choices)
@@ -120,29 +135,14 @@ def prepare(market, world, clock, rules, policy, guidance, jobs, excluded, deadl
         proposals.append((priority,actor,choices,trip,stage,item,num))
     if not proposals:return []
     _,actor,choices,trip,stage,item,num=min(proposals,key=lambda p:p[0])
-    if actor.id == roster.w:
-        # W's basket/delivery circuit is one procurement work in the ledger.
-        work = market.work_for(world, actor.id, 'day_checkout')
-        if work is None:
-            # A conflicting live trip owns W; unreferenced candidates must not
-            # bypass the ledger, so nothing is offered this frame.
-            market.diagnostic['blocked'] = 'procurement_work_busy'
-            return []
-        market.attach_quote(world, work, pw.Quote(
-            status=pw.FEASIBLE if trip.get('fits', True) else pw.quote_status_for('no_route'),
-            round=world.round, actor=actor.id, orders=dict(trip.get('orders', {})),
-            required=trip.get('required'), reserve=trip.get('reserve') or 0,
-            cost=sum(world.shop.get(n, 0)*c for n, c in trip.get('orders', {}).items()),
-            source='upgrade_dispatch'))
-        choices = market.propose_step(world, work, choices, stage)
     if stage=='day_repair':
         world.maintenance_targets=dict(getattr(world,'maintenance_targets',{}))
         world.maintenance_targets[trip['maintenance']['target']]=actor.id
     world.sunset_actions[actor.id]=[c.command for c in choices]
     guidance.day_actions[actor.id]=list(world.sunset_actions[actor.id])
     guidance.funded_actions[actor.id]=list(world.sunset_actions[actor.id])
-    # A worker daily itinerary may also exist. Serialise purchases only, not
-    # the other guard's independent building, repairing or return movement.
+    # The legacy buyer view is advisory for migrated works. Joint cash and
+    # personal actor locks decide whether both purchases can ship.
     if world.sunset_buyer is None or choices[0].command['action']=='buy':
         world.sunset_buyer=actor.id
     if stage == 'upgrade_procure':

@@ -168,8 +168,7 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
     # reserved in P's basket. Fund a small working stock alongside the wall
     # stage, before its remaining cash is exhausted by upgrade chains.
     if (not emergency and not getattr(world,'critical_base_ids',())
-            and (actor.id==roster.w or actor.id==roster.p and not rear_enabled(world))
-            and not (actor.id==roster.p and getattr(world,'base_restore_ids',()))
+            and actor.id==roster.w
             and len(world.weapons)==rules.weapon_limit
             and not any(g.id in stage_ids for g in world.weapons)):
         price=world.shop.get('WallFixer',0)
@@ -212,7 +211,7 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
                 planned.extend(dict(name='WallFixer',rank=1.8,level=0,unit=None) for _ in range(count))
                 available-=count*world.shop['WallFixer'];space-=count
                 if limits is not None:limits['WallFixer']-=count
-    if actor.id==roster.w and not emergency:
+    if actor.id==roster.p and not emergency:
         from .guard_stock import ATTACK_ITEMS
         for name in ATTACK_ITEMS:
             price=world.shop.get(name,0)
@@ -225,6 +224,9 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
                 available-=count*price;space-=count
                 if limits is not None:limits[name]-=count
     for req in unfilled:
+        from .purchase_roles import permitted
+        if not permitted(world, actor.id, req['name']):
+            continue
         if space <= 0 or time.monotonic() >= deadline:
             break
         uid = req['unit'].id
@@ -252,8 +254,7 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
     stock = []
     if not emergency and (primary or actor.id==roster.w):
         stock.append(('Medicine', 1 if policy.medical_stock_enabled else 2))
-    if (not emergency and (actor.id==roster.w or actor.id==roster.p and not rear_enabled(world)) and walls
-            and not (actor.id==roster.p and getattr(world,'base_restore_ids',()))):
+    if not emergency and actor.id==roster.w and walls:
         from .repair_decision import eligible
         damaged = sum(eligible(world,u,rules,policy) for u in walls)
         target=(max(2,damaged+(len(walls)+3)//4) if actor.id==roster.w else 1)
@@ -270,13 +271,12 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
         from .wall_policy import investment_fund
         paid_now=sum(world.shop[e['name']] for e in planned if e['unit'] is not None)
         defence_reserve=max(defence_reserve,max(0,investment_fund(world)[0]-paid_now))
-    # Upgrade ownership serializes shared building investment, not personal
-    # guard ammunition. W must budget its sale/checkout before sealing even
-    # when the free pioneer owns the team's upgrade purchases.
-    if actor.id == roster.w and not emergency:
+    # W owns building investment; P budgets personal attack stock separately.
+    # Both baskets still reserve the other actor's shared-cash grants.
+    if actor.id == roster.p and not emergency:
         from .guard_stock import ATTACK_ITEMS
         stock.extend((n,getattr(world,'guard_attack_targets',{}).get(n,1)) for n in ATTACK_ITEMS)
-    if actor.id == roster.w and not emergency:
+    if actor.id == roster.p and not emergency:
         # Spend smaller residuals on next-wave pressure only after personal
         # defence stock. Held orders across all bags already occupy the quota.
         slots=getattr(world,'summon_purchase_slots',0)
@@ -294,6 +294,9 @@ def basket(world, actor, rules, policy, deadline, *, cash=None, order_limits=Non
     from .wall_policy import investment_fund
     minimum_reserve,_=investment_fund(world,preserve_reconstruction=False)
     for name, target in stock:
+        from .purchase_roles import permitted
+        if not permitted(world, actor.id, name):
+            continue
         price = world.shop.get(name,0)
         if price <= 0: continue
         count=stock_quantity(world,actor,name,target,available,defence_reserve,space,planned,minimum_reserve)

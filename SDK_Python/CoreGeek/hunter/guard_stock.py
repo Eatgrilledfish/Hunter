@@ -3,14 +3,19 @@ from collections import Counter
 from dataclasses import dataclass, field
 from .protocol import distance
 
-ATTACK_ITEMS=('DizzyWeapon','Bomb')
+from .purchase_roles import ATTACK_ITEMS
 
 
 def requirements(world, actor, policy):
     from .repair_decision import stock_target
-    stock=[('WallFixer',stock_target(world,policy)),('Medicine',1)]
-    if actor.health<220:stock.reverse()
-    return stock+[(name,getattr(world,'guard_attack_targets',{}).get(name,1)) for name in ATTACK_ITEMS]
+    roster = getattr(world, 'night_roster', None)
+    stock = [('Medicine', 1)]
+    if roster is None or actor.id == roster.w:
+        stock.insert(0, ('WallFixer', stock_target(world, policy)))
+        if actor.health < 220: stock.reverse()
+    if roster is None or actor.id == roster.p:
+        stock += [(name, getattr(world, 'guard_attack_targets', {}).get(name, 1)) for name in ATTACK_ITEMS]
+    return stock
 
 
 @dataclass
@@ -21,7 +26,7 @@ class GuardStock:
     observed: int = -1
 
     def prepare(self, world, clock):
-        actor=world.ours.get(world.night_roster.w)
+        actor=world.ours.get(world.night_roster.p)
         if not actor or actor.backpack is None:return
         if self.observed!=world.round:
             for name,row in list(self.pending.items()):
@@ -57,7 +62,7 @@ class GuardStock:
             demand_basis='day reserve plus confirmed consumption and distinct unserved threats')
 
     def finalize(self, world, clock, response):
-        actor=world.ours.get(world.night_roster.w)
+        actor=world.ours.get(world.night_roster.p)
         command=response['roleCommandMap'].get(actor.id,{}) if actor else {}
         name=command.get('name')
         if actor and clock.phases=={'night'} and command.get('action')=='use' and name in ATTACK_ITEMS:

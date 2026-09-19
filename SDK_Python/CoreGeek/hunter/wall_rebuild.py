@@ -97,7 +97,7 @@ class WallRebuild:
         required = set(world.wall_targets or ()) & rear_open.required(world)
         from .wall_policy import upgrade_targets
         from .wall_policy import investment_targets
-        direct_upgrade=set(investment_targets(world))
+        direct_upgrade=(set(investment_targets(world)) if worker.inventory['WallUpgradeVoucher1'] else set())
         if p and p['stage']=='SUPPLY' and wall and wall.pos in direct_upgrade:
             # An unopened transaction can yield to direct upgrading. A real
             # hole or completed rebuild still keeps its existing owner.
@@ -164,10 +164,8 @@ class WallRebuild:
         due=daily_upgrade_targets(world)
         held_front=any(u.inventory[f'WallUpgradeVoucher{target.level}'] for u in world.movers
                        if u.backpack is not None for target in due)
-        funded_front=any(r['purpose']=='wall_upgrade' and r.get('granted',0)>=r['cost']
-                         for r in getattr(world,'funding_plan',()))
         front_gap=bool(direct_upgrade-set(walls))
-        if (not p or p['stage']=='SUPPLY' and p.get('target_level',1)==1) and (front_gap or due and (held_front or funded_front)):
+        if (not p or p['stage']=='SUPPLY' and p.get('target_level',1)==1) and (front_gap or due and held_front):
             # An intact optional side wall has not acquired exclusive work rights.
             if p:p.pop('segment',None)
             return self._blocked(world,worker,'yield_front_upgrade')
@@ -203,6 +201,10 @@ class WallRebuild:
         from .repair_decision import stock_target
         from .guard_stock import requirements as guard_requirements
         stock=guard_requirements(world,worker,policy)
+        if not missing_stone and not missing_voucher:
+            # Materials for this transaction are already personal. Optional
+            # restocking must not send W away before closing the local wall job.
+            stock=[(name,n) for name,n in stock if name=='Medicine' and worker.health<220]
         if p['stage']!='REBUILD':
             from .funding import permits_bundle
             for name,target in stock+([('WallUpgradeVoucher1',paid_elsewhere+1)] if missing_voucher else []):

@@ -126,6 +126,8 @@ def prepare(world, clock, rules, policy, actor, reach, home, blocked, remaining,
         targets, actors, deadline, delivery)
     _check(deadline)
     carried = [target for identity, target, _ in allocations if identity == actor.id]
+    from .purchase_roles import permitted
+    remaining_targets = {i:t for i,t in remaining_targets.items() if permitted(world, actor.id, t['name'])}
 
     def dawn_budget(entries):
         circuits = [delivery(actor, entry) for entry in entries]

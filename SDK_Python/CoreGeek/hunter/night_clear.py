@@ -67,7 +67,7 @@ class NightClear:
             return []
         if not self.actor and (not clear or self.seen_day!=clock.day):return []
         if (worker.id in guidance.survival_actions or worker.id in getattr(world,'return_recovery_actions',{})
-                or worker.id in getattr(world,'repair_commands',{}) and world.repair_commands[worker.id]
+                or not clear and worker.id in getattr(world,'repair_commands',{}) and world.repair_commands[worker.id]
                 or worker.health<=110 or getattr(world,'critical_base_ids',())
                 or guidance.observations.get(worker.id,{}).get('upper_per_attack_opportunity',0)>0):
             if self.actor:self.returning=True
@@ -108,9 +108,6 @@ class NightClear:
         elif back is not None and time.monotonic()<deadline:
             reach=distance_field(world,{worker.pos},worker.pos,deadline,blocked)
             buy_in_flight=market is not None and market.purchase_pending(world,worker.id)
-            if not buy_in_flight:
-                command=self._investment(world,clock,rules,policy,worker,reach,home,blocked,horizon,deadline)
-                if command:stage='invest'
             sale={name:worker.inventory[name] for name in MINERALS
                   if world.vendor.get(name,0)>0 and worker.inventory[name]}
             if 'stone' in sale:
@@ -156,7 +153,10 @@ class NightClear:
                     route=distance_field(world,{stand},worker.pos,deadline,blocked)
                     steps=sorted(p for p in neighbours(worker.pos) if route.get(p,float('inf'))<route.get(worker.pos,0))
                     if steps:command=dict(action='move',targetPos=[pos_json(steps[0])])
-            elif not command:
+            if not command and not buy_in_flight:
+                command=self._investment(world,clock,rules,policy,worker,reach,home,blocked,horizon,deadline)
+                if command:stage='invest'
+            if not command:
                 command=self._passage(world,clock,rules,policy,worker,reach,blocked,horizon,deadline)
                 if command:
                     stage='open_passage'

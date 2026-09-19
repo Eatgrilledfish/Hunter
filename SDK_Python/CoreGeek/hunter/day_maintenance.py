@@ -23,6 +23,8 @@ def propose(world, actor, clock, rules, policy, deadline, home):
     report=dict(reason='no_unassigned_damaged_wall')
     options=[]
     held=actor.inventory['WallFixer']>0
+    if not held:
+        return [], dict(reason='repair_stock_owned_by_worker')
     price=world.shop.get('WallFixer',0)
     reserve=sum(r['granted'] for r in getattr(world,'funding_plan',()))
     if not held and (price<=0 or actor.capacity is None or len(actor.backpack)>=actor.capacity

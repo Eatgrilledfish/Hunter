@@ -165,7 +165,7 @@ class SunsetMarket:
             return
         guard = getattr(world, 'essential_guard_stock', {}).get((actor.id, name), {})
         repair = getattr(world, 'essential_repair_stock', {}).get(actor.id, {})
-        if (actor.id == getattr(getattr(world, 'night_roster', None), 'w', None)
+        if (actor.id == getattr(getattr(world, 'night_roster', None), 'p', None)
                 and name in {'DizzyWeapon', 'Bomb'} and actor.inventory[name] < 1
                 and guard.get('round') == world.round and guard.get('price') == world.shop.get(name)
                 and command.get('num', 1) == 1 == guard.get('count')):

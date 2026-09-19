@@ -509,6 +509,8 @@ class Agent:
             if task_choice and task_choice.get('selected'):
                 market_excluded.add(task_choice['actor'])
             funding.release_busy(world,market_excluded)
+            from .purchase_roles import publish as publish_purchase_list
+            publish_purchase_list(world, clock, self.policy)
             from .opponent import next_wave_window, SUMMONS, summon_target_status
             summon_window=next_wave_window(clock)
             world.summon_use_remaining=(draft.opponent.remaining if summon_window and clock.phases=={'day'}
@@ -836,6 +838,7 @@ class Agent:
                           for w in getattr(world,'procurement_works',[])],
                       "treasure_inventory":draft.intelligence.inventory_report(world),
                       "guard_stock":getattr(world,'guard_stock_report',{}),
+                      "daily_purchase_plan":getattr(world,'daily_purchase_plan',{}),
                       "guard_funding":getattr(world,'guard_funding_report',{}),
                       "six_task_deadline":getattr(world,"six_task_deadline",{}),
                       "role_handoff":getattr(world,"role_handoff",{}),

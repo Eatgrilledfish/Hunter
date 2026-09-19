@@ -110,6 +110,8 @@ class RepairSupply:
                 continue  # W's multi-pack order belongs to SunsetMarket, including unknown receipts.
             if time.monotonic()>=deadline or slots<=0 or price>budget:
                 break
+            if identity != roster.w:
+                continue
             actor=world.ours.get(identity)
             market=getattr(world,'procurement_market',None)
             migrated_w = market is not None and identity==roster.w

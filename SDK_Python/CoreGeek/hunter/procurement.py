@@ -278,6 +278,9 @@ def propose(world, policy, deadline, task_actor=None, *, plans=None, priority_id
             start = start_fields[identity]
             shops = interaction_cells(world, world.zones.get("weaponShop", ()), actor.pos)
             for target_id, target in targets.items():
+                from .purchase_roles import permitted
+                if not permitted(world, actor.id, target['name']):
+                    continue
                 price = world.shop.get(target["name"])
                 if price is None or price > gold or time.monotonic() >= deadline:
                     continue

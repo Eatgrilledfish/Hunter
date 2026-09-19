@@ -321,6 +321,9 @@ def purchase_permitted(world, rules, candidate):
     same-source quote at creation; this gate stays read-only for them (E4).
     """
     command=candidate.command
+    from .purchase_roles import permitted
+    if command.get('action') == 'buy' and not permitted(world, candidate.actor, command.get('name', '')):
+        return False
     if (command.get('action') != 'buy' or not getattr(world, 'staged_walls', False)
             or not getattr(getattr(world, 'strategy_policy', None), 'upgrade_commitment_enabled', True)):
         return True
@@ -343,7 +346,7 @@ def purchase_permitted(world, rules, candidate):
             return True
     if name=='WallFixer' and getattr(world,'critical_base_ids',()):return True
     guard=getattr(world,'essential_guard_stock',{}).get((actor.id,name),{})
-    if (actor.id==getattr(getattr(world,'night_roster',None),'w',None)
+    if (actor.id==getattr(getattr(world,'night_roster',None),'p',None)
             and name in {'DizzyWeapon','Bomb'} and actor.inventory[name]<1
             and guard.get('round')==world.round and guard.get('price')==world.shop.get(name)
             and command.get('num',1)==1==guard.get('count')):

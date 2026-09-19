@@ -165,8 +165,7 @@ class CaretakerDay:
         # Add the return uncertainty once; P's ingress has its own shared clock.
         margin = policy.return_buffer + defence_duties.seal_service_steps(world)
         self.diagnostic = dict(left=clock.until_night,missing_walls=len(missing),reserved_stone=stone)
-        if (self.phase in {'close','home','use'} and home.get(actor.pos)==0
-                and (not missing or not actor.inventory['stone']) and clock.until_night>0):
+        if (home.get(actor.pos)==0 and not missing and clock.until_night>0):
             immediate=self.adjacent_paid(world,actor,rules,policy)
             if immediate:
                 return self.finish(world,guidance,jobs,actor,immediate,'use',
@@ -703,6 +702,9 @@ class CaretakerDay:
         return self.finish(world, guidance, jobs, actor, DaySchedule.moves(actor, home, 'return to single turret after daily work'), 'home')
 
     def finish(self, world, guidance, jobs, actor, choices, phase, **details):
+        if phase == 'repair' and choices and all(c.command.get('action') == 'use'
+                and 'UpgradeVoucher' in c.command.get('name', '') for c in choices):
+            phase = 'use'  # Restoring with a paid voucher follows the delivery gate.
         world.caretaker_day_phase = phase
         self.diagnostic.update(stage=phase, actor=actor.id, **details)
         if phase == 'close':

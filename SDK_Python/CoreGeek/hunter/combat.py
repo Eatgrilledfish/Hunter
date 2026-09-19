@@ -357,7 +357,7 @@ def area_targets(world, robots, deadline, forbidden=frozenset()):
 def propose_consumables(world, deadline, task_actor=None):
     roster = getattr(world, 'night_roster', None)
     actors = [u for u in world.movers if u.id != task_actor
-              and (roster is None or u.id == roster.w or u.id == roster.m)
+              and (roster is None or u.id in (roster.p, roster.m))
               and not cleanup(world)
               and (u.inventory["Bomb"] or u.inventory["DizzyWeapon"])]
     if not actors:
@@ -387,8 +387,8 @@ def propose_consumables(world, deadline, task_actor=None):
         if actor.inventory["DizzyWeapon"]:
             actor_controls=controls
             from .rear_open import enabled as rear_enabled
-            if rear_enabled(world) and actor.id==world.night_roster.w:
-                # The dedicated maintainer keeps control for an actual
+            if rear_enabled(world) and actor.id==world.night_roster.p:
+                # The pioneer keeps control stock for an actual
                 # defensive window. A distant dense spawn is not evidence
                 # that stunning it now protects the miner or a wall.
                 assets=world.movers+world.stations+[
@@ -427,7 +427,7 @@ def propose_consumables(world, deadline, task_actor=None):
                                         suppression=identities))
     if roster:
         # Preserve M's existing personal escape stock only against a robot
-        # already able to hit M. Ordinary offensive supplies belong to W.
+        # already able to hit M. Ordinary offensive supplies belong to P.
         miner=world.ours.get(roster.m)
         direct={r.id for r in robots if miner and r.abnormal!='dizzy'
                 and r.attack_range is not None and r.attack_power is not None and r.attack_power>0

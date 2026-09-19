@@ -64,7 +64,7 @@ class DefenceProcurement:
             self.diagnostic['status'] = 'immediate_survival_precedes_future_purchase'
             return []
         roster=getattr(world,'night_roster',None)
-        actors = [a for a in world.movers if a.id != task_actor and (roster is None or a.id==roster.w)]
+        actors = [a for a in world.movers if a.id != task_actor and (roster is None or a.id==roster.p)]
         self.diagnostic['status'] = 'inventory_or_purchase_unresolved'
         if any(a.backpack is None for a in actors):
             return []

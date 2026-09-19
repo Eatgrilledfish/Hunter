@@ -57,12 +57,14 @@ def check_action(world, clock, rules, identity, command, *, task_actor=None, sum
             if target_status == 'unknown':
                 return unknown('surviving opponent base not observed')
     roster = getattr(world, 'night_roster', None)
-    if roster and action in {'buy','use'} and command.get('name') in {'Bomb','DizzyWeapon'}:
-        if identity != roster.w:
-            emergency = (action == 'use' and identity == roster.m and
-                command in getattr(world, 'emergency_consumable_actions', {}).get(identity, ()))
+    from .purchase_roles import permitted
+    if action == 'buy' and not permitted(world, identity, command.get('name', '')):
+        return invalid('purchase belongs to the other daily role')
+    if roster and action == 'use' and command.get('name') in {'Bomb','DizzyWeapon'}:
+        if identity != roster.p:
+            emergency = command in getattr(world, 'emergency_consumable_actions', {}).get(identity, ())
             if not emergency:
-                return invalid('attack consumables belong to maintenance worker')
+                return invalid('attack consumables belong to pioneer; personal emergency use only elsewhere')
     if action != "attack" and actor.kind not in MOBILE:
         return invalid("stationary entity cannot perform mobile action")
     owner=command.get('controllerId') if action=='attack' else identity
