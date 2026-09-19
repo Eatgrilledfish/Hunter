@@ -61,16 +61,32 @@ class SunsetMarket:
                                     if w.status in (pw.ACTIVE, pw.WAIT_RECEIPT)}
 
     def active_work(self, actor):
-        """The actor's currently executing trip; suspended works only await resume."""
+        """The trip actually executing; PROPOSED quotes never occupy (§5)."""
         for work in self.works.values():
-            if work.actor == actor and work.status in (pw.PROPOSED, pw.ACTIVE, pw.WAIT_RECEIPT):
+            if work.actor == actor and work.status in (pw.ACTIVE, pw.WAIT_RECEIPT):
                 return work
         return None
 
+    def linkable_work(self, actor, name):
+        """Best non-terminal work whose demand covers the item, for linking."""
+        fallback = None
+        for work in self.works.values():
+            if work.actor == actor and work.status not in pw.TERMINAL and name in work.item_names():
+                if work.status in (pw.ACTIVE, pw.WAIT_RECEIPT):
+                    return work
+                fallback = fallback or work
+        return fallback
+
     def work_for(self, world, actor, purpose, *, deadline=None, preempt=False, preempt_reason=None):
-        # A same-purpose work resumes regardless of suspension; it is the same trip.
+        # A same-purpose work is the same trip. A suspended one resumes only
+        # once the preempting trip is no longer executing (§5.5).
         for work in self.works.values():
             if work.actor == actor and work.purpose == purpose and work.status not in pw.TERMINAL:
+                if work.status == pw.SUSPENDED:
+                    current = self.active_work(actor)
+                    if current is not None:
+                        work.block(world, 'duty', 'preemption_in_effect:'+current.purpose)
+                        return None
                 return work
         existing = self.active_work(actor)
         if existing is not None:
@@ -220,15 +236,18 @@ class SunsetMarket:
             and (world.ours[uid].kind!='wall' or upgrade_ready(world,world.ours[uid]))]
             for i,targets in self.checkout_targets.items() if i in world.ours and world.ours[i].alive}
         world.checkout_targets=self.checkout_targets
-        # The filtered table above is authoritative; sync work bindings so a
-        # target completed via any entry releases the work (design §4.3/§5.6).
-        live={binding for targets in self.checkout_targets.values() for binding in targets}
+        # The filtered table above is authoritative for live targets. A work
+        # binding is released only when the unit observably passed the bound
+        # tier — a destroyed instance keeps its position-level obligation and
+        # waits for WallService/WallRebuild evidence to rebind (§5.6).
         for work in self.works.values():
             if work.status in pw.TERMINAL or not work.bindings:
                 continue
-            kept=[b for b in work.bindings if b in live]
+            kept=[b for b in work.bindings
+                  if not ((u:=world.ours.get(b[0])) and u.alive
+                          and u.level is not None and u.level > b[1])]
             if len(kept)!=len(work.bindings):
-                dropped=[b for b in work.bindings if b not in live]
+                dropped=[b for b in work.bindings if b not in kept]
                 work.bindings=kept
                 pw.emit(world,work,'bindings_released',dropped=len(dropped))
         job=self.maintenance_assignment

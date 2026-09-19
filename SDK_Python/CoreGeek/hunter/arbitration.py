@@ -59,7 +59,7 @@ def movement_yielders(checked):
 
 def select(world, clock, rules, policy, candidates, deadline, *, task_actor=None, summon_remaining=0,
            weights=None, incumbent=None, task_moves=(), allow_task_control=False, alternatives_limit=0,
-           diversity_key=None, funding_topup=False):
+           diversity_key=None, funding_topup=False, admission=None):
     from .forage_admission import bundle_allowed, attack_key, prepare_fire
     weights = weights or {}
     pressure = BasePressure(world, clock) if policy.base_fire_enabled and policy.joint_fire_enabled else None
@@ -279,6 +279,10 @@ def select(world, clock, rules, policy, candidates, deadline, *, task_actor=None
             for candidate in completions:
                 key = (candidate.actor, repr(candidate.command))
                 if key in unique or not permits(world, clock, candidate):
+                    continue
+                # Completion candidates pass the same admission chain as every
+                # other candidate: duty guidance and failure backoff included.
+                if admission is not None and not admission(candidate):
                     continue
                 check = check_action(world, clock, rules, candidate.actor, candidate.command,
                                      task_actor=task_actor, summon_remaining=summon_remaining,

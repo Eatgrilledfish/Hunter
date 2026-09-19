@@ -713,7 +713,9 @@ class Agent:
                               task_actor=task_actor, weights=weights,
                               task_moves=guidance.task_moves, allow_task_control=guidance.allow_task_control,
                               incumbent=incumbent_candidates, summon_remaining=draft.opponent.remaining,
-                              funding_topup=True)
+                              funding_topup=True,
+                              admission=lambda c: guidance.permit(c)
+                                                  and not draft.backed_off(c.actor, c.command, world.round))
             joint_report = {"status": "inactive"}
             if self.policy.joint_lookahead_enabled:
                 try:

@@ -194,11 +194,13 @@ def completion_candidates(world, released, selected):
         from .arbitration import Candidate
         candidate = Candidate(actor.id, {'action': 'buy', 'name': name, 'num': num}, 60,
                               'bounded funding completion for a cash-blocked retained demand')
-        market = getattr(world, 'procurement_market', None)
-        work = market.active_work(actor.id) if market else None
-        if work is not None:
-            candidate.work_id = work.work_id
         if permits_bundle(world, list(selected)+[candidate], spent+price*num, released=released):
+            market = getattr(world, 'procurement_market', None)
+            work = market.linkable_work(actor.id, name) if market else None
+            if work is not None:
+                # Register the offer with the ledger: if the command ships,
+                # record_selected commits the same work like any other purchase.
+                market.propose_step(world, work, [candidate], 'checkout')
             out.append(candidate)
             spent += price*num
     return out
