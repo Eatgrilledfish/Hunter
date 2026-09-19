@@ -155,7 +155,9 @@ def choose(world, clock, policy, deadline, timing=None):
             routes=[dict(risk=r,travel=t,goal=c,back=b,return_reserve=task_return_reserve(world,policy,b,deadline)) for r,t,c,b in sorted(routes)[:3]]))
         if not routes:
             continue
-        risk,travel,cell,back = min(routes)
+        # Equal outward walks must not prefer an arbitrary coordinate over a
+        # shorter real return. This matters for the final pre-night task.
+        risk,travel,cell,back = min(routes,key=lambda r:(r[0],r[1],r[3],r[2]))
         score,gold = task['scoreReward'],task['goldReward']
         wait = max(0,task['coldDownRounds']-travel)
         duration = estimate['duration']

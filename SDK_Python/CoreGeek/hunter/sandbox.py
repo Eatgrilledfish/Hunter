@@ -268,6 +268,7 @@ runpy.run_path(entry, run_name="__main__")
                     raise ValueError("nonfinite tool JSON number")
                 if len(answers)>1:raise ValueError('ambiguous answer envelopes')
                 out["data"] = json.loads(answers[0] if answers else text, object_pairs_hook=unique, parse_constant=invalid_constant)
+                out['answer_origin']='HUNTER_ANSWER' if answers else 'stdout'
             except ValueError:
                 pass
     else:

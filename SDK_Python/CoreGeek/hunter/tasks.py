@@ -8,7 +8,7 @@ import time
 from .arbitration import Candidate
 from .protocol import distance, fingerprint, obj, array, integer, strict_json
 from .sandbox import parse_result, discovery, bootstrap, compile_operation, task_documents, locate_task
-from .task_protocol import INSTRUCTIONS as MODEL_INSTRUCTIONS, FINAL_INSTRUCTIONS, normalize as normalize_decision
+from .task_protocol import normalize as normalize_decision
 from .documents import DocumentLedger
 from .answer_contract import contract as answer_contract, validate as validate_answer
 from .task_payload import pack_evidence
@@ -1039,6 +1039,10 @@ class TaskEngine:
                                       if pending["operation"] in {"run_tool", "run_python"} else ""})
         if usable and not failure and pending.get("plan"):
             output = pending['plan'].get('answer_output')
+            missing_explicit_answer=bool(output and output.get('require_explicit_answer')
+                                        and data.get('answer_origin')!='HUNTER_ANSWER')
+            if missing_explicit_answer:
+                output=None
             if (output is None or data.get('data') is None) and data.get('completeness')=='complete':
                 from .checker_contract import token_answer
                 recovered=token_answer(task,data)
@@ -1054,7 +1058,7 @@ class TaskEngine:
             # last useful round. An explicit answer contract lets us submit
             # its complete JSON now, without guessing from prose or an API
             # probe and without requiring the model to echo that same JSON.
-            if (output is None and pending['operation'] in {'run_python','run_tool'}
+            if (output is None and not missing_explicit_answer and pending['operation'] in {'run_python','run_tool'}
                     and task.timeout is not None and task.accept_round is not None
                     and world.round >= task.accept_round+task.timeout-3
                     and isinstance(data.get('data'),dict)):
@@ -1346,7 +1350,8 @@ class TaskEngine:
             if self.budget.reserve(active_task=True):
                 context = self._context(task, "choose_next_task_step")
                 evidence, document_coverage = pack_evidence(task)
-                instructions = FINAL_INSTRUCTIONS if final_answer_only else MODEL_INSTRUCTIONS
+                from .task_protocol import instructions_for
+                instructions, prompt_profile = instructions_for(task, final_answer_only)
                 from .task_payload import api_scope, api_observations, statistics_review
                 payload = {"request_id": fingerprint(context["nonce"])[:16], "task": task.text[:16384], "evidence": evidence,
                            "api_statistics_review":statistics_review(task, final_answer_only),
@@ -1380,6 +1385,9 @@ class TaskEngine:
                 payload['reply_template'] = {'request_id':payload['request_id'],
                     **({'submit':'<actual answer>'} if final_answer_only else {'cmd':'<Python source>'})}
                 payload['recovery']=task_recovery.feedback(task)
+                from .task_payload import turn_budget
+                payload['turn_budget']=turn_budget(task,world)
+                payload['prompt_profile']=prompt_profile
                 if task_recovery.needs_execution(task) and not final_answer_only:
                     payload['allowed_actions']=['cmd']
                 payload['required_response'] = 'ONLY JSON; copy the current request_id and choose one allowed action.'

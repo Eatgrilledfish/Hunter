@@ -28,6 +28,21 @@ def size(value):
     return len(json.dumps(value, ensure_ascii=False))
 
 
+def turn_budget(task, world):
+    """Observed clocks and explicit objectives, never an invented success rate."""
+    clock=getattr(world,'strategy_clock',None)
+    life=getattr(world,'task_lifecycle',None)
+    remaining=(task.accept_round+task.timeout-world.round
+               if task.accept_round is not None and task.timeout is not None else None)
+    return dict(task_rounds_remaining=remaining,
+        daylight_rounds_remaining=clock.until_night if clock else None,
+        target='finish six evolution tasks by second daylight end',
+        target_round=min(clock.offsets)+199 if clock else None,
+        unended_tasks=sum(3-n for n in life.consumed.values()) if life else None,
+        official_success_count=None,model_calls_this_task=task.metrics.get('counts',{}).get('llm_sent',0),
+        preferred_next_step='one executable solution with an explicit final answer; repair only observed failures')
+
+
 def statistics_review(task, answer_only=False):
     statements=[task.text]+[e.get('data',{}).get('text','') or '' for e in task.evidence.values()
         if e.get('usable') and e.get('data',{}).get('operation')=='read_slice'
