@@ -178,10 +178,14 @@ def completion_candidates(world, released, selected):
     selection lapses provisional grants, a row whose owner is standing at the
     counter can issue its buy under the released ledger. Travelling re-quotes
     stay with the next frame's executors; no unverified movement is invented.
+    W's completion goes through the ledger's unified entry (work creation,
+    occupancy and resume checks, offer registration) like any other purchase.
     """
     rows = getattr(world, 'funding_plan', ())
     if not rows:
         return []
+    work_purpose = {'night_essential': 'night_stock', 'night_buffer': 'night_stock',
+                    'night_attack': 'night_stock', 'wall_rebuild': 'wall_rebuild_supply'}
     spent = sum(world.shop.get(c.command.get('name'), 0)*c.command.get('num', 1)
                 for c in selected if c.command.get('action') == 'buy')
     out = []
@@ -203,10 +207,16 @@ def completion_candidates(world, released, selected):
                               'bounded funding completion for a cash-blocked retained demand')
         if permits_bundle(world, list(selected)+[candidate], spent+price*num, released=released):
             market = getattr(world, 'procurement_market', None)
-            work = market.linkable_work(actor.id, name) if market else None
-            if work is not None:
-                # Register the offer with the ledger: if the command ships,
-                # record_selected commits the same work like any other purchase.
+            w_identity = getattr(getattr(world, 'night_roster', None), 'w', None)
+            if market is not None and actor.id == w_identity:
+                purpose = work_purpose.get(row.get('purpose'), 'day_checkout')
+                hinted = market.linkable_work(actor.id, name)
+                # The unified entry owns creation, occupancy and resume gating;
+                # a suspended hint still passes the executing-trip check.
+                work = market.work_for(world, actor.id, hinted.purpose if hinted else purpose,
+                                       deadline=row.get('deadline'))
+                if work is None:
+                    continue  # an executing trip owns the actor this frame
                 market.propose_step(world, work, [candidate], 'checkout')
             out.append(candidate)
             spent += price*num

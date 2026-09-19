@@ -215,9 +215,18 @@ class SunsetMarket:
                 if (new_wall.id, level) not in saved:
                     saved.append((new_wall.id, level))
         for work in self.works.values():
-            if work.bindings:
-                work.bindings = [(new_wall.id if uid == old_id else uid, level)
-                                 for uid, level in work.bindings]
+            if not work.bindings:
+                continue
+            rebound = []
+            for b in work.bindings:
+                uid, level = b[0], b[1]
+                pos = b[2] if len(b) > 2 else None
+                gen = b[3] if len(b) > 3 else 0
+                if uid == old_id:
+                    site = getattr(world, 'wall_service', {}).get(new_wall.pos, {})
+                    uid, pos, gen = new_wall.id, new_wall.pos, site.get('generation', gen)
+                rebound.append((uid, level, pos, gen))
+            work.bindings = rebound
 
     def publish_checkout_targets(self,world):
         """Expose live paid ownership before repair and night candidates run."""
@@ -237,19 +246,38 @@ class SunsetMarket:
             for i,targets in self.checkout_targets.items() if i in world.ours and world.ours[i].alive}
         world.checkout_targets=self.checkout_targets
         # The filtered table above is authoritative for live targets. A work
-        # binding is released only when the unit observably passed the bound
-        # tier — a destroyed instance keeps its position-level obligation and
-        # waits for WallService/WallRebuild evidence to rebind (§5.6).
+        # binding releases only when the unit observably passed the bound tier;
+        # a destroyed instance keeps its position-level obligation and rebinds
+        # only on a same-position new instance with a newer generation —
+        # evidence from WallService/WallRebuild, never an assumption (§5.6).
+        sites=getattr(world,'wall_service',{}) or {}
         for work in self.works.values():
             if work.status in pw.TERMINAL or not work.bindings:
                 continue
-            kept=[b for b in work.bindings
-                  if not ((u:=world.ours.get(b[0])) and u.alive
-                          and u.level is not None and u.level > b[1])]
-            if len(kept)!=len(work.bindings):
-                dropped=[b for b in work.bindings if b not in kept]
-                work.bindings=kept
-                pw.emit(world,work,'bindings_released',dropped=len(dropped))
+            rebound=[];dropped=0
+            for b in work.bindings:
+                uid,level=b[0],b[1]
+                pos=b[2] if len(b)>2 else None
+                gen=b[3] if len(b)>3 else 0
+                unit=world.ours.get(uid)
+                if unit and unit.alive and unit.level is not None and unit.level>level:
+                    dropped+=1;continue  # bound tier reached by any entry
+                if unit and unit.alive:
+                    rebound.append((uid,level,pos,gen));continue
+                site=sites.get(pos) if pos else None
+                nid=site.get('id') if isinstance(site,dict) else None
+                fresh=world.ours.get(nid) if nid else None
+                if (nid and nid!=uid and fresh and fresh.alive and fresh.kind=='wall'
+                        and isinstance(site.get('generation'),int) and site['generation']>gen):
+                    if fresh.level is not None and fresh.level>level:
+                        dropped+=1;continue  # replacement already reached the tier
+                    rebound.append((nid,level,pos,site['generation']))
+                    pw.emit(world,work,'rebind',target=uid,new_target=nid)
+                else:
+                    rebound.append((uid,level,pos,gen))  # position obligation retained
+            if dropped or rebound!=work.bindings:
+                work.bindings=rebound
+                pw.emit(world,work,'bindings_released',dropped=dropped)
         job=self.maintenance_assignment
         target=world.ours.get(job.get('target'))
         clock=getattr(world,'strategy_clock',None)
@@ -883,6 +911,16 @@ class SunsetMarket:
             work = self.works.get(self.work_offers.get((actor, fingerprint(command)), ''))
             if work is None or work.status in pw.TERMINAL:
                 continue
+            # One executing trip per actor (§4.3): committing this work
+            # suspends any other executing trip of the same actor, preserving
+            # its paid bindings; its receipts keep resolving normally.
+            for other in self.works.values():
+                if (other.actor == actor and other is not work
+                        and other.status == pw.ACTIVE):
+                    other.preemption = dict(reason='selected_other_work', round=world.round,
+                                            resume='requote after '+work.purpose)
+                    other.transition(world, pw.SUSPENDED,
+                                     reason='selected_other_work:'+work.work_id)
             action = command.get('action')
             if action == 'buy':
                 work.issued = dict(command=dict(command), round=world.round)
@@ -944,7 +982,13 @@ class SunsetMarket:
                 # inventory. Matching still consumes only observed vouchers.
                 self.checkout_targets[actor]=world.quoted_checkout_targets[actor]
                 if work_id and work_id in self.works:
-                    self.works[work_id].bindings=list(world.quoted_checkout_targets[actor])
+                    sites=getattr(world,'wall_service',{}) or {}
+                    bound=[]
+                    for uid,level in world.quoted_checkout_targets[actor]:
+                        unit=world.ours.get(uid)
+                        bound.append((uid,level,unit.pos if unit else None,
+                                      sites.get(unit.pos,{}).get('generation',0) if unit else 0))
+                    self.works[work_id].bindings=bound
             if (command.get('action')=='use' and 'UpgradeVoucher' in command.get('name','')
                     and command in getattr(world,'sunset_actions',{}).get(actor,())):
                 self.upgrade_travellers.add(actor)
