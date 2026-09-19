@@ -123,14 +123,18 @@ def prepare(market, world, clock, rules, policy, guidance, jobs, excluded, deadl
     if actor.id == roster.w:
         # W's basket/delivery circuit is one procurement work in the ledger.
         work = market.work_for(world, actor.id, 'day_checkout')
-        if work is not None:
-            market.attach_quote(world, work, pw.Quote(
-                status=pw.FEASIBLE if trip.get('fits', True) else pw.quote_status_for('no_route'),
-                round=world.round, actor=actor.id, orders=dict(trip.get('orders', {})),
-                required=trip.get('required'), reserve=trip.get('reserve') or 0,
-                cost=sum(world.shop.get(n, 0)*c for n, c in trip.get('orders', {}).items()),
-                source='upgrade_dispatch'))
-            choices = market.propose_step(world, work, choices, stage)
+        if work is None:
+            # A conflicting live trip owns W; unreferenced candidates must not
+            # bypass the ledger, so nothing is offered this frame.
+            market.diagnostic['blocked'] = 'procurement_work_busy'
+            return []
+        market.attach_quote(world, work, pw.Quote(
+            status=pw.FEASIBLE if trip.get('fits', True) else pw.quote_status_for('no_route'),
+            round=world.round, actor=actor.id, orders=dict(trip.get('orders', {})),
+            required=trip.get('required'), reserve=trip.get('reserve') or 0,
+            cost=sum(world.shop.get(n, 0)*c for n, c in trip.get('orders', {}).items()),
+            source='upgrade_dispatch'))
+        choices = market.propose_step(world, work, choices, stage)
     if stage=='day_repair':
         world.maintenance_targets=dict(getattr(world,'maintenance_targets',{}))
         world.maintenance_targets[trip['maintenance']['target']]=actor.id

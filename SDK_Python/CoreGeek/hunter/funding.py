@@ -147,7 +147,9 @@ def link_works(world):
     works = getattr(world, 'procurement_works', ())
     if not works:
         return
-    active = [w for w in works if w.status in ('ACTIVE', 'WAIT_RECEIPT', 'SUSPENDED')]
+    # Only committed trips hold their grants; PROPOSED quotes and SUSPENDED
+    # temporary reservations stay provisional and may lapse (§4.4).
+    active = [w for w in works if w.status in ('ACTIVE', 'WAIT_RECEIPT')]
     if not active:
         return
     for row in getattr(world, 'funding_plan', ()):
@@ -159,6 +161,47 @@ def link_works(world):
                 work.grants.update({name: min(row.get('granted', 0), row['cost']) for name in row['items']})
                 work.demands = tuple(dict.fromkeys(work.demands + (row['demand_id'],)))
                 break
+
+
+def completion_candidates(world, released, selected):
+    """One bounded completion for demands the first ledger priced out (§4.4).
+
+    funding.publish already proved each retained row's shop/return trip before
+    creating it; the rows keep that feasibility evidence. Once the initial
+    selection lapses provisional grants, a row whose owner is standing at the
+    counter can issue its buy under the released ledger. Travelling re-quotes
+    stay with the next frame's executors; no unverified movement is invented.
+    """
+    rows = getattr(world, 'funding_plan', ())
+    if not rows:
+        return []
+    spent = sum(world.shop.get(c.command.get('name'), 0)*c.command.get('num', 1)
+                for c in selected if c.command.get('action') == 'buy')
+    out = []
+    for row in rows:
+        deficit = row.get('deficit', row['cost']-row.get('granted', 0))
+        if deficit <= 0:
+            continue
+        actor = world.ours.get(row['owner'])
+        if (not actor or not actor.alive or actor.backpack is None or actor.capacity is None
+                or not world.near_zone(actor.pos, 'weaponShop')):
+            continue
+        name = next(iter(row['items']))
+        price = world.shop.get(name, 0)
+        num = min(row['items'][name], actor.capacity-len(actor.backpack))
+        if price <= 0 or num <= 0:
+            continue
+        from .arbitration import Candidate
+        candidate = Candidate(actor.id, {'action': 'buy', 'name': name, 'num': num}, 60,
+                              'bounded funding completion for a cash-blocked retained demand')
+        market = getattr(world, 'procurement_market', None)
+        work = market.active_work(actor.id) if market else None
+        if work is not None:
+            candidate.work_id = work.work_id
+        if permits_bundle(world, list(selected)+[candidate], spent+price*num, released=released):
+            out.append(candidate)
+            spent += price*num
+    return out
 
 
 def allocate(world):

@@ -265,16 +265,32 @@ def select(world, clock, rules, policy, candidates, deadline, *, task_actor=None
         return beam
     beam = search()
     topup_report = None
-    if funding_topup and grant_blocked and time.monotonic() < deadline:
-        from .funding import lapsable
+    if funding_topup and time.monotonic() < deadline:
+        from .funding import lapsable, completion_candidates
         # Bounded one-shot completion (design §4.4): provisional grants the
         # first selection neither consumed nor holds via a committed work
-        # lapse; committed trips and strategy floors stay protected. The
-        # second result never recursively triggers a third planning pass.
+        # lapse; committed trips and strategy floors stay protected. Retained
+        # cash-blocked demands then produce their missing candidates, and the
+        # re-run arbitrates once more — never recursively triggering a third.
         released = lapsable(world, beam[0][1])
-        if released:
+        completions = completion_candidates(world, released, beam[0][1])
+        if released or completions:
+            added = 0
+            for candidate in completions:
+                key = (candidate.actor, repr(candidate.command))
+                if key in unique or not permits(world, clock, candidate):
+                    continue
+                check = check_action(world, clock, rules, candidate.actor, candidate.command,
+                                     task_actor=task_actor, summon_remaining=summon_remaining,
+                                     task_moves=task_moves, allow_task_control=allow_task_control)
+                if check.verdict != Verdict.VALID:
+                    continue
+                unique.add(key)
+                checked.append((candidate, check.resources))
+                added += 1
             second = search(released)
             topup_report = {'released': sorted(r for r in released if r),
+                            'completed': added,
                             'adopted': second[0][0] > beam[0][0],
                             'budget_exhausted': time.monotonic() >= deadline}
             if second[0][0] > beam[0][0]:

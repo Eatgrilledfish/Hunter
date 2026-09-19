@@ -715,7 +715,12 @@ class CaretakerDay:
             market = getattr(world, 'procurement_market', None)
             if market is not None:
                 work = market.work_for(world, actor.id, 'day_checkout')
-                if work is not None:
+                if work is None:
+                    # Another live trip owns W; an unreferenced candidate would
+                    # bypass the ledger, so this frame's circuit is not offered.
+                    self.diagnostic['blocked'] = 'procurement_work_busy'
+                    choices = []
+                else:
                     orders = {c.command['name']: c.command.get('num', 1)
                               for c in choices if c.command.get('action') == 'buy'}
                     clock = getattr(world, 'strategy_clock', None)

@@ -58,28 +58,27 @@ class SunsetMarket:
         world.procurement_market = self
         world.procurement_works = list(self.works.values())
         world.committed_work_ids = {w.work_id for w in self.works.values()
-                                    if w.status in (pw.ACTIVE, pw.WAIT_RECEIPT, pw.SUSPENDED)}
+                                    if w.status in (pw.ACTIVE, pw.WAIT_RECEIPT)}
 
     def active_work(self, actor):
-        """At most one active procurement trip per actual actor (design §4.3)."""
+        """The actor's currently executing trip; suspended works only await resume."""
         for work in self.works.values():
-            if work.actor == actor and work.status not in pw.TERMINAL:
+            if work.actor == actor and work.status in (pw.PROPOSED, pw.ACTIVE, pw.WAIT_RECEIPT):
                 return work
         return None
 
     def work_for(self, world, actor, purpose, *, deadline=None, preempt=False, preempt_reason=None):
+        # A same-purpose work resumes regardless of suspension; it is the same trip.
+        for work in self.works.values():
+            if work.actor == actor and work.purpose == purpose and work.status not in pw.TERMINAL:
+                return work
         existing = self.active_work(actor)
         if existing is not None:
-            if existing.purpose == purpose:
-                return existing
             if not preempt or existing.status == pw.WAIT_RECEIPT:
                 return None  # A receipt in flight is never preempted (§5.3).
-            if existing.status in (pw.PROPOSED, pw.ACTIVE):
-                existing.preemption = dict(reason=preempt_reason or purpose, round=world.round,
-                                           resume='requote after '+purpose)
-                existing.transition(world, pw.SUSPENDED, reason='preempted_by_'+purpose)
-            else:
-                return None
+            existing.preemption = dict(reason=preempt_reason or purpose, round=world.round,
+                                       resume='requote after '+purpose)
+            existing.transition(world, pw.SUSPENDED, reason='preempted_by_'+purpose)
         seq = self.work_seq.get((actor, purpose), 0) + 1
         self.work_seq[(actor, purpose)] = seq
         work = pw.ProcurementWork(work_id=f'{actor}:{purpose}:{seq}', epoch=getattr(world, 'session_epoch', 0),
@@ -98,17 +97,17 @@ class SunsetMarket:
             layer = 'funding' if quote.status == pw.CASH_DEFICIT else \
                     'target' if quote.status == pw.TARGET_INVALID else 'quote'
             work.block(world, layer, quote.reason or quote.status)
+        else:
+            work.unblock()
         return quote
 
     def propose_step(self, world, work, candidates, step):
-        """Candidates carry the work reference; no execution fact advances here."""
-        if work.status in (pw.PROPOSED, pw.SUSPENDED):
-            work.transition(world, pw.ACTIVE, step=step)
-            if work.preemption:
-                work.preemption = None
-        else:
-            work.step = step
-        work.unblock()
+        """Candidates carry the work reference; no execution fact advances here.
+
+        Offering a step never commits the trip: PROPOSED holds no cross-round
+        exclusivity (§5). Only record_selected after final arbitration commits.
+        """
+        work.step = step
         for candidate in candidates:
             candidate.work_id = work.work_id
             self.work_offers[(candidate.actor, fingerprint(candidate.command))] = work.work_id
@@ -221,6 +220,17 @@ class SunsetMarket:
             and (world.ours[uid].kind!='wall' or upgrade_ready(world,world.ours[uid]))]
             for i,targets in self.checkout_targets.items() if i in world.ours and world.ours[i].alive}
         world.checkout_targets=self.checkout_targets
+        # The filtered table above is authoritative; sync work bindings so a
+        # target completed via any entry releases the work (design §4.3/§5.6).
+        live={binding for targets in self.checkout_targets.values() for binding in targets}
+        for work in self.works.values():
+            if work.status in pw.TERMINAL or not work.bindings:
+                continue
+            kept=[b for b in work.bindings if b in live]
+            if len(kept)!=len(work.bindings):
+                dropped=[b for b in work.bindings if b not in live]
+                work.bindings=kept
+                pw.emit(world,work,'bindings_released',dropped=len(dropped))
         job=self.maintenance_assignment
         target=world.ours.get(job.get('target'))
         clock=getattr(world,'strategy_clock',None)
@@ -369,7 +379,7 @@ class SunsetMarket:
                 self.works.pop(work.work_id,None)
         world.procurement_works=list(self.works.values())
         world.committed_work_ids={w.work_id for w in self.works.values()
-                                  if w.status in (pw.ACTIVE,pw.WAIT_RECEIPT,pw.SUSPENDED)}
+                                  if w.status in (pw.ACTIVE,pw.WAIT_RECEIPT)}
 
     def cancel_for_critical_base(self, world):
         """A new survival priority overrides unpaid routine purchases (§5.5).
@@ -841,8 +851,9 @@ class SunsetMarket:
     def record_selected(self, world, response):
         """Only actually issued commands create pending evidence (§6.2).
 
-        Work-linked commands advance their record to WAIT_RECEIPT; offered but
-        unselected candidates create nothing and leave the work Active.
+        Selection is what commits a work: any offered command that ships moves
+        it to ACTIVE (purchases/voucher uses to WAIT_RECEIPT); offered but
+        unselected candidates create nothing and the work stays PROPOSED.
         """
         for actor, command in response['roleCommandMap'].items():
             work = self.works.get(self.work_offers.get((actor, fingerprint(command)), ''))
@@ -851,13 +862,18 @@ class SunsetMarket:
             action = command.get('action')
             if action == 'buy':
                 work.issued = dict(command=dict(command), round=world.round)
+                work.preemption = None
                 work.transition(world, pw.WAIT_RECEIPT, step='checkout', reason=None)
                 pw.emit(world, work, 'selected', next_action='buy', item=command.get('name'),
                         num=command.get('num', 1))
             elif action == 'use' and 'UpgradeVoucher' in command.get('name', ''):
                 work.issued = dict(command=dict(command), round=world.round)
+                work.preemption = None
                 work.transition(world, pw.WAIT_RECEIPT, step='deliver', reason=None)
                 pw.emit(world, work, 'selected', next_action='use', item=command.get('name'))
+            elif work.status in (pw.PROPOSED, pw.SUSPENDED):
+                work.preemption = None
+                work.transition(world, pw.ACTIVE, reason=None)
 
     def finalize(self, world, response):
         self.record_selected(world, response)
