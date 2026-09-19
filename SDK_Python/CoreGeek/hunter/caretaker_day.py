@@ -294,6 +294,7 @@ class CaretakerDay:
         order = None; count = 0; held = []; deliveries = {}; use_steps = 0
         checkout = tail; sale = tail; required = None
         if trip is not None:
+            if trip.get('sale_deferred'):stock={}
             held = trip['held']
             use_steps = trip['use_steps']
             checkout,sale,required = trip['checkout'],trip['sale'],trip['required']
@@ -433,8 +434,8 @@ class CaretakerDay:
                 # A fully funded executable investment no longer waits until
                 # all remaining harvesting time has been consumed. Material,
                 # use, closure and return are already in this very quote.
-                self.phase=('sell' if not funded_checkout or stock and world.near_zone(actor.pos,'vendor')
-                            and required is not None and required+margin<=clock.until_night else 'buy')
+                self.phase=('sell' if stock and required is not None
+                            and required+margin<=clock.until_night else 'buy')
                 required=(required if self.phase=='sell' else checkout[actor.pos])
                 self.last_required=required+margin
                 self.diagnostic.update(required=self.last_required,
@@ -539,6 +540,7 @@ class CaretakerDay:
             self.phase = 'close' if self.construction_only else 'sell'
         if (self.phase == 'sell' and funded_checkout and checkout is not None
                 and not world.near_zone(actor.pos, 'vendor')
+                and (required is None or required+margin>clock.until_night)
                 and checkout.get(actor.pos, float('inf')) + margin <= clock.until_night):
             # Sale proceeds are unnecessary for this whole observed basket.
             # Keep the ore and complete checkout before a distant vendor trip
@@ -547,7 +549,7 @@ class CaretakerDay:
             required = checkout[actor.pos]
             self.last_required = required + margin
             self.diagnostic.update(required=self.last_required, sale_deferred='basket already funded')
-        if (self.phase == 'buy' and stock and not funded_checkout
+        if (self.phase == 'buy' and stock
                 and trip and trip['orders'] and required is not None
                 and required + margin <= clock.until_night):
             # Shared cash may have changed, or a blocked prior frame may have

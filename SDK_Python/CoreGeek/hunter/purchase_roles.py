@@ -3,6 +3,31 @@
 ATTACK_ITEMS = ('DizzyWeapon', 'Bomb')
 
 
+def attack_targets(world):
+    clock = getattr(world, 'strategy_clock', None)
+    enabled = clock is not None and clock.day is not None and clock.day >= 5
+    return dict(DizzyWeapon=2 if enabled else 0, Bomb=0)
+
+
+def quantity_permitted(world, actor, name, count=1):
+    if not permitted(world, actor, name):
+        return False
+    unit = world.ours.get(actor)
+    if unit is None or unit.backpack is None:
+        return True  # The protocol validator handles missing inventory evidence.
+    if name == 'WallFixer':
+        from .repair_decision import stock_target
+        return unit.inventory[name]+count <= stock_target(world, None)
+    if name in ATTACK_ITEMS:
+        return (unit.inventory[name]+count <= attack_targets(world)[name]
+                and count <= getattr(world, 'stun_purchase_remaining', 2))
+    return True
+
+
+def stun_ready(world, actor):
+    return world.round >= getattr(world, 'stun_next_rounds', {}).get(actor, 0)
+
+
 def owner(world, name):
     roster = getattr(world, 'night_roster', None)
     if roster is None:
@@ -15,6 +40,8 @@ def owner(world, name):
 
 
 def permitted(world, actor, name):
+    if name in ATTACK_ITEMS and attack_targets(world)[name] == 0:
+        return False
     roster = getattr(world, 'night_roster', None)
     if roster is None:
         return True

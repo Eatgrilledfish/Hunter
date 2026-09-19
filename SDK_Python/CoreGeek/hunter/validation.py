@@ -57,9 +57,12 @@ def check_action(world, clock, rules, identity, command, *, task_actor=None, sum
             if target_status == 'unknown':
                 return unknown('surviving opponent base not observed')
     roster = getattr(world, 'night_roster', None)
-    from .purchase_roles import permitted
-    if action == 'buy' and not permitted(world, identity, command.get('name', '')):
+    from .purchase_roles import quantity_permitted
+    if action == 'buy' and not quantity_permitted(world, identity, command.get('name', ''), command.get('num', 1)):
         return invalid('purchase belongs to the other daily role')
+    from .purchase_roles import stun_ready
+    if action == 'use' and command.get('name') == 'DizzyWeapon' and not stun_ready(world, identity):
+        return invalid('space stun uses by five rounds')
     if roster and action == 'use' and command.get('name') in {'Bomb','DizzyWeapon'}:
         if identity != roster.p:
             emergency = command in getattr(world, 'emergency_consumable_actions', {}).get(identity, ())

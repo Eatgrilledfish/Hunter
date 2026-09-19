@@ -63,7 +63,11 @@ def prepare(market, world, clock, rules, policy, guidance, jobs, excluded, deadl
         elif trip['orders'] and trip['fits']:
             item,num=next(iter(trip['orders'].items()))
             choices=([Candidate(actor.id,dict(action='buy',name=item,num=num),240,
-                        'buy complete upgrade chain and night stock with observed cash',gold_reserve=trip['reserve'])]
+                        'buy complete upgrade chain and night stock with observed cash',
+                        # Other actors' grants are already enforced (and credited
+                        # when spent) by funding.permits_bundle. Do not count them twice.
+                        gold_reserve=max(0,trip['reserve']-sum(r['granted'] for r in
+                            getattr(world,'funding_plan',()) if r['owner']!=actor.id)))]
                      if world.near_zone(actor.pos,'weaponShop') else DaySchedule.moves(actor,trip['checkout'],'free guard goes directly to weapon shop'))
             stage='upgrade_procure'
         else:

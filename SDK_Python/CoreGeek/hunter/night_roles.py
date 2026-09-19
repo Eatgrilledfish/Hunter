@@ -105,8 +105,8 @@ def operators(world, include_pioneer=True, task_actor=None, allow_task_control=F
 
 
 def permits(world, clock, candidate):
-    from .purchase_roles import permitted
-    if candidate.command.get('action') == 'buy' and not permitted(world, candidate.actor, candidate.command.get('name', '')):
+    from .purchase_roles import quantity_permitted
+    if candidate.command.get('action') == 'buy' and not quantity_permitted(world, candidate.actor, candidate.command.get('name', ''), candidate.command.get('num', 1)):
         return False
     owner=candidate.command.get('controllerId') if candidate.command.get('action')=='attack' else candidate.actor
     claimed=getattr(world,'wall_rebuild_actions',{})

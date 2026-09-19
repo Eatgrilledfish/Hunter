@@ -100,6 +100,8 @@ class DefenceProcurement:
             if length is None or length > 3 or length+2 > turns:
                 continue
             for name in ITEMS:
+                from .purchase_roles import quantity_permitted
+                if not quantity_permitted(world, actor.id, name):continue
                 price = world.shop.get(name)
                 if price is None or price > budget:
                     continue

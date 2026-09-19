@@ -38,19 +38,19 @@ def premaintenance(world, wall, rules, policy=None):
                 or damage>0 and wall.health<=damage)
 
 
-def carry_target(clock, policy, used=0, unserved=0):
-    """Strategy reserve, not a claim about future monster damage or bag size."""
-    day=max(1,clock.day or 1)
-    baseline=(3,6,10,15,20)[min(day,5)-1]
-    return max(baseline,policy.caretaker_repair_target,used+unserved+1)
+def weapons_maxed(world):
+    """Only observed completion of all three weapon slots unlocks bulk stock."""
+    return len(world.weapons) == 3 and all(u.alive and u.level == 3 for u in world.weapons)
+
+
+def carry_target(clock, policy, used=0, unserved=0, *, world=None):
+    return 26 if world is not None and weapons_maxed(world) else 3
 
 
 def stock_target(world, policy):
-    """Actual daytime service debt plus the next night's personal carry target."""
-    return (max(2,getattr(world,'caretaker_repair_target',policy.caretaker_repair_target))
-            + max(0,getattr(world,'day_repair_demand',0)))
+    # A stock ceiling, not an instruction to spend before today's other orders.
+    return 26 if weapons_maxed(world) else 3
 
 
 def purchase_floor(world, policy):
-    """Fund normal night stock first; extra service debt follows upgrades."""
-    return min(stock_target(world,policy),max(2,policy.caretaker_repair_target))
+    return 0 if weapons_maxed(world) else 3

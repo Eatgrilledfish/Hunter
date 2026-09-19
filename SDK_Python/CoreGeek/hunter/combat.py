@@ -384,7 +384,8 @@ def propose_consumables(world, deadline, task_actor=None):
                 result.append(Candidate(actor.id, {"action": "use", "name": "Bomb", "targetPos": [pos_json(p)]},
                                         -40, "joint bomb coverage competes with personal stock and controller turn",
                                         {i: 100 for i in sorted(identities)}))
-        if actor.inventory["DizzyWeapon"]:
+        from .purchase_roles import stun_ready
+        if actor.inventory["DizzyWeapon"] and stun_ready(world, actor.id):
             actor_controls=controls
             from .rear_open import enabled as rear_enabled
             if rear_enabled(world) and actor.id==world.night_roster.p:

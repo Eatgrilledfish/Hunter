@@ -14,7 +14,9 @@ def propose(world, clock, rules, policy, miner, deadline, *, stock=None):
             or miner.id!=world.night_roster.m or miner.id in world.night_defenders
             or getattr(world,'critical_base_ids',()) or clock.day is None):
         return None,{}
-    demands=[r for r in getattr(world,'funding_plan',()) if r.get('deficit',0)>0]
+    # A planned checkout is enough reason to liquidate real surplus, even
+    # when current cash already covers the first order. Reprice after receipts.
+    demands=list(getattr(world,'funding_plan',()))
     buyer=min(demands,key=lambda r:(r.get('latest_departure',r['deadline']),r['purpose']!='night_essential')) if demands else None
     worker=world.ours.get(buyer['owner'] if buyer else world.night_roster.w)
     from .medical import needs_treatment
@@ -29,7 +31,7 @@ def propose(world, clock, rules, policy, miner, deadline, *, stock=None):
         cost=sum(r['cost'] for r in world.funding_plan if r['owner']==worker.id and r['deadline']<=buyer['deadline'])
         missing=sum(r['deficit'] for r in world.funding_plan if r['owner']==worker.id and r['deadline']<=buyer['deadline'])
         available=cost-missing
-    if not missing or available>=cost:return None,{}
+    if not buyer and (not missing or available>=cost):return None,{}
     if clock.phases=={'day'}:horizon=clock.until_night
     elif clock.phases=={'night'} and clock.day<10:
         explicit=isinstance(world.raw.get('robot'),dict) and isinstance(world.raw['robot'].get('roles'),list)
@@ -87,7 +89,7 @@ def propose(world, clock, rules, policy, miner, deadline, *, stock=None):
         command=dict(action='move',targetPos=[pos_json(steps[0])])
     report=dict(actor=miner.id,buyer=worker.id,stage='MAINTENANCE_FUNDING',
         purposes=[r['purpose'] for r in demands],
-        required_gold=cost,cash_gap=cost-available,actual_stock_value=value,
+        required_gold=cost,cash_gap=max(0,cost-available),actual_stock_value=value,
         required_rounds=required,deadline_round=world.round+horizon,shop=shop,
         latest_sale_departure=world.round+horizon-required,
         basis='current personal stock and observed quotes; proceeds not yet spendable')

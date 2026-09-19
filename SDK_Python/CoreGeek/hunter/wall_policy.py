@@ -183,7 +183,8 @@ def reconstruction_pending(world):
 def minimum_stock(world, actor, name):
     if name=='Medicine':return 1
     if name=='WallFixer':
-        return 2 if actor.id==getattr(getattr(world,'night_roster',None),'w',None) else 1
+        from .repair_decision import purchase_floor
+        return purchase_floor(world,None) if actor.id==getattr(getattr(world,'night_roster',None),'w',None) else 0
     return 0
 
 
@@ -321,8 +322,8 @@ def purchase_permitted(world, rules, candidate):
     same-source quote at creation; this gate stays read-only for them (E4).
     """
     command=candidate.command
-    from .purchase_roles import permitted
-    if command.get('action') == 'buy' and not permitted(world, candidate.actor, command.get('name', '')):
+    from .purchase_roles import quantity_permitted
+    if command.get('action') == 'buy' and not quantity_permitted(world, candidate.actor, command.get('name', ''), command.get('num', 1)):
         return False
     if (command.get('action') != 'buy' or not getattr(world, 'staged_walls', False)
             or not getattr(getattr(world, 'strategy_policy', None), 'upgrade_commitment_enabled', True)):

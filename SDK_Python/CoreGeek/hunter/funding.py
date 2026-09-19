@@ -13,6 +13,7 @@ def publish(world, clock, rules, policy, intelligence, deadline):
     roster = world.night_roster
     worker = world.ours.get(roster.w)
     world.work_rejections=[]
+    bulk_stock=[]
     for buyer in (worker, world.ours.get(roster.p)):
         if buyer and buyer.alive and buyer.backpack is not None and len(world.weapons) == rules.weapon_limit:
             capacity=max(0,(buyer.capacity or 0)-len(buyer.backpack))
@@ -35,14 +36,16 @@ def publish(world, clock, rules, policy, intelligence, deadline):
                 price = world.shop.get(name,0)
                 count = min(max(0,target-buyer.inventory[name]),capacity)
                 if price > 0 and count:
-                    capacity-=count
+                    from .repair_decision import weapons_maxed
+                    bulk = name=='WallFixer' and weapons_maxed(world)
+                    if not bulk:capacity-=count
                     from .repair_decision import purchase_floor
                     for index in range(count):
                         owned=buyer.inventory[name]+index
                         purpose=('night_attack' if name in {'DizzyWeapon','Bomb'} else
                                  'night_buffer' if name=='WallFixer' and owned>=purchase_floor(world,policy)
                                  else 'night_essential')
-                        world.funding_plan.append(dict(owner=buyer.id,purpose=purpose,
+                        (bulk_stock if bulk else world.funding_plan).append(dict(owner=buyer.id,purpose=purpose,
                             items={name:1},cost=price,stock_index=owned,
                             deadline=due,required_rounds=required,latest_departure=due-required,
                             deadline_source='next_night',expires=world.round))
@@ -140,6 +143,12 @@ def publish(world, clock, rules, policy, intelligence, deadline):
             world.funding_plan.append(dict(owner=worker.id,purpose='wall_rebuild',items={'WallUpgradeVoucher1':1},cost=price,
                 deadline=world.round+clock.until_night,expires=world.round,
                 last_progress_round=plan.get('last_progress_round'),deadline_source='reprice_each_frame'))
+    # Bulk repair stock uses only bag space left by today's other demands.
+    for row in bulk_stock:
+        buyer=world.ours[row['owner']]
+        allocated=sum(sum(r['items'].values()) for r in world.funding_plan if r['owner']==buyer.id)
+        if allocated+len(buyer.backpack)<buyer.capacity:
+            world.funding_plan.append(row)
     allocate(world)
     link_works(world)
     from .purchase_roles import publish as publish_list
@@ -242,7 +251,7 @@ def allocate(world):
         if row['purpose']=='night_essential':return 1
         if row['purpose']=='treasure':return 2
         if any(row is r for r in walls):return 3
-        if row['purpose']=='night_buffer':return 4
+        if row['purpose']=='night_buffer':return 8
         if row['purpose']=='night_attack':return 5 if row.get('stock_index',0)==0 else 7
         return 6
     world.funding_plan.sort(key=lambda r:(priority(r),r.get('stock_index',0)))
@@ -260,8 +269,8 @@ def allocate(world):
             stage='funded_await_purchase' if grant==row['cost'] else 'cash_deficit')
         if row['purpose']=='treasure':world.treasure_reserved_gold=grant
     from .purchase_roles import owner
-    targets=dict(getattr(world,'guard_attack_targets',{}),Medicine=1,
-        WallFixer=getattr(world,'caretaker_repair_target',3)+getattr(world,'day_repair_demand',0))
+    from .repair_decision import stock_target
+    targets=dict(getattr(world,'guard_attack_targets',{}),Medicine=1,WallFixer=stock_target(world,None))
     world.guard_funding_report={}
     for name in ('WallFixer','Medicine','DizzyWeapon','Bomb'):
         actor=world.ours.get(owner(world,name) or world.night_roster.w)
