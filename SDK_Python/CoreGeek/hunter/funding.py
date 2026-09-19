@@ -103,7 +103,14 @@ def publish(world, clock, rules, policy, intelligence, deadline):
                 if len(buyer.backpack)+allocated>=buyer.capacity:continue
                 if buyer.id not in routes:
                     start=distance_field(world,{buyer.pos},buyer.pos,deadline)
-                    home=distance_field(world,stands(world,buyer.id),buyer.pos,deadline)
+                    goals = (stands(world,buyer.id) if getattr(world,'task_side_plan',None)
+                             else None)
+                    if not goals:
+                        # Legacy layouts publish no defence stands; reuse the
+                        # same base-adjacent fallback as the treasure row.
+                        from .task_schedule import home_cells
+                        goals = home_cells(world, buyer)
+                    home=distance_field(world,goals,buyer.pos,deadline)
                     routes[buyer.id]=(start,home)
                 start,home=routes[buyer.id]
                 service=weighted_field(world,{p:home[p]+1 for p in interaction_cells(world,[target.pos],buyer.pos)
