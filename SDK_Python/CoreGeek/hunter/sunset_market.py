@@ -345,6 +345,11 @@ class SunsetMarket:
                                        if not (b[0]==order['target'])]
                         work.transition(world,pw.ACTIVE,step=work.step,reason=None)
                     else:
+                        # A failed, changed or unknown delivery leaves the
+                        # wait state; the fresh snapshot re-quotes the trip.
+                        work.transition(world,pw.ACTIVE,step=work.step,
+                            reason='delivery_failed' if failed else
+                                   'target_changed' if changed else 'delivery_not_applied')
                         work.block(world,'receipt','delivery_failed' if failed else
                                    'target_changed' if changed else 'delivery_not_applied')
                     pw.emit(world,work,'receipt',receipt='confirmed' if confirmed else
