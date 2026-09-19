@@ -303,6 +303,8 @@ class _HunterPopen(_hunter_popen):
         # Never reinterpret a shell string, opaque executable override or flags.
         if not positional and not kwargs.get('shell') and not kwargs.get('executable') and isinstance(args, (list, tuple)) and args:
             args=list(args)
+            replayable = len(args)==1 and not (set(kwargs)-{
+                'cwd','stdout','stderr','text','encoding','errors','universal_newlines'})
             executable = args[0]
             cwd = _ho.path.abspath(kwargs.get('cwd') or _ho.getcwd())
             known={_ho.path.realpath(p) for p in [_hsys.executable,*[_hh.which(n) for n in ('python3','python','bash','sh')]] if p}
@@ -351,6 +353,13 @@ class _HunterPopen(_hunter_popen):
                         except (OSError, UnicodeError, ValueError) as exc:
                             info['inspection_error'] = type(exc).__name__
                     self._hunter_local_program = info.get("path")
+                    if (replayable and info['path'] in _hunter_declared_checkers
+                            and not info['symlink'] and _ho.path.dirname(path)==cwd):
+                        try:
+                            with open(path,'rb') as source:checker_bytes=source.read(1048577)
+                            if len(checker_bytes)<=1048576:
+                                self._hunter_recheck=dict(cwd=info['cwd'],sha256=_hhash.sha256(checker_bytes).hexdigest())
+                        except OSError:pass
                     _hunter_event(**info)
 
         # Recognize a direct script argument to an observed standard
@@ -417,6 +426,8 @@ def _hunter_checked_communicate(self,*args,**kwargs):
         _hunter_checker_outputs[path]=dict(path=path,returncode=self.returncode,
             stdout=text,complete=len(raw)<=2048 and text is not None,
             sha256=_hhash.sha256(raw).hexdigest())
+        if getattr(self,'_hunter_recheck',None):
+            _hunter_checker_outputs[path]['recheck']=self._hunter_recheck
         while len(_hunter_checker_outputs)>2:
             _hunter_checker_outputs.pop(next(iter(_hunter_checker_outputs)))
     return result

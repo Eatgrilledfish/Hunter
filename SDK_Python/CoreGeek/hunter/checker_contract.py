@@ -59,6 +59,9 @@ def validate(task, refs):
 def token_answer(task, data):
     """Recover captured output only from this execution's declared checker."""
     from .answer_contract import contract
+    from .protocol import strict_json
+    if data.get('status')!='ok' or data.get('completeness')!='complete':
+        return None
     required=checker_paths(task)
     schema=contract(task)
     fields=set(schema['required_fields']) | set((schema.get('schema') or {}).get('required',[]))
@@ -88,5 +91,12 @@ def token_answer(task, data):
     # checker formats stay with the existing model/evidence validation path.
     tokens={m[1] for text in sources if isinstance(text,str)
             for m in re.finditer(r'(?m)^\s*TOKEN:\s*([A-Za-z0-9_-]+)\s*$',text)}
+    for text in sources:
+        if not isinstance(text,str):continue
+        try:value=strict_json(text)
+        except ValueError:continue
+        if (isinstance(value,dict) and set(value)=={'token'}
+                and isinstance(value['token'],str) and value['token'].strip()):
+            tokens.add(value['token'])
     if len(tokens)!=1:return None
     return {'token':tokens.pop()}

@@ -30,6 +30,9 @@ INSTRUCTIONS = (
     '地点完整但未来才开启也可DIG_READY，程序等待窗口；祭品确定即可BUY_READY，其余字段缺口不否定祭品。'
     '真正未知写unresolved:[{field:items|location|time|condition,reason:缺口或具体竞争解释}]，不要编造额外条件。'
     'validation_feedback只修对应字段，不能用空列表消除错误；已买物品见runtime_state，不能重复采购。'
+    'missing_fields是尚缺执行条件；找不到对应宝藏原句则WAIT_INFO并写明缺口，保留已有字段。'
+    '当前日期、消息发布日期或矿区复工不是宝藏开放时间，不能据此补今天或仅提高confidence。'
+    '引用优先复制evidence_index的source/span，不手写哈希。'
     '兼容完整treasures/purchases格式时使用evidence_version:3、item_evidence、support和confidence:high；'
     'treasures需position、items、location、time、all_conditions_resolved:true；purchases需items、all_item_conditions_resolved:true。'
     '合法献祭失败也耗物品，不盲试；回执2为位置或时间未满足，3为祭品错误，success/empty不可再取同图宝藏。'
@@ -113,7 +116,8 @@ class NewsCycle:
             if ('read_clues', key) not in self.repairs:
                 return ('read_clues', key)
         if intel.invalid_candidates:
-            key = fingerprint([corpus,sorted((c['id'],c['reason'],c.get('detail',{}).get('path')) for c in intel.invalid_candidates)])
+            from .news_fields import repair_key
+            key = repair_key(intel,sources)
             if ('repair_validation',key) not in self.repairs:
                 return ('repair_validation',key)
         feedback = [a for a in intel.attempts if a.get('result') in (2,3)
@@ -212,6 +216,8 @@ class NewsCycle:
         payload['evidence_sources']={k:v for k,v in citation_sources.items() if k not in sources}
         payload['field_state']=intel.field_state
         payload['resolved_fields']=intel.resolved_fields
+        from .news_fields import FIELDS
+        payload['missing_fields']=[name for name in FIELDS if name not in intel.resolved_fields]
         payload['evidence_index']={k:v.get('spans',{}) for k,v in citation_sources.items()}
         pioneer=next((u for u in world.movers if u.kind=='pioneer'),None)
         payload['runtime_state']=dict(gold=world.gold,pioneer=None if pioneer is None else

@@ -17,6 +17,7 @@ from .task_timing import TaskTiming, descriptor as timing_descriptor, mark as ma
 from .task_checkpoints import remember as remember_checkpoint, checkpoint as task_checkpoint
 from .task_lifecycle import TaskLifecycle, family as task_family
 from .rules import Clock, Policy
+from . import task_recovery
 
 
 def llm_service_failure(world, pending):
@@ -183,6 +184,7 @@ class TaskInstance:
     pagination_block: dict = field(default_factory=dict)
     diagnostic_events: list = field(default_factory=list)  # Never included in model prompts.
     metrics: dict = field(default_factory=dict)
+    recovery: dict = field(default_factory=dict)
 
 
 def binding_value(task_text, argument):
@@ -585,7 +587,10 @@ def evidence_answer(task, spec):
     # The transport answer is a string, but a JSON task's semantic value is
     # structured. Decode one complete strict JSON envelope without spending
     # another model turn; prose, duplicate keys and nonfinite values still fail.
-    if isinstance(value, str) and answer_contract(task)['json_required']:
+    from .answer_contract import permits_string
+    if isinstance(value,str) and permits_string(answer_contract(task)['schema']):
+        spec=dict(spec,format='json')
+    elif isinstance(value, str) and answer_contract(task)['json_required']:
         try:
             decoded = strict_json(value)
         except ValueError:
@@ -883,10 +888,17 @@ class TaskEngine:
                         and isinstance(record["data"].get("text"), str)][-8:])
                 task.command_plan = plan
             elif data["intent"] == "answer":
+                if task_recovery.needs_execution(task):
+                    raise ValueError('latest execution or answer validation failure requires a corrected execution before submit')
                 candidate = evidence_answer(task, data.get("answer_candidate"))
                 task.answer = candidate if candidate["hash"] not in {s["hash"] for s in task.submitted} else None
+                if task.answer is None:
+                    task_recovery.stalled(task, 'answer already submitted; inspect feedback and change the computation', world.round)
+            else:
+                task_recovery.stalled(task, 'inspect requires an explicit read/list command', world.round)
             task.events.append({"kind": "llm_consumed", "round": world.round, "nonce": pending["context"]["nonce"]})
         except (ValueError, TypeError, KeyError) as exc:
+            task_recovery.stalled(task, str(exc), world.round)
             record_pagination_block(task,str(exc),world.round)
             task.events.append({"kind": "invalid_llm", "round": world.round, "reason": str(exc)[:200],
                                 "expected":fingerprint(pending["context"]["nonce"])[:16],
@@ -1009,6 +1021,8 @@ class TaskEngine:
         task.evidence[evidence_id] = {"answer_usable": usable and not failure, "failure": failure, "source": "sandbox", "round": world.round, "usable": usable,
                                       "bound_hash":pending.get('bound_hash'),
                                       "nonce": pending["context"]["nonce"], "data": data or parsed}
+        if not usable and parsed['status']=='ok':
+            task_recovery.recheck(task, data, pending, evidence_id, world.round)
         task.events.append({"kind": "sandbox_result", "status": data.get("status", parsed["status"]),
                             "op":pending["operation"], "round": world.round,
                             "exit":data.get("tool_exit_code", data.get("exit_code", parsed.get("exit_code"))),
@@ -1025,7 +1039,7 @@ class TaskEngine:
                                       if pending["operation"] in {"run_tool", "run_python"} else ""})
         if usable and not failure and pending.get("plan"):
             output = pending['plan'].get('answer_output')
-            if (output is None or 'data' not in data) and data.get('completeness')=='complete':
+            if (output is None or data.get('data') is None) and data.get('completeness')=='complete':
                 from .checker_contract import token_answer
                 recovered=token_answer(task,data)
                 if recovered is not None:
@@ -1057,6 +1071,8 @@ class TaskEngine:
                         from .task_checkpoints import remember_complete
                         remember_complete(task,task.answer['spec'])
                 except (ValueError, KeyError, TypeError) as exc:
+                    task_recovery.stalled(task, str(exc), world.round)
+                    task.recovery['recompute_after']=evidence_id
                     record_pagination_block(task,str(exc),world.round)
                     task.events.append({'kind':'answer_output_rejected','round':world.round})
                     task.diagnostic_events.append({'kind':'answer_output_rejected','round':world.round,
@@ -1209,7 +1225,7 @@ class TaskEngine:
             and isinstance(task.command_plan, dict)
             and task.command_plan.get('operation') in {'run_python', 'run_tool'}
             and isinstance(task.command_plan.get('answer_output'), dict))
-        final_answer_only = at_boundary and not final_execution and any(
+        final_answer_only = at_boundary and not final_execution and not task_recovery.needs_execution(task) and any(
             e.get("usable") and e.get("answer_usable") is not False and e.get("data", {}).get("operation") in {"run_python", "run_tool"}
             and e["data"].get("completeness") == "complete" for e in task.evidence.values())
         if stopping and not (final_answer_only or final_execution):
@@ -1301,12 +1317,22 @@ class TaskEngine:
                         task.checkpoints.clear()
                 except (ValueError, TypeError, KeyError) as exc:
                     self.programs.reject(program_id)
+                    task_recovery.stalled(task, str(exc), world.round)
                     task.events.append({"kind": "invalid_command_plan", "round": world.round, "reason": str(exc)[:512],
                                         "op":plan.get("operation"), "path":str(plan.get("path", "."))[:160]})
                     task.plan_failures += 1
                 task.command_plan = None
         if stopping and not final_answer_only:
             return  # A failed final execution cannot start another model cycle.
+        if task_recovery.blocked(task) and not response['executeCmd'] and not task.sandbox_pending:
+            state=task.recovery['stall']
+            if not state.get('reported'):
+                task.events.append(dict(kind='task_no_progress',round=world.round,reason=state['reason'],count=state['count']))
+                task.diagnostic_events.append(dict(kind='task_no_progress',round=world.round,
+                    reason='stopped repeated model replies without new evidence: '+state['reason']))
+                task.diagnostic_events=task.diagnostic_events[-8:]
+                state['reported']=True
+            return
         block=task.pagination_block
         if (block.get('count',0)>=3 and block.get('signature')==pagination_progress(task)
                 and not task.answer and not response['executeCmd']):
@@ -1353,6 +1379,9 @@ class TaskEngine:
                 # be confused with old identities or buried in the long protocol.
                 payload['reply_template'] = {'request_id':payload['request_id'],
                     **({'submit':'<actual answer>'} if final_answer_only else {'cmd':'<Python source>'})}
+                payload['recovery']=task_recovery.feedback(task)
+                if task_recovery.needs_execution(task) and not final_answer_only:
+                    payload['allowed_actions']=['cmd']
                 payload['required_response'] = 'ONLY JSON; copy the current request_id and choose one allowed action.'
                 response["prompt"] = instructions + json.dumps(payload, ensure_ascii=False)
                 claim(world,context,'task_exempt')

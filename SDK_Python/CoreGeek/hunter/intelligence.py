@@ -222,16 +222,20 @@ class Intelligence:
             'position_or_items':'position is an in-bounds integer {x,y}; items is a nonempty exact quantity list, at most 40',
             'unknown_shop_item':'items must use exact IDs from the current shop and offering descriptions',
             'opening_window':'opening_round is an absolute integer round; optional closing_round >= opening_round, horizon <=1300',
-            'unresolved_conditions':'confidence must be high and all_conditions_resolved true, only when supported by original clues'}
+            'unresolved_conditions':'A field needs source-supported high confidence (condition also needs resolved:true). Otherwise return WAIT_INFO with this field in unresolved; raising confidence is not a repair.',
+            'day_not_in_source':'time.day needs a treasure timing statement naming that day. Current day, publication date and unrelated economic news do not establish treasure opening. Preserve the other fields and report the missing timing clue.',
+            'invalid_field_updates':'field_updates must be an object keyed by items/location/time/condition, or a list of unique {field,value} objects.',
+            'unknown_source_id':'Copy a supplied evidence_index source/span ID. Never reconstruct a source hash.',
+            'quote_not_exact':'Use a supplied evidence_index span; do not paraphrase or join separate quotes.'}
         citation_issue={}
-        def reject(candidate,reason):
+        def reject(candidate,reason,detail=None):
             rejected[reason]+=1
             encoded=json.dumps(candidate,ensure_ascii=False)
             sample=(candidate if isinstance(candidate,dict) and len(encoded)<=6000 else
                     dict(type=type(candidate).__name__,sample=encoded[:600],truncated=len(encoded)>600))
             record=dict(id=fingerprint(candidate),candidate=sample,reason=reason,
                 expected=expected.get(reason,'Correct the cited field using supplied evidence; do not guess.'),
-                detail=dict(citation_issue) if citation_issue else {},round=world.round,
+                detail=dict(detail if detail is not None else citation_issue),round=world.round,
                 validation_revision=fingerprint([world.round,candidate,reason])[:16])
             self.invalid_candidates=[v for v in self.invalid_candidates if v['id']!=record['id']]
             self.invalid_candidates=(self.invalid_candidates+[record])[-4:]

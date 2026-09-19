@@ -38,6 +38,14 @@ def citations(value, sources, path='support', require_news=True):
         where=f'{path}[{i}]'
         if not isinstance(ref,dict):raise EvidenceError('invalid_citation_shape',where)
         key=ref.get('source',ref.get('source_id'));entry=sources.get(key)
+        # Repair only a mistyped digest within the SAME observed news identity,
+        # backed by one exact quote. Never fuzzy-match text or change day/section.
+        if entry is None and isinstance(key,str) and re.fullmatch(r'news:\d+:(?:folkLegends|officialNews):[a-f0-9]{12}',key):
+            quote=ref.get('quote');prefix=key.rsplit(':',1)[0]+':'
+            matches=[k for k,e in sources.items() if k.startswith(prefix)
+                     and isinstance(quote,str) and len(quote.strip())>=8 and quote in e['text']]
+            if len(matches)==1:
+                key=matches[0];entry=sources[key]
         if entry is None:raise EvidenceError('unknown_source_id',where,key)
         text=entry['text'];quote=ref.get('quote')
         if 'span' in ref:

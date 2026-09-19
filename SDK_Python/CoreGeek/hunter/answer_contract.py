@@ -14,7 +14,7 @@ def explicit_fields(text):
     for match in re.finditer(pattern, text, re.I):
         parts = re.split(r'\s*(?:,|，|、|\band\b|和)\s*', match[1].strip())
         matches = [re.fullmatch(key, part.strip()) for part in parts]
-        if len(parts) >= 2 and all(matches):
+        if parts and all(matches):
             fields.update(m[1] for m in matches)
     return sorted(fields)
 
@@ -25,11 +25,41 @@ def answer_schema(text):
     for match in re.finditer(r'(?:answer\s+(?:JSON\s+)?schema|答案\s*(?:JSON\s*)?Schema)\s*[:：]\s*(?:```(?:json)?\s*)?', text, re.I):
         try:
             value, _ = json.JSONDecoder().raw_decode(text[match.end():])
-            if isinstance(value, dict) and value.get('type') == 'object':
+            if isinstance(value, dict) and isinstance(value.get('type'), (str, list)):
                 return value
         except (ValueError, RecursionError):
             continue
     return None
+
+
+def answer_example(text):
+    """An explicit answer-format object declares keys, never example values/types."""
+    for match in re.finditer(r'(?:答案格式|提交格式|返回格式|answer\s+format|return\s+JSON|返回|提交)'
+                             r'[^\n。.{}]{0,60}(\{)', text, re.I):
+        if negated(text, match.start()):continue
+        try:
+            value, _ = json.JSONDecoder().raw_decode(text[match.start(1):])
+            if isinstance(value, dict) and value:
+                return value
+        except (ValueError, RecursionError):
+            continue
+    return None
+
+
+def negated(text, start):
+    return bool(re.search(r'(?:do\s+not|must\s+not|never|not|禁止|不得|不能|不要)\s*$',text[max(0,start-24):start],re.I))
+
+
+def permits_null(text, schema):
+    if schema and 'null' in (schema.get('type') if isinstance(schema.get('type'),list) else [schema.get('type')]):
+        return True
+    return any(not negated(text,m.start()) for m in re.finditer(
+        r'(?:return|submit)\s+(?:JSON\s+)?null\b|(?:返回|提交|允许)\s*null\b',text,re.I))
+
+
+def permits_string(schema):
+    kind=(schema or {}).get('type')
+    return kind=='string' or isinstance(kind,list) and 'string' in kind
 
 
 def validate_schema(value, schema, partial=False, path='$', depth=0):
@@ -101,13 +131,16 @@ def contract(task):
                 and (data.get("path") == task.statement_path or str(data.get("path", "")).endswith("spec.md"))):
             statements.append(data.get("text") or "")
     text = "\n".join(statements)
+    example = answer_example(text)
+    schema = answer_schema(text)
     feedback = str([s.get("feedback", {}) for s in task.submitted])
     result = {
-        "json_required": bool((re.search(r"(?<![.\w])JSON\b", text, re.I) and not re.search(r"without\s+JSON|不(?:要|使用|用)\s*JSON|纯文本", text, re.I)) or "合法 JSON" in feedback or "合法JSON" in feedback),
+        "json_required": bool(schema or example is not None or (re.search(r"(?<![.A-Za-z0-9_])JSON\b", text, re.I) and not re.search(r"without\s+JSON|不(?:要|使用|用)\s*JSON|纯文本", text, re.I)) or "合法 JSON" in feedback or "合法JSON" in feedback),
         "execution_required": bool(re.search(r"\bAPI\b|\./check|修复|查询|query|repair|run .*check", text, re.I)),
-        "required_fields": explicit_fields(text),
+        "required_fields": sorted(set(explicit_fields(text)) | set(example or {}) if schema is None else set(explicit_fields(text))),
         "coverage_scope": coverage_scope(text),
-        "schema": answer_schema(text),
+        "schema": schema,
+        "null_allowed": permits_null(text,schema),
         "validation_scope": "explicit field lists and declared structural schema; semantic correctness requires execution/judge evidence",
     }
     paths = checker_paths(task)
@@ -119,11 +152,13 @@ def contract(task):
 
 def validate(task, spec, value, refs):
     required = contract(task)
-    if required["json_required"] and (spec["format"] != "json" or isinstance(value, str)):
+    if value is None and required['json_required'] and not required['null_allowed']:
+        raise ValueError('null is not a declared answer: inspect actual response shape and compute the required result; do not submit missing data')
+    if required["json_required"] and (spec["format"] != "json" or isinstance(value, str) and not permits_string(required['schema'])):
         raise ValueError("task requires structured JSON results, not a text summary or JSON string")
     partial = spec.get('partial') is True
     fields = required['required_fields']
-    if fields:
+    if fields and value is not None:
         if not isinstance(value, dict):
             raise ValueError('task requires a JSON object with named answer fields')
         missing = sorted(set(fields)-value.keys())

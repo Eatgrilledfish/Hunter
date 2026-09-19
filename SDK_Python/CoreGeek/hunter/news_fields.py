@@ -6,16 +6,53 @@ from .protocol import position
 FIELDS=('items','location','time','condition')
 
 
-def merge(intel, world, data, sources, reject):
+def normalize_updates(data):
+    """Accept the unambiguous field/value envelope seen in real model replies."""
     updates=data.get('field_updates',{})
+    if not isinstance(updates,list):return updates,data.get('revisions',[])
+    result={};revisions=list(data.get('revisions',[])) if isinstance(data.get('revisions',[]),list) else []
+    for row in updates:
+        if (not isinstance(row,dict) or set(row)-{'field','value','revisions'}
+                or row.get('field') not in FIELDS or row['field'] in result
+                or not isinstance(row.get('value'),dict)
+                or not isinstance(row.get('revisions',[]),list)):
+            raise ValueError('field_updates list requires unique field/value objects')
+        result[row['field']]=row['value']
+        revisions.extend(row.get('revisions',[]))
+    return result,revisions
+
+
+def repair_key(intel, sources):
+    """Changing a rejected guess or its wording is not evidence of progress."""
+    from .protocol import fingerprint
+    facts={}
+    for name,row in intel.resolved_fields.items():
+        value=row['value']
+        if name=='location':value=value.get('position')
+        if name=='time':value={k:value.get(k) for k in ('opening_round','execution_window_end','phase','official_expiry')}
+        facts[name]=value
+    fields=set()
+    for row in intel.invalid_candidates:
+        candidate=row.get('candidate',{})
+        name=candidate.get('field') if isinstance(candidate,dict) else None
+        path=row.get('detail',{}).get('path','')
+        fields.add(name if name in FIELDS else next((f for f in FIELDS if f in path),'envelope'))
+    return fingerprint([sorted(sources),facts,sorted(fields)])
+
+
+def merge(intel, world, data, sources, reject):
+    try:updates,revisions=normalize_updates(data)
+    except ValueError as exc:
+        reject({'field_updates':data.get('field_updates')},'invalid_field_updates',
+               dict(path='field_updates',reason=str(exc)));return set()
     if not isinstance(updates,dict):
         reject({'field_updates':updates},'invalid_field_updates');return set()
     changed=set()
-    revisions=data.get('revisions',[])
     for row in revisions if isinstance(revisions,list) else []:
         if not isinstance(row,dict) or row.get('field') not in FIELDS:continue
         try:refs=citations(row,sources,'revisions.support')
-        except EvidenceError as exc:reject(row,exc.reason);continue
+        except EvidenceError as exc:
+            reject(row,exc.reason,dict(path=exc.path,source=exc.source));continue
         if not isinstance(row.get('reason'),str) or not row['reason'].strip():continue
         name=row['field']
         intel.resolved_fields.pop(name,None)
@@ -23,7 +60,8 @@ def merge(intel, world, data, sources, reject):
         if name=='items':intel.preparations=[]
         intel.rejections.append(dict(field=name,support=refs,reason=row['reason'],round=world.round))
     for name,spec in updates.items():
-        if name not in FIELDS or not isinstance(spec,dict):continue
+        if name not in FIELDS or not isinstance(spec,dict):
+            reject(dict(field=name,field_update=spec),'invalid_field_shape',dict(path='field_updates.'+str(name)));continue
         try:
             refs=citations(spec,sources,f'field_updates.{name}.support')
             if spec.get('confidence')!='high':raise EvidenceError('unresolved_conditions',name)
@@ -53,7 +91,8 @@ def merge(intel, world, data, sources, reject):
                 version=world.round)
             changed.add(name)
         except (EvidenceError,TypeError,ValueError) as exc:
-            reject(dict(field=name,field_update=spec),exc.reason if isinstance(exc,EvidenceError) else 'invalid_field_shape')
+            reject(dict(field=name,field_update=spec),exc.reason if isinstance(exc,EvidenceError) else 'invalid_field_shape',
+                   dict(path=exc.path,source=exc.source) if isinstance(exc,EvidenceError) else dict(path='field_updates.'+name))
     return changed
 
 
